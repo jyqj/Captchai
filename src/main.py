@@ -10,12 +10,14 @@ from fastapi import FastAPI
 
 from .api.routes import router
 from .core.config import config
+from .core.services import SolverServices, set_services
+from .services.browser import BrowserManager
 from .services.classification import ClassificationSolver
 from .services.hcaptcha import HCaptchaSolver
 from .services.recognition import CaptchaRecognizer
 from .services.recaptcha_v2 import RecaptchaV2Solver
 from .services.recaptcha_v3 import RecaptchaV3Solver
-from .services.task_manager import task_manager
+from .services.task_manager import TaskCategory, task_manager
 from .services.turnstile import TurnstileSolver
 
 logging.basicConfig(
@@ -65,46 +67,57 @@ _IMAGE_TEXT_TYPES = [
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── startup ──
-    v3_solver = RecaptchaV3Solver(config)
-    await v3_solver.start()
+    # One Chromium process shared by every browser-based solver. Each solve
+    # still gets an isolated context (with its own proxy/UA), but we avoid
+    # launching four separate browsers.
+    task_manager.configure(config)
+
+    browser = BrowserManager(config)
+    await browser.start()
+
+    # Shared asset / consumption / vision layers, injected into the solvers.
+    services = SolverServices(config)
+    services.attach_browser(browser)
+    set_services(services)
+
+    v3_solver = RecaptchaV3Solver(config, manager=browser)
     for task_type in _RECAPTCHA_V3_TYPES:
-        task_manager.register_solver(task_type, v3_solver)
+        task_manager.register_solver(task_type, v3_solver, TaskCategory.BROWSER)
     log.info("Registered reCAPTCHA v3 solver for types: %s", _RECAPTCHA_V3_TYPES)
 
-    v2_solver = RecaptchaV2Solver(config)
-    await v2_solver.start()
+    v2_solver = RecaptchaV2Solver(config, manager=browser)
     for task_type in _RECAPTCHA_V2_TYPES:
-        task_manager.register_solver(task_type, v2_solver)
+        task_manager.register_solver(task_type, v2_solver, TaskCategory.BROWSER)
     log.info("Registered reCAPTCHA v2 solver for types: %s", _RECAPTCHA_V2_TYPES)
 
-    hcaptcha_solver = HCaptchaSolver(config)
-    await hcaptcha_solver.start()
+    hcaptcha_solver = HCaptchaSolver(config, manager=browser, services=services)
     for task_type in _HCAPTCHA_TYPES:
-        task_manager.register_solver(task_type, hcaptcha_solver)
+        task_manager.register_solver(task_type, hcaptcha_solver, TaskCategory.BROWSER)
     log.info("Registered hCaptcha solver for types: %s", _HCAPTCHA_TYPES)
 
-    turnstile_solver = TurnstileSolver(config)
-    await turnstile_solver.start()
+    turnstile_solver = TurnstileSolver(config, manager=browser)
     for task_type in _TURNSTILE_TYPES:
-        task_manager.register_solver(task_type, turnstile_solver)
+        task_manager.register_solver(task_type, turnstile_solver, TaskCategory.BROWSER)
     log.info("Registered Turnstile solver for types: %s", _TURNSTILE_TYPES)
 
+    # Pure-vision tasks draw from a separate concurrency pool so a burst of image
+    # requests can't starve the browser solvers.
     recognizer = CaptchaRecognizer(config)
     for task_type in _IMAGE_TEXT_TYPES:
-        task_manager.register_solver(task_type, recognizer)
+        task_manager.register_solver(task_type, recognizer, TaskCategory.VISION)
     log.info("Registered image captcha recognizer for types: %s", _IMAGE_TEXT_TYPES)
 
     classifier = ClassificationSolver(config)
     for task_type in _CLASSIFICATION_TYPES:
-        task_manager.register_solver(task_type, classifier)
+        task_manager.register_solver(task_type, classifier, TaskCategory.VISION)
     log.info("Registered classification solver for types: %s", _CLASSIFICATION_TYPES)
 
     yield
     # ── shutdown ──
-    await v3_solver.stop()
-    await v2_solver.stop()
-    await hcaptcha_solver.stop()
-    await turnstile_solver.stop()
+    await task_manager.shutdown()
+    await services.close()
+    set_services(None)
+    await browser.stop()
 
 
 app = FastAPI(

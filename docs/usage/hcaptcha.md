@@ -1,12 +1,12 @@
 # hCaptcha Usage
 
-hCaptcha presents a CAPTCHA challenge via an iframe widget. The solver visits the target page with a Playwright-controlled Chromium browser, clicks the hCaptcha checkbox, waits for the challenge to resolve, and extracts the `h-captcha-response` token.
+hCaptcha presents a CAPTCHA challenge via an iframe widget. The solver renders the widget for your sitekey (sitekey injection, served as the target origin), clicks the checkbox and, **when hCaptcha escalates to an image grid challenge, solves it with the configured vision model** — screenshotting each task tile, asking the model which tiles match the prompt, clicking them, and submitting. This is the path Stripe Radar / checkout hCaptcha typically requires, since a headless browser is almost always given a visual challenge.
 
 ## Supported task type
 
 | Task type | Description |
 |-----------|-------------|
-| `HCaptchaTaskProxyless` | Browser-based hCaptcha solving |
+| `HCaptchaTaskProxyless` | Browser-based hCaptcha solving with vision-model challenge solving |
 
 ## Required fields
 
@@ -14,6 +14,25 @@ hCaptcha presents a CAPTCHA challenge via an iframe widget. The solver visits th
 |-------|------|-------------|
 | `websiteURL` | string | Full URL of the page containing the captcha |
 | `websiteKey` | string | The `data-sitekey` value from the page's HTML |
+
+## Optional fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `isInvisible` | bool | Render the widget as invisible and call `execute()` (passive flow). |
+| `rqdata` | string | hCaptcha Enterprise `rqdata` nonce. Forwarded to `hcaptcha.render`; required by enterprise widgets that set it. |
+| `userAgent` | string | Force a UA so the token matches your downstream submission. Echoed back in `solution.userAgent`. |
+| `proxyType` / `proxyAddress` / `proxyPort` / `proxyLogin` / `proxyPassword` | | Solve through a proxy. Recommended for reputation-bound / IP-bound flows. |
+| `proxy` | string | Single-string proxy form, e.g. `http://user:pass@host:port`. |
+
+## Stripe note
+
+Stripe's payment/checkout flows present hCaptcha (often enterprise). To solve reliably:
+
+1. Pass the exact `websiteURL` that embeds the widget and the correct `websiteKey`.
+2. Provide `rqdata` if Stripe's page sets it on the widget.
+3. Bind a proxy + `userAgent` and reuse the returned `solution.userAgent` (and same IP) when you submit the token.
+4. Quality of the grid-challenge solve depends on your configured vision model (`LOCAL_MODEL`).
 
 ## Test targets
 

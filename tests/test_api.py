@@ -310,6 +310,84 @@ def test_create_turnstile_task_accepted() -> None:
         mgr._solvers.pop("TurnstileTaskProxyless", None)
 
 
+def test_create_turnstile_task_accepts_proxy_and_advanced_fields() -> None:
+    """Proxy / action / cData / userAgent must be accepted and forwarded."""
+    client = _load_app()
+    task_mgr_mod = importlib.import_module("src.services.task_manager")
+    mgr = getattr(task_mgr_mod, "task_manager")
+    mock_solver = AsyncMock(return_value={"token": "cf-tok", "userAgent": "UA"})
+    mock_solver.solve = mock_solver
+    mgr.register_solver("TurnstileTaskProxyless", mock_solver)
+    try:
+        resp = client.post(
+            "/createTask",
+            json={
+                "clientKey": "any",
+                "task": {
+                    "type": "TurnstileTaskProxyless",
+                    "websiteURL": "https://example.com",
+                    "websiteKey": "0x4AAA",
+                    "action": "login",
+                    "cData": "session-123",
+                    "userAgent": "Mozilla/5.0 Custom",
+                    "proxyType": "http",
+                    "proxyAddress": "1.2.3.4",
+                    "proxyPort": 8080,
+                    "proxyLogin": "u",
+                    "proxyPassword": "p",
+                },
+            },
+        )
+        body = resp.json()
+        assert body["errorId"] == 0
+        assert body["taskId"] is not None
+        forwarded = mock_solver.call_args.args[0]
+        assert forwarded["action"] == "login"
+        assert forwarded["cData"] == "session-123"
+        assert forwarded["proxyAddress"] == "1.2.3.4"
+        assert forwarded["userAgent"] == "Mozilla/5.0 Custom"
+    finally:
+        mgr._solvers.pop("TurnstileTaskProxyless", None)
+
+
+def test_get_task_result_returns_user_agent_in_solution() -> None:
+    """solution.userAgent must survive serialization for token/UA binding."""
+    import time
+
+    client = _load_app()
+    task_mgr_mod = importlib.import_module("src.services.task_manager")
+    mgr = getattr(task_mgr_mod, "task_manager")
+    mock_solver = AsyncMock(return_value={"token": "cf-tok", "userAgent": "UA-XYZ"})
+    mock_solver.solve = mock_solver
+    mgr.register_solver("TurnstileTaskProxyless", mock_solver)
+    try:
+        created = client.post(
+            "/createTask",
+            json={
+                "clientKey": "any",
+                "task": {
+                    "type": "TurnstileTaskProxyless",
+                    "websiteURL": "https://example.com",
+                    "websiteKey": "0x4AAA",
+                },
+            },
+        ).json()
+        task_id = created["taskId"]
+        for _ in range(20):
+            result = client.post(
+                "/getTaskResult",
+                json={"clientKey": "any", "taskId": task_id},
+            ).json()
+            if result.get("status") == "ready":
+                break
+            time.sleep(0.05)
+        assert result["status"] == "ready"
+        assert result["solution"]["token"] == "cf-tok"
+        assert result["solution"]["userAgent"] == "UA-XYZ"
+    finally:
+        mgr._solvers.pop("TurnstileTaskProxyless", None)
+
+
 def test_create_classification_task_accepted() -> None:
     client = _load_app()
     task_mgr_mod = importlib.import_module("src.services.task_manager")

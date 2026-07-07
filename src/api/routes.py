@@ -16,7 +16,8 @@ from ..models.task import (
     GetTaskResultResponse,
     SolutionObject,
 )
-from ..services.task_manager import TaskStatus, task_manager
+from ..core.services import get_services
+from ..services.task_manager import QueueFull, TaskStatus, task_manager
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +112,20 @@ async def create_task(request: CreateTaskRequest) -> CreateTaskResponse:
             )
 
     params = request.task.model_dump(exclude_none=True)
-    task_id = task_manager.create_task(request.task.type, params)
+    # Thread the client key through so the solver can attribute consumption to it
+    # in the ledger. Prefixed with '_' to distinguish from YesCaptcha fields.
+    params["_clientKey"] = request.clientKey
+    try:
+        task_id = task_manager.create_task(
+            request.task.type, params, idempotency_key=request.idempotencyKey
+        )
+    except QueueFull as exc:
+        log.warning("Rejecting task (queue full): %s", exc)
+        return CreateTaskResponse(
+            errorId=1,
+            errorCode="ERROR_NO_SLOT_AVAILABLE",
+            errorDescription=str(exc),
+        )
 
     log.info("Created task %s (type=%s)", task_id, request.task.type)
     return CreateTaskResponse(errorId=0, taskId=task_id)
@@ -157,7 +171,46 @@ async def get_task_result(
 async def get_balance(request: GetBalanceRequest) -> GetBalanceResponse:
     if config.client_key and request.clientKey != config.client_key:
         return GetBalanceResponse(errorId=1, balance=0)
-    return GetBalanceResponse(errorId=0, balance=99999.0)
+    # Real balance semantics: starting credit minus this client's ledger spend.
+    services = get_services()
+    balance = config.account_balance_usd
+    if services is not None:
+        spent = await services.ledger.total_cost_usd(request.clientKey)
+        balance = max(0.0, config.account_balance_usd - spent)
+    return GetBalanceResponse(errorId=0, balance=balance)
+
+
+def _authorized(client_key: str) -> bool:
+    return not config.client_key or client_key == config.client_key
+
+
+@router.get("/admin/metrics")
+async def admin_metrics(clientKey: str = "") -> dict[str, object]:
+    """Per-sitekey / per-model consumption summary from the cost ledger."""
+    if not _authorized(clientKey):
+        return {"errorId": 1, "errorCode": "ERROR_KEY_DOES_NOT_EXIST"}
+    services = get_services()
+    if services is None:
+        return {"errorId": 0, "summary": {}, "note": "services not initialised"}
+    return {"errorId": 0, "summary": await services.ledger.summary()}
+
+
+@router.get("/admin/proxies")
+async def admin_proxies(clientKey: str = "") -> dict[str, object]:
+    """Proxy-pool health / consumption snapshot."""
+    if not _authorized(clientKey):
+        return {"errorId": 1, "errorCode": "ERROR_KEY_DOES_NOT_EXIST"}
+    services = get_services()
+    if services is None:
+        return {"errorId": 0, "proxies": [], "sessions": []}
+    sessions = (
+        services.session_pool.snapshot() if services.session_pool is not None else []
+    )
+    return {
+        "errorId": 0,
+        "proxies": services.proxy_pool.snapshot(),
+        "sessions": sessions,
+    }
 
 
 @router.get("/api/v1/health")

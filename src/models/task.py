@@ -14,6 +14,36 @@ class TaskObject(BaseModel):
     pageAction: str | None = None
     minScore: float | None = None
     isInvisible: bool | None = None
+
+    # ── Cloudflare Turnstile advanced params ──
+    # Widgets configured with an action / cData / chlPageData must receive the
+    # exact same values, otherwise the generated token is rejected server-side.
+    action: str | None = None
+    cData: str | None = None
+    chlPageData: str | None = None
+
+    # ── hCaptcha enterprise params ──
+    # `rqdata` (a.k.a. enterprise "data") binds the token to a challenge nonce.
+    rqdata: str | None = None
+    enterprisePayload: dict[str, object] | None = None
+
+    # ── Fingerprint / session binding ──
+    # Callers may force a specific User-Agent so the token they submit downstream
+    # matches the one used during solving. If omitted the solver picks a default
+    # and echoes it back in solution.userAgent.
+    userAgent: str | None = None
+
+    # ── Proxy (YesCaptcha-style fields) ──
+    # CF / reCAPTCHA tokens are IP-bound; solving through the same egress IP the
+    # caller will submit from is required for the token to validate.
+    proxyType: str | None = None
+    proxyAddress: str | None = None
+    proxyPort: int | None = None
+    proxyLogin: str | None = None
+    proxyPassword: str | None = None
+    # Convenience single-string form: "http://user:pass@host:port"
+    proxy: str | None = None
+
     # Image captcha / classification fields
     body: str | None = None
     image: str | None = None
@@ -26,6 +56,10 @@ class TaskObject(BaseModel):
 class CreateTaskRequest(BaseModel):
     clientKey: str
     task: TaskObject
+    # Optional idempotency key: retries carrying the same key coalesce onto the
+    # same task instead of launching a second solve (no double-spend of proxies /
+    # model calls).
+    idempotencyKey: str | None = None
 
 
 class CreateTaskResponse(BaseModel):

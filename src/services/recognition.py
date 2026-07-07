@@ -7,6 +7,7 @@ Images are resized to 1440x900 for consistent coordinate space.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -100,7 +101,10 @@ class CaptchaRecognizer:
         )
 
     async def recognize(self, image_bytes: bytes) -> dict[str, Any]:
-        processed = self._preprocess_image(image_bytes)
+        # LANCZOS resize is CPU-bound; run it in a worker thread so a batch of
+        # concurrent recognitions doesn't block the event loop (and every
+        # in-flight browser solve with it).
+        processed = await asyncio.to_thread(self._preprocess_image, image_bytes)
         b64 = base64.b64encode(processed).decode()
         data_url = f"data:image/png;base64,{b64}"
 

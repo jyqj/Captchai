@@ -9,6 +9,7 @@ vision model for analysis and return structured coordinate/index results.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -161,8 +162,11 @@ class ClassificationSolver:
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = []
 
-        for img_b64 in images:
-            data_url = self._prepare_image(img_b64)
+        # PIL decode/format sniffing is CPU-bound; keep it off the event loop.
+        data_urls = await asyncio.gather(
+            *(asyncio.to_thread(self._prepare_image, img_b64) for img_b64 in images)
+        )
+        for data_url in data_urls:
             content.append({
                 "type": "image_url",
                 "image_url": {"url": data_url, "detail": "high"},

@@ -232,10 +232,29 @@ OhMyCaptcha uses two model backends — a **local model** for image tasks and a 
 | `CLIENT_KEY` | Client authentication key | unset |
 | `CAPTCHA_RETRIES` | Retry count | `3` |
 | `CAPTCHA_TIMEOUT` | Model timeout (seconds) | `30` |
+| `CAPTCHA_MAX_CONCURRENCY` | Max concurrent browser solves | `4` |
+| `CAPTCHA_SOLVE_TIMEOUT` | Per-task wall-clock budget (seconds) | `180` |
 | `BROWSER_HEADLESS` | Headless Chromium | `true` |
 | `BROWSER_TIMEOUT` | Page load timeout (seconds) | `30` |
 | `SERVER_HOST` | Bind host | `0.0.0.0` |
 | `SERVER_PORT` | Bind port | `8000` |
+
+### Proxy & User-Agent binding (Turnstile / hCaptcha / reCAPTCHA)
+
+Cloudflare and Google bind tokens to the **egress IP** and **User-Agent** used at solve time. For real (non-test) sitekeys, pass a proxy and reuse the returned `solution.userAgent` (and the same proxy IP) when submitting the token downstream:
+
+```jsonc
+"task": {
+  "type": "TurnstileTaskProxyless",
+  "websiteURL": "https://example.com",
+  "websiteKey": "0x4AAA...",
+  "action": "login",          // if the widget sets one
+  "cData": "…",               // if the widget sets one
+  "userAgent": "Mozilla/5.0 … Chrome/131.0.0.0 Safari/537.36",
+  "proxyType": "http", "proxyAddress": "1.2.3.4", "proxyPort": 8080,
+  "proxyLogin": "user", "proxyPassword": "pass"
+}
+```
 
 > Legacy vars (`CAPTCHA_BASE_URL`, `CAPTCHA_API_KEY`, `CAPTCHA_MODEL`, `CAPTCHA_MULTIMODAL_MODEL`) are supported as fallbacks.
 

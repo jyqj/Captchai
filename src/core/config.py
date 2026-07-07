@@ -45,6 +45,54 @@ class Config:
     browser_headless: bool
     browser_timeout: int  # seconds
 
+    # ── Runtime / concurrency (orchestration plane) ──
+    # Browser solves and pure-vision (classification/recognition) calls draw from
+    # separate concurrency pools so a burst of image tasks can't starve browser
+    # solvers. See services/task_manager.py.
+    browser_concurrency: int
+    vision_concurrency: int
+    # Bounded task queue admission control; 0 disables the cap.
+    queue_max_size: int
+    # Per-task wall-clock budget (seconds) enforced by the scheduler.
+    solve_timeout: int
+
+    # ── Token polling (unified budget) ──
+    # Single poll budget shared by hCaptcha / Turnstile widget-token extraction.
+    poll_budget: int  # seconds
+    poll_interval: float  # seconds between checks
+
+    # ── Vision routing (parsing plane) ──
+    # When true, hard grid challenges may escalate to the powerful cloud model.
+    vision_cloud_enabled: bool
+    # Self-consistency: sample the model this many times and majority-vote per
+    # tile when confidence is low. 1 disables voting.
+    vision_vote_samples: int
+    # Escalate / re-vote when reported confidence is below this threshold.
+    vision_confidence_threshold: float
+    # OpenAI image `detail` for tier-2 (hard) grids.
+    vision_tier2_detail: str
+
+    # ── Asset pools ──
+    session_pool_size: int
+    session_max_solves: int
+    session_prewarm: bool
+    proxy_cooldown: int  # seconds
+    proxy_max_consecutive_fails: int
+    token_cache_ttl: int  # seconds
+    # Playwright runtime flavour: "chromium" (stock) | "rebrowser" | "camoufox".
+    browser_runtime: str
+
+    # ── State backend ──
+    # Redis URL for the persistent task store; None => in-memory fallback.
+    redis_url: str | None
+
+    # ── Billing / budget (consumption plane) ──
+    # Starting credit surfaced by getBalance; the ledger's spend is subtracted.
+    account_balance_usd: float
+    # Optional hard spend caps enforced by BudgetGuard before a cloud call.
+    budget_global_cap_usd: float | None
+    budget_per_client_cap_usd: float | None
+
     # ── Convenience aliases (backward-compat) ──
 
     @property
@@ -100,7 +148,55 @@ def load_config() -> Config:
         browser_headless=os.environ.get("BROWSER_HEADLESS", "true").strip().lower()
         in {"1", "true", "yes"},
         browser_timeout=int(os.environ.get("BROWSER_TIMEOUT", "30")),
+        # Runtime / concurrency
+        browser_concurrency=int(os.environ.get("BROWSER_CONCURRENCY", "4")),
+        vision_concurrency=int(os.environ.get("VISION_CONCURRENCY", "8")),
+        queue_max_size=int(os.environ.get("QUEUE_MAX_SIZE", "128")),
+        solve_timeout=int(
+            os.environ.get("CAPTCHA_SOLVE_TIMEOUT", os.environ.get("SOLVE_TIMEOUT", "180"))
+        ),
+        # Token polling
+        poll_budget=int(os.environ.get("POLL_BUDGET", "30")),
+        poll_interval=float(os.environ.get("POLL_INTERVAL", "0.5")),
+        # Vision routing
+        vision_cloud_enabled=os.environ.get("VISION_CLOUD_ENABLED", "true")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        vision_vote_samples=int(os.environ.get("VISION_VOTE_SAMPLES", "3")),
+        vision_confidence_threshold=float(
+            os.environ.get("VISION_CONFIDENCE_THRESHOLD", "0.6")
+        ),
+        vision_tier2_detail=os.environ.get("VISION_TIER2_DETAIL", "high"),
+        # Asset pools
+        session_pool_size=int(os.environ.get("SESSION_POOL_SIZE", "4")),
+        session_max_solves=int(os.environ.get("SESSION_MAX_SOLVES", "8")),
+        session_prewarm=os.environ.get("SESSION_PREWARM", "false").strip().lower()
+        in {"1", "true", "yes"},
+        proxy_cooldown=int(os.environ.get("PROXY_COOLDOWN", "120")),
+        proxy_max_consecutive_fails=int(
+            os.environ.get("PROXY_MAX_CONSECUTIVE_FAILS", "3")
+        ),
+        token_cache_ttl=int(os.environ.get("TOKEN_CACHE_TTL", "110")),
+        browser_runtime=os.environ.get("BROWSER_RUNTIME", "chromium").strip().lower(),
+        # State backend
+        redis_url=os.environ.get("REDIS_URL", "").strip() or None,
+        # Billing / budget
+        account_balance_usd=float(os.environ.get("ACCOUNT_BALANCE_USD", "99999.0")),
+        budget_global_cap_usd=_optional_float(os.environ.get("BUDGET_GLOBAL_CAP_USD")),
+        budget_per_client_cap_usd=_optional_float(
+            os.environ.get("BUDGET_PER_CLIENT_CAP_USD")
+        ),
     )
+
+
+def _optional_float(value: str | None) -> float | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 config = load_config()

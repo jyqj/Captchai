@@ -6,9 +6,10 @@ import asyncio
 import logging
 from typing import Any
 
-from playwright.async_api import Browser, Playwright, async_playwright
+from playwright.async_api import Browser
 
 from ..core.config import Config
+from .browser import BrowserManager
 
 log = logging.getLogger(__name__)
 
@@ -38,57 +39,42 @@ _EXECUTE_JS = """
 })
 """
 
-# Basic anti-detection init script
-_STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-window.chrome = {runtime: {}, loadTimes: () => {}, csi: () => {}};
-"""
-
-
 class RecaptchaV3Solver:
-    """Solves RecaptchaV3TaskProxyless tasks via headless Chromium."""
+    """Solves RecaptchaV3TaskProxyless tasks via a shared headless Chromium."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        manager: BrowserManager | None = None,
+        browser: Browser | None = None,
+    ) -> None:
         self._config = config
-        self._playwright: Playwright | None = None
-        self._browser: Browser | None = None
+        self._manager = manager or BrowserManager(config)
+        self._owns_manager = manager is None
+        if browser is not None:
+            self._manager._browser = browser  # type: ignore[attr-defined]
 
     async def start(self) -> None:
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self._config.browser_headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
-        log.info(
-            "Playwright browser started (headless=%s)", self._config.browser_headless
-        )
+        if self._owns_manager:
+            await self._manager.start()
 
     async def stop(self) -> None:
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-        log.info("Playwright browser stopped")
+        if self._owns_manager:
+            await self._manager.stop()
+        log.info("RecaptchaV3Solver stopped")
 
     async def solve(self, params: dict[str, Any]) -> dict[str, Any]:
         website_url = params["websiteURL"]
         website_key = params["websiteKey"]
-        page_action = params.get("pageAction", "verify")
+        page_action = params.get("pageAction") or params.get("action") or "verify"
 
         last_error: Exception | None = None
         for attempt in range(self._config.captcha_retries):
             try:
-                token = await self._solve_once(
-                    website_url, website_key, page_action
+                token, user_agent = await self._solve_once(
+                    website_url, website_key, page_action, params
                 )
-                return {"gRecaptchaResponse": token}
+                return {"gRecaptchaResponse": token, "userAgent": user_agent}
             except Exception as exc:
                 last_error = exc
                 log.warning(
@@ -106,22 +92,10 @@ class RecaptchaV3Solver:
         )
 
     async def _solve_once(
-        self, website_url: str, website_key: str, page_action: str
-    ) -> str:
-        assert self._browser is not None
-
-        context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-        )
-
+        self, website_url: str, website_key: str, page_action: str, params: dict[str, Any]
+    ) -> tuple[str, str]:
+        context, user_agent = await self._manager.new_context(params)
         page = await context.new_page()
-        await page.add_init_script(_STEALTH_JS)
 
         try:
             timeout_ms = self._config.browser_timeout * 1000
@@ -155,6 +129,6 @@ class RecaptchaV3Solver:
             log.info(
                 "Got reCAPTCHA token for %s (len=%d)", website_url, len(token)
             )
-            return token
+            return token, user_agent
         finally:
             await context.close()
