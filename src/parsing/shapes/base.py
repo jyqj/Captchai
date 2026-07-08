@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, List, Optional
 
 from ..dispatcher import ChallengeContext, VisionClient
+from .human_cursor import human_click
 
 log = logging.getLogger(__name__)
 
@@ -143,6 +144,58 @@ class BaseShapeSolver:
         except Exception as exc:  # noqa: BLE001
             log.debug("submit click failed: %s", exc)
             return False
+
+    # -- human-like acting -------------------------------------------------
+
+    async def human_click_tile(
+        self, frame: Any, index: int, ctx: ChallengeContext, selector: Optional[str] = None
+    ) -> bool:
+        """Click a tile with a human-like pointer path when a page is available.
+
+        hCaptcha scores mouse dynamics, so tiles are clicked by moving
+        ``page.mouse`` along an eased/jittered path (see :mod:`human_cursor`)
+        to a randomised point inside the tile, with a click dwell. When no page
+        is threaded on ``ctx.extra`` (unit tests) or humanisation is disabled,
+        or the geometry can't be read, this degrades to the plain
+        :meth:`click_tile`.
+        """
+        return await self._human_click_locator(
+            frame, selector or self.TILE_SELECTOR, ctx, index=index
+        )
+
+    async def human_click_submit(
+        self, frame: Any, ctx: ChallengeContext, selector: Optional[str] = None
+    ) -> bool:
+        """Human-like submit click; degrades to :meth:`click_submit`."""
+        return await self._human_click_locator(
+            frame, selector or self.SUBMIT_SELECTOR, ctx, index=None
+        )
+
+    async def _human_click_locator(
+        self, frame: Any, selector: str, ctx: ChallengeContext, *, index: Optional[int]
+    ) -> bool:
+        page = ctx.extra.get("page")
+        humanize = ctx.extra.get("humanize", True)
+        if page is not None and humanize:
+            try:
+                locator = frame.locator(selector)
+                locator = locator.nth(index) if index is not None else locator.first
+                box = await locator.bounding_box()
+                if box:
+                    new_cursor = await human_click(
+                        page,
+                        box,
+                        cursor=ctx.extra.get("_cursor"),
+                        jitter_ms=float(ctx.extra.get("humanize_jitter_ms", 90.0)),
+                    )
+                    if new_cursor is not None:
+                        ctx.extra["_cursor"] = new_cursor
+                        return True
+            except Exception as exc:  # noqa: BLE001 - fall back to plain click
+                log.debug("human click on %s failed: %s", selector, exc)
+        if index is not None:
+            return await self.click_tile(frame, index, selector)
+        return await self.click_submit(frame, selector)
 
     async def classify(self, req: ClassifyRequest) -> Optional[Any]:
         """Call the injected vision client. Returns the raw result or None."""

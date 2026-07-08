@@ -309,10 +309,18 @@ class ProxyPool:
     """Concurrency-safe collection of proxies with health-aware selection."""
 
     def __init__(
-        self, *, cooldown_seconds: int = 120, max_consecutive_fails: int = 3
+        self,
+        *,
+        cooldown_seconds: int = 120,
+        max_consecutive_fails: int = 3,
+        max_bytes_per_proxy: int = 0,
     ) -> None:
         self._cooldown_seconds = cooldown_seconds
         self._max_consecutive_fails = max_consecutive_fails
+        # Bandwidth quota per proxy in bytes; 0 disables. Residential/mobile
+        # proxies are billed per GB, so a proxy that has burned through its
+        # quota is retired ("burned") to cap spend regardless of its health.
+        self._max_bytes_per_proxy = max_bytes_per_proxy
         self._proxies: Dict[str, ProxyAsset] = {}
         # Created lazily so the pool can be constructed outside a running event
         # loop (on Python 3.9 asyncio.Lock() binds to the loop at construction).
@@ -435,6 +443,14 @@ class ProxyPool:
                     proxy.cooldown_until = (
                         time.monotonic() + self._cooldown_seconds
                     )
+            # Bandwidth quota overrides health: a proxy past its byte cap is
+            # burned (removed from rotation) even on a successful solve, so
+            # metered residential/mobile spend stays bounded.
+            if (
+                self._max_bytes_per_proxy
+                and proxy.bytes_used >= self._max_bytes_per_proxy
+            ):
+                proxy.state = "burned"
 
     async def report_sitekey(
         self, proxy_id: str, sitekey: str, *, success: bool
@@ -581,6 +597,7 @@ class RedisProxyPool:
         max_consecutive_fails: int = 3,
         key_prefix: str = "captcha:proxy",
         lock_timeout_seconds: int = 5,
+        max_bytes_per_proxy: int = 0,
     ) -> None:
         try:
             import redis.asyncio as aioredis  # noqa: WPS433
@@ -592,6 +609,7 @@ class RedisProxyPool:
             ) from exc
         self._cooldown_seconds = cooldown_seconds
         self._max_consecutive_fails = max_consecutive_fails
+        self._max_bytes_per_proxy = max_bytes_per_proxy
         self._prefix = key_prefix
         self._lock_key = f"{key_prefix}:lock"
         self._lock_timeout = lock_timeout_seconds
@@ -842,6 +860,12 @@ class RedisProxyPool:
                     proxy.cooldown_until = (
                         time.time() + self._cooldown_seconds
                     )
+            # Bandwidth quota overrides health (see in-memory ProxyPool.report).
+            if (
+                self._max_bytes_per_proxy
+                and proxy.bytes_used >= self._max_bytes_per_proxy
+            ):
+                proxy.state = "burned"
             await self._redis.hset(
                 self._proxies_key, proxy_id, self._serialize(proxy)
             )
@@ -966,14 +990,26 @@ def build_proxy_pool(config: Any) -> "ProxyPool | RedisProxyPool":
     shared across workers and survive a restart, so a proxy that burned on
     worker A isn't retried by worker B.
     """
+    max_bytes = _gb_to_bytes(getattr(config, "proxy_max_gb", 0.0))
     redis_url = getattr(config, "redis_url", None)
     if redis_url:
         return RedisProxyPool(
             redis_url,
             cooldown_seconds=getattr(config, "proxy_cooldown", 120),
             max_consecutive_fails=getattr(config, "proxy_max_consecutive_fails", 3),
+            max_bytes_per_proxy=max_bytes,
         )
     return ProxyPool(
         cooldown_seconds=getattr(config, "proxy_cooldown", 120),
         max_consecutive_fails=getattr(config, "proxy_max_consecutive_fails", 3),
+        max_bytes_per_proxy=max_bytes,
     )
+
+
+def _gb_to_bytes(gb: float) -> int:
+    """Convert a GB quota to bytes; non-positive / missing means unlimited (0)."""
+    try:
+        value = float(gb)
+    except (TypeError, ValueError):
+        return 0
+    return int(value * 1024**3) if value > 0 else 0

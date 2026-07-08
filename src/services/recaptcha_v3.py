@@ -7,7 +7,12 @@ import logging
 import time
 from typing import Any
 
-from .browser_solver import BaseBrowserSolver, fingerprint_geo_from_params, has_task_proxy
+from .browser_solver import (
+    BaseBrowserSolver,
+    egress_from_params,
+    fingerprint_geo_from_params,
+    has_task_proxy,
+)
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +83,7 @@ class RecaptchaV3Solver(BaseBrowserSolver):
                     "userAgent": user_agent,
                     "timezoneId": tz,
                     "acceptLanguage": accept,
+                    **egress_from_params(params),
                 }
             except Exception as exc:
                 last_error = exc

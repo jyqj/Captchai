@@ -51,9 +51,11 @@ from ..parsing.shapes.dynamic_grid import DynamicGridSolver
 from ..parsing.shapes.grid_select import GridSelectSolver
 from ..parsing.shapes.slide import CanvasSlideSolver
 from ..parsing.vision_adapter import VisionAdapter
+from .captcha_errors import CaptchaError, classify_widget_error
 from .browser_solver import (
     BaseBrowserSolver,
     ProxyKind,
+    egress_from_params,
     fingerprint_geo_from_params,
     has_task_proxy,
 )
@@ -210,7 +212,30 @@ class HCaptchaSolver(BaseBrowserSolver):
                     "userAgent": user_agent,
                     "timezoneId": tz,
                     "acceptLanguage": accept,
+                    **egress_from_params(params),
                 }
+            except CaptchaError as exc:
+                # A classified widget error: record its specific outcome
+                # (e.g. "rate_limited") and fail fast when retrying can't help
+                # (rate-limit / bad request). The proxy is already cooled down
+                # by _release_context(solved=False), so the next task lands on a
+                # different egress instead of hammering this one.
+                last_error = exc
+                await self._record(
+                    params, website_key, client_key, exc.outcome, started
+                )
+                log.warning(
+                    "HCaptcha attempt %d/%d: %s (retryable=%s)",
+                    attempt + 1,
+                    self._config.captcha_retries,
+                    exc,
+                    exc.retryable,
+                )
+                if not exc.retryable:
+                    raise
+                params["_hcaptcha_vision_tier"] = 2
+                if attempt < self._config.captcha_retries - 1:
+                    await asyncio.sleep(2)
             except Exception as exc:
                 last_error = exc
                 await self._record(
@@ -477,10 +502,11 @@ class HCaptchaSolver(BaseBrowserSolver):
         params: dict[str, Any],
         client_key: Optional[str],
     ) -> Optional[str]:
-        # Surface a widget error-callback immediately as a distinguishable error.
+        # Surface a widget error-callback immediately as a classified error so
+        # the solve loop reacts per kind (rate-limit → fail fast, etc.).
         err = await page.evaluate("() => window.__omcError || null")
         if err:
-            raise RuntimeError(f"hCaptcha widget error: {err}")
+            raise classify_widget_error(err, provider="hCaptcha")
 
         challenge_frame: FrameLocator = page.frame_locator(_CHALLENGE_IFRAME)
 
@@ -496,7 +522,17 @@ class HCaptchaSolver(BaseBrowserSolver):
             prompt="",
             task_id=params.get("_taskId"),
             sitekey=website_key,
-            extra={"page": page},
+            extra={
+                "page": page,
+                # Shape solvers move page.mouse along a human-like path for tile
+                # / submit clicks when this is set; gated by the same flag that
+                # controls the pre-checkbox mouse warmup so tests / invisible
+                # widgets can disable it.
+                "humanize": getattr(self._config, "human_mouse_enabled", True),
+                "humanize_jitter_ms": getattr(
+                    self._config, "human_mouse_jitter_ms", 90
+                ),
+            },
         )
 
         original_solve = dispatcher.solve
@@ -568,7 +604,7 @@ class HCaptchaSolver(BaseBrowserSolver):
                 log.info("Got hCaptcha token (len=%d)", len(token))
                 return token
             if err:
-                raise RuntimeError(f"hCaptcha widget error: {err}")
+                raise classify_widget_error(err, provider="hCaptcha")
             remaining_ms = int((deadline - asyncio.get_event_loop().time()) * 1000)
             if remaining_ms <= 0:
                 break

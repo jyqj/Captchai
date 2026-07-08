@@ -71,9 +71,9 @@ class GridSelectSolver(BaseShapeSolver):
                     continue
 
             for i in indices:
-                await self.click_tile(frame, i)
+                await self.human_click_tile(frame, i, ctx)
 
-            await self.click_submit(frame)
+            await self.human_click_submit(frame, ctx)
 
             token = await self.poll_token()
             if token:

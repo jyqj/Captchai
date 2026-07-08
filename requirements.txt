@@ -11,3 +11,9 @@ mkdocs-material==9.6.7
 mkdocs-redirects==1.2.2
 mkdocs-static-i18n==1.3.0
 pymdown-extensions==10.14.3
+
+# ── Optional hardened runtime (BROWSER_RUNTIME=camoufox) ──
+# Camoufox is a large, optional dependency (pulls a patched Firefox build).
+# Install only when you need it for enterprise hCaptcha / tough anti-bot:
+#   pip install camoufox==0.4.11 && python -m camoufox fetch
+# camoufox==0.4.11

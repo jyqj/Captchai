@@ -118,7 +118,7 @@ async def create_task(request: CreateTaskRequest) -> CreateTaskResponse:
     # in the ledger. Prefixed with '_' to distinguish from YesCaptcha fields.
     params["_clientKey"] = request.clientKey
     try:
-        task_id = task_manager.create_task(
+        task_id = await task_manager.acreate_task(
             request.task.type, params, idempotency_key=request.idempotencyKey
         )
     except QueueFull as exc:
@@ -217,10 +217,22 @@ async def admin_proxies(clientKey: str = "") -> dict[str, object]:
 
 @router.get("/api/v1/health")
 async def health() -> dict[str, object]:
+    # Surface the actual (post-fallback) browser runtime alongside the
+    # requested one so a silent degrade to stock Chromium is observable.
+    runtime_requested = config.browser_runtime
+    runtime_actual = config.browser_runtime
+    services = get_services()
+    manager = getattr(services, "browser_manager", None) if services else None
+    if manager is not None:
+        runtime_requested = getattr(manager, "requested_runtime", runtime_requested)
+        runtime_actual = getattr(manager, "runtime", runtime_actual)
     return {
         "status": "ok",
         "supported_task_types": task_manager.supported_types(),
         "browser_headless": config.browser_headless,
+        "browser_runtime": runtime_actual,
+        "browser_runtime_requested": runtime_requested,
+        "browser_runtime_degraded": runtime_actual != runtime_requested,
         "cloud_model": config.cloud_model,
         "local_model": config.local_model,
     }
@@ -314,6 +326,24 @@ async def _report_outcome(
         except Exception:  # noqa: BLE001 - non-fatal: report must not 500
             log.debug(
                 "proxy_pool.report_sitekey_real failed for task %s",
+                request.taskId,
+                exc_info=True,
+            )
+
+    # Real outcome also drives proxy *health*, not just per-sitekey ranking:
+    # a pool proxy whose tokens are rejected downstream (correct=False) accrues
+    # a consecutive-fail streak and cools down, even though it "obtained" a
+    # token during the solve. Without this, a proxy that reliably mints tokens
+    # that Stripe/hCaptcha-enterprise then reject would keep a 100% health
+    # score and be reselected indefinitely. Only pool proxies (rec.proxy_id
+    # set) are governed here; caller-supplied task proxies are the caller's
+    # responsibility.
+    if rec.proxy_id:
+        try:
+            await services.proxy_pool.report(rec.proxy_id, success=correct)
+        except Exception:  # noqa: BLE001 - non-fatal: report must not 500
+            log.debug(
+                "proxy_pool.report (real outcome) failed for task %s",
                 request.taskId,
                 exc_info=True,
             )

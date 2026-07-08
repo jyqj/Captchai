@@ -28,6 +28,9 @@ class TaskStore(Protocol):
     async def update(self, task_id: str, **fields: Any) -> None: ...
     async def delete(self, task_id: str) -> None: ...
     async def all_ids(self) -> list[str]: ...
+    async def claim_idempotency(
+        self, key: str, task_id: str, ttl_seconds: int
+    ) -> str: ...
     async def close(self) -> None: ...
 
 
@@ -37,6 +40,9 @@ class InMemoryTaskStore:
     def __init__(self, ttl_seconds: int = 600) -> None:
         self._ttl = ttl_seconds
         self._data: dict[str, dict[str, Any]] = {}
+        # idempotency key -> (owning task_id, expires_at). Mirrors the Redis
+        # SET-NX claim so the in-process path shares the same interface.
+        self._idem: dict[str, tuple[str, float]] = {}
 
     async def put(self, task_id: str, record: dict[str, Any]) -> None:
         record.setdefault("stored_at", time.time())
@@ -62,8 +68,24 @@ class InMemoryTaskStore:
     async def all_ids(self) -> list[str]:
         return list(self._data.keys())
 
+    async def claim_idempotency(
+        self, key: str, task_id: str, ttl_seconds: int
+    ) -> str:
+        """Claim ``key`` for ``task_id``; return the owner (this or the prior).
+
+        Returns ``task_id`` when this call won the claim (or the prior claim
+        expired), or the existing owner's task id when another claim is live.
+        """
+        now = time.time()
+        existing = self._idem.get(key)
+        if existing is not None and existing[1] > now:
+            return existing[0]
+        self._idem[key] = (task_id, now + ttl_seconds)
+        return task_id
+
     async def close(self) -> None:
         self._data.clear()
+        self._idem.clear()
 
     def _expired(self, rec: dict[str, Any]) -> bool:
         stored_at = rec.get("stored_at", 0.0)
@@ -119,6 +141,23 @@ class RedisTaskStore:
 
     async def all_ids(self) -> list[str]:
         return list(await self._redis.smembers(self._INDEX))
+
+    async def claim_idempotency(
+        self, key: str, task_id: str, ttl_seconds: int
+    ) -> str:
+        """Atomic cross-worker claim via ``SET {key} {task_id} NX EX ttl``.
+
+        The first worker to set the key wins and gets ``task_id`` back; every
+        other worker (concurrent or a later retry within the TTL) reads the
+        stored owner and gets it back instead, so the expensive solve is spawned
+        exactly once per idempotency key across the whole cluster.
+        """
+        redis_key = f"captcha:idem:{key}"
+        won = await self._redis.set(redis_key, task_id, nx=True, ex=ttl_seconds)
+        if won:
+            return task_id
+        existing = await self._redis.get(redis_key)
+        return existing or task_id
 
     async def close(self) -> None:
         await self._redis.aclose()

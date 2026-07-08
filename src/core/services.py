@@ -52,11 +52,15 @@ class SolverServices:
         # Asset plane.
         self.proxy_pool = build_proxy_pool(config)
         self.session_pool: Optional[SessionPool] = None
+        # Set by ``attach_browser`` so admin/health can surface the actual
+        # browser runtime (post-fallback) without reaching into module globals.
+        self.browser_manager = None
 
         self._load_proxy_inventory()
 
     def attach_browser(self, manager) -> None:
         """Wire the warm session pool once the browser manager is available."""
+        self.browser_manager = manager
         if self.config.session_pool_size <= 0:
             self.session_pool = None
             return

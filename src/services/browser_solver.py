@@ -64,6 +64,32 @@ def proxy_ip_from_params(params: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def egress_from_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Egress identity to surface in the solution for IP-binding alignment.
+
+    Enterprise hCaptcha (and any IP-bound token — Turnstile, reCAPTCHA v2) is
+    validated against the egress IP that minted it. When the service solves on
+    a server-side pool proxy the caller otherwise has no way to know *which*
+    egress to submit their downstream request from, so the token is rejected.
+
+    This surfaces:
+
+    * ``proxyKind`` — ``proxyless`` / ``pool_proxy`` / ``task_proxy`` so the
+      caller knows whether the token is bound to their own proxy, the server
+      pool, or the bare server IP.
+    * ``egressServer`` — the proxy gateway (scheme://host:port, credentials
+      stripped) used for the solve, so the caller can route their downstream
+      submit through the same egress. ``None`` for proxyless solves.
+
+    Both keys are omitted (``None``) when unknown so the solution stays
+    backward compatible with YesCaptcha clients that ignore extra fields.
+    """
+    return {
+        "proxyKind": params.get("_proxyKind"),
+        "egressServer": params.get("_egress_server"),
+    }
+
+
 def fingerprint_geo_from_params(params: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
     """Return ``(timezone_id, accept_language)`` stashed on ``params``.
 
@@ -177,6 +203,11 @@ class BaseBrowserSolver:
                 "(proxy / proxyAddress+proxyPort fields)"
             )
         params["_proxyKind"] = ProxyKind.TASK_PROXY.value
+        task_asset = proxy_from_params(params)
+        if task_asset is not None:
+            # Credential-free gateway (scheme://host:port) surfaced back to the
+            # caller so they can align their downstream submit egress.
+            params["_egress_server"] = task_asset.server
         context, user_agent = await self._manager.new_context(params)
         return SolveContext(
             context=context,
@@ -233,6 +264,9 @@ class BaseBrowserSolver:
             )
         params["_pool_proxy_id"] = pool_proxy.id
         params["_proxyKind"] = ProxyKind.POOL_PROXY.value
+        # Credential-free gateway of the checked-out pool proxy so the caller
+        # can route their downstream (IP-bound) submit through the same egress.
+        params["_egress_server"] = pool_proxy.server
         # WP3: thread the proxy's exit-IP geo + a deterministic seed so a
         # fresh-context build (no session pool) produces a fingerprint
         # aligned with the proxy's egress. Warm sessions read these from the

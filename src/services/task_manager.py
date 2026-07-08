@@ -206,7 +206,15 @@ class TaskManager:
         task_type: str,
         params: dict[str, Any],
         idempotency_key: str | None = None,
+        *,
+        task_id: str | None = None,
     ) -> str:
+        """Synchronous admission (same-worker idempotency only).
+
+        Kept for callers/tests that admit within one process. For cross-worker
+        deduplication (Redis configured) prefer :meth:`acreate_task`, which adds
+        an atomic store-level claim before spawning the solve.
+        """
         self._cleanup_expired()
 
         # Coalesce retries carrying the same idempotency key onto one task.
@@ -220,7 +228,70 @@ class TaskManager:
                 f"in-flight tasks at capacity ({self._queue_max_size})"
             )
 
+        return self._admit(
+            task_type, params, idempotency_key, task_id or str(uuid.uuid4())
+        )
+
+    async def acreate_task(
+        self,
+        task_type: str,
+        params: dict[str, Any],
+        idempotency_key: str | None = None,
+    ) -> str:
+        """Async admission with a cross-worker idempotency claim.
+
+        A same-worker retry is coalesced via the in-memory map (fast path). For
+        a cross-worker retry, the store's atomic ``claim_idempotency`` (Redis
+        ``SET NX``) decides ownership *before* the solve is spawned, so a client
+        retry that lands on a different worker returns the original task id
+        instead of double-spending a proxy / model call. The queue check runs
+        before the claim so a rejected (full) admission never leaves a dangling
+        claim that a retry would resolve to a non-existent task.
+        """
+        self._cleanup_expired()
+
+        if idempotency_key:
+            existing_id = self._idempotency.get(idempotency_key)
+            if existing_id and existing_id in self._tasks:
+                return existing_id
+
+        if self._queue_max_size and self._inflight_count() >= self._queue_max_size:
+            raise QueueFull(
+                f"in-flight tasks at capacity ({self._queue_max_size})"
+            )
+
         task_id = str(uuid.uuid4())
+        if idempotency_key and self._store is not None:
+            claim = getattr(self._store, "claim_idempotency", None)
+            if claim is not None:
+                try:
+                    owner = await claim(
+                        idempotency_key, task_id, self._idempotency_ttl()
+                    )
+                except Exception:  # noqa: BLE001 - never fail admission on claim
+                    owner = task_id
+                if owner and owner != task_id:
+                    return owner
+
+        return self._admit(task_type, params, idempotency_key, task_id)
+
+    def _idempotency_ttl(self) -> int:
+        """TTL (seconds) for a cross-worker idempotency claim.
+
+        Matches the task store's record TTL (``solve_timeout * 4``, see
+        ``build_store``) with a small floor so a retry within the task's
+        lifetime resolves to the original id, and the claim expires afterwards.
+        """
+        return max(60, int(self._solve_timeout) * 4)
+
+    def _admit(
+        self,
+        task_type: str,
+        params: dict[str, Any],
+        idempotency_key: str | None,
+        task_id: str,
+    ) -> str:
+        """Register a task, mirror it to the store, and spawn its runner."""
         task = Task(
             id=task_id,
             type=task_type,
@@ -231,8 +302,7 @@ class TaskManager:
         if idempotency_key:
             self._idempotency[idempotency_key] = task_id
 
-        # Best-effort persistence. ``create_task`` is sync (the API route does
-        # not await it), so we can't await the store here; fire-and-forget.
+        # Best-effort persistence; fire-and-forget so a sync caller doesn't block.
         self._persist_fire_and_forget(task)
 
         runner = asyncio.create_task(self._process_task(task))

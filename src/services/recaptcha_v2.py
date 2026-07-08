@@ -21,7 +21,11 @@ from typing import Any
 
 import httpx
 
-from .browser_solver import BaseBrowserSolver, fingerprint_geo_from_params
+from .browser_solver import (
+    BaseBrowserSolver,
+    egress_from_params,
+    fingerprint_geo_from_params,
+)
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +93,7 @@ class RecaptchaV2Solver(BaseBrowserSolver):
                     "userAgent": user_agent,
                     "timezoneId": tz,
                     "acceptLanguage": accept,
+                    **egress_from_params(params),
                 }
             except Exception as exc:
                 last_error = exc

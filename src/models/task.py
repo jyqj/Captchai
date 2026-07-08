@@ -95,6 +95,13 @@ class SolutionObject(BaseModel):
     # context. Optional — omitted when the solver didn't pin a fingerprint.
     timezoneId: str | None = None
     acceptLanguage: str | None = None
+    # Egress identity of the solve, surfaced so callers can submit an IP-bound
+    # token (enterprise hCaptcha / Turnstile / reCAPTCHA v2) from the SAME
+    # egress that minted it. ``proxyKind`` is proxyless / pool_proxy /
+    # task_proxy; ``egressServer`` is the credential-free proxy gateway
+    # (scheme://host:port) or null for proxyless / server-egress solves.
+    proxyKind: str | None = None
+    egressServer: str | None = None
 
 
 class GetTaskResultResponse(BaseModel):

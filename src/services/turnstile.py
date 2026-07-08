@@ -28,7 +28,12 @@ from typing import Any, Optional
 
 from playwright.async_api import Route
 
-from .browser_solver import BaseBrowserSolver, fingerprint_geo_from_params
+from .browser_solver import (
+    BaseBrowserSolver,
+    egress_from_params,
+    fingerprint_geo_from_params,
+)
+from .captcha_errors import CaptchaError, classify_widget_error
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +118,24 @@ class TurnstileSolver(BaseBrowserSolver):
                     "userAgent": user_agent,
                     "timezoneId": tz,
                     "acceptLanguage": accept,
+                    **egress_from_params(params),
                 }
+            except CaptchaError as exc:
+                last_error = exc
+                await self._record(
+                    params, website_key, client_key, exc.outcome, started
+                )
+                log.warning(
+                    "Turnstile attempt %d/%d: %s (retryable=%s)",
+                    attempt + 1,
+                    self._config.captcha_retries,
+                    exc,
+                    exc.retryable,
+                )
+                if not exc.retryable:
+                    raise
+                if attempt < self._config.captcha_retries - 1:
+                    await asyncio.sleep(2)
             except Exception as exc:
                 last_error = exc
                 await self._record(
@@ -198,7 +220,7 @@ class TurnstileSolver(BaseBrowserSolver):
             if isinstance(token, str) and len(token) > 20:
                 return token
             if err:
-                raise RuntimeError(f"Turnstile widget error: {err}")
+                raise classify_widget_error(err, provider="Turnstile")
 
             remaining_ms = int(
                 (deadline - asyncio.get_event_loop().time()) * 1000

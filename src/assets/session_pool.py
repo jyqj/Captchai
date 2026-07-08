@@ -209,20 +209,40 @@ class SessionPool:
         return None
 
     def _evict_one_idle(self) -> Optional[BrowserSession]:
-        """Pop an idle session from any bucket to free its slot (caller retires it).
+        """Pop the *least valuable* idle session to free its slot for a new one.
 
         Buckets share the global ``size`` bound, so warming a new egress
         identity when every slot is held may require retiring an idle session
-        bound to a different identity. Returns ``None`` when nothing is idle
-        (all slots held by in-use sessions). Must be called under ``self._lock``.
+        bound to a different identity. Rather than evicting an arbitrary bucket
+        (which could throw away a high-reputation, freshly-warmed session and
+        keep a nearly-exhausted low-reputation one), pick the worst idle session
+        across all buckets: lowest reputation first, then most solves (closest
+        to ``max_solves``), then oldest. This preserves the warmest, most
+        trusted sessions — the ones most likely to keep passing enterprise
+        risk checks — under slot pressure.
+
+        Returns ``None`` when nothing is idle (all slots held by in-use
+        sessions). Must be called under ``self._lock``.
         """
-        for k, bucket in list(self._idle.items()):
-            if bucket:
-                session = bucket.pop()
-                if not bucket:
-                    del self._idle[k]
-                return session
-        return None
+        worst_key: Optional[str] = None
+        worst: Optional[BrowserSession] = None
+        for key, bucket in self._idle.items():
+            for session in bucket:
+                rank = (session.reputation, -session.solves, session.created_at)
+                if worst is None or rank < (
+                    worst.reputation,
+                    -worst.solves,
+                    worst.created_at,
+                ):
+                    worst = session
+                    worst_key = key
+        if worst is None or worst_key is None:
+            return None
+        bucket = self._idle[worst_key]
+        bucket.remove(worst)
+        if not bucket:
+            del self._idle[worst_key]
+        return worst
 
     async def release(
         self, session: BrowserSession, *, success: bool, burned: bool = False

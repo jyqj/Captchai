@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from src.assets.model_pool import ModelPool, ModelUsage
+from src.parsing.image_grid import compose_grid
 
 SYSTEM_PROMPT = (
     "You are a strict CAPTCHA grid classifier. You are shown a challenge prompt "
@@ -67,6 +68,12 @@ _SHAPE_PROMPTS = {
     "canvas_slide": SLIDE_DISTANCE_PROMPT,
     "drag_drop": DRAG_PATH_PROMPT,
 }
+
+# Shapes whose images are independent tiles of one grid — the only ones where a
+# single-image montage preserves the classifier's index contract. Coordinate
+# shapes (area_bbox / slide / drag) already send one image, so stitching is a
+# no-op for them and must never apply (it would corrupt pixel coordinates).
+_STITCHABLE_SHAPES = {"grid_select", "recaptcha_dynamic"}
 
 # Temperature used for self-consistency voting samples (must be > 0 so the
 # model produces varied samples to vote over).
@@ -133,6 +140,11 @@ class VisionRouter:
     async def classify(
         self, req: VisionRequest, *, client_key: "str | None" = None
     ) -> VisionResult:
+        # Collapse a multi-tile grid into a single montage before routing so the
+        # cost estimate, the single call, and every vote sample all operate on
+        # one image instead of N. Transparent to the index contract (tiles keep
+        # their left-to-right / top-to-bottom order) and reversible via config.
+        req = self._maybe_stitch(req)
         model_name = self._route(req)
 
         # Budget gate — only paid (cloud) calls are checked. A denial with a
@@ -231,6 +243,31 @@ class VisionRouter:
             raw=raw,
             **shape_fields,
         )
+
+    def _maybe_stitch(self, req: VisionRequest) -> VisionRequest:
+        """Return ``req`` with its tiles composed into one grid image, or as-is.
+
+        Gated by ``VISION_STITCH_GRID`` (default on). Applies only to grid-shape
+        requests with 2+ tiles; any failure (Pillow missing, undecodable tile)
+        returns the original request so the per-tile path runs unchanged. The
+        montage's row/column count is appended to the prompt so the model can
+        reason about the exact layout, and ``grid_size`` is recorded.
+        """
+        if not getattr(self._config, "vision_stitch_grid", True):
+            return req
+        if req.shape not in _STITCHABLE_SHAPES or len(req.images) < 2:
+            return req
+        composed = compose_grid(list(req.images))
+        if composed is None:
+            return req
+        image_bytes, rows, cols = composed
+        n = len(req.images)
+        prompt = (
+            f"{req.prompt}\n\nThe image is a single {rows}x{cols} grid montage of "
+            f"{n} tiles laid out left-to-right, top-to-bottom (index 0 is top-left, "
+            f"index {n - 1} is the last tile). Return the matching tile indices."
+        )
+        return replace(req, images=[image_bytes], prompt=prompt, grid_size=n)
 
     async def _budget_allows_cloud(
         self, req: VisionRequest, client_key: "str | None"

@@ -82,6 +82,12 @@ class Config:
     # WP4: when a tier-1 (local) call returns confidence below threshold, retry
     # inline on the cloud model before falling back to a full browser redo.
     vision_inline_escalate: bool
+    # When true, multi-tile grid challenges are composed into a single montage
+    # image before the model call (1 image instead of N) — ~N× cheaper on input
+    # tokens and decode latency, with voting multiplying the saving. Tile order
+    # is preserved so the index contract is unchanged. Set false to send each
+    # tile as its own image (max per-tile resolution, higher cost).
+    vision_stitch_grid: bool
 
     # ── Resource interception (WP4 performance) ──
     # When true, BrowserManager._build_context registers a per-context route
@@ -104,6 +110,9 @@ class Config:
     session_prewarm: bool
     proxy_cooldown: int  # seconds
     proxy_max_consecutive_fails: int
+    # Per-proxy bandwidth quota in GB; 0 disables. A proxy that exceeds it is
+    # burned (removed from rotation) to cap metered residential/mobile spend.
+    proxy_max_gb: float
     token_cache_ttl: int  # seconds
     # Playwright runtime flavour: "chromium" (stock) | "rebrowser" | "camoufox".
     # Enterprise hCaptcha deployments should set BROWSER_RUNTIME=camoufox (a
@@ -112,6 +121,19 @@ class Config:
     # switching (running multiple browser processes side-by-side) is out of
     # scope for the current batch; the runtime is process-wide.
     browser_runtime: str
+    # When true, a requested hardened runtime (camoufox / rebrowser) that is
+    # unavailable or fails to launch is a FATAL startup error instead of a
+    # silent degrade to stock Chromium. Recommended for enterprise hCaptcha
+    # deployments so an operator never unknowingly runs detectable Chromium.
+    browser_runtime_strict: bool
+    # ── Camoufox runtime knobs (only used when BROWSER_RUNTIME=camoufox) ──
+    # Camoufox owns the fingerprint at the engine level; these tune its launch.
+    # ``humanize`` adds camoufox's built-in human-like cursor motion; block
+    # WebRTC to avoid an IP leak past the proxy; ``os`` optionally pins the
+    # spoofed OS family (comma list of windows/macos/linux; empty = randomise).
+    camoufox_humanize: bool
+    camoufox_block_webrtc: bool
+    camoufox_os: str
 
     # WP5: enterprise hCaptcha residential-proxy enforcement. When true (the
     # default), enterprise tasks must use a residential or mobile pool proxy
@@ -240,6 +262,10 @@ def load_config() -> Config:
         .strip()
         .lower()
         in {"1", "true", "yes"},
+        vision_stitch_grid=os.environ.get("VISION_STITCH_GRID", "true")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
         # WP4: resource interception — per-context bandwidth shaping.
         resource_block_enabled=os.environ.get("RESOURCE_BLOCK_ENABLED", "true")
         .strip()
@@ -262,8 +288,20 @@ def load_config() -> Config:
         proxy_max_consecutive_fails=int(
             os.environ.get("PROXY_MAX_CONSECUTIVE_FAILS", "3")
         ),
+        proxy_max_gb=_optional_float(os.environ.get("PROXY_MAX_GB")) or 0.0,
         token_cache_ttl=int(os.environ.get("TOKEN_CACHE_TTL", "110")),
         browser_runtime=os.environ.get("BROWSER_RUNTIME", "chromium").strip().lower(),
+        browser_runtime_strict=os.environ.get("BROWSER_RUNTIME_STRICT", "false")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        camoufox_humanize=os.environ.get("CAMOUFOX_HUMANIZE", "true").strip().lower()
+        in {"1", "true", "yes"},
+        camoufox_block_webrtc=os.environ.get("CAMOUFOX_BLOCK_WEBRTC", "true")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        camoufox_os=os.environ.get("CAMOUFOX_OS", "").strip(),
         # WP5: enterprise residential-proxy enforcement (default on; set to
         # "false"/"0" to relax for tests / dev).
         enterprise_require_residential=os.environ.get(

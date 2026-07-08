@@ -68,13 +68,13 @@ class DynamicGridSolver(BaseShapeSolver):
                     continue
 
             if not indices:
-                await self.click_submit(frame)
+                await self.human_click_submit(frame, ctx)
                 break
 
             for i in indices:
-                await self.click_tile(frame, i)
+                await self.human_click_tile(frame, i, ctx)
 
-        await self.click_submit(frame)
+        await self.human_click_submit(frame, ctx)
         return await self.poll_token()
 
     async def _try_reload(self, frame: Any) -> bool:

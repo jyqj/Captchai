@@ -236,12 +236,26 @@ OhMyCaptcha uses two model backends — a **local model** for image tasks and a 
 | `CAPTCHA_SOLVE_TIMEOUT` | Per-task wall-clock budget (seconds) | `180` |
 | `BROWSER_HEADLESS` | Headless Chromium | `true` |
 | `BROWSER_TIMEOUT` | Page load timeout (seconds) | `30` |
+| `BROWSER_RUNTIME` | Browser runtime: `chromium` (stock) \| `rebrowser` \| `camoufox` | `chromium` |
+| `BROWSER_RUNTIME_STRICT` | Fail startup instead of silently degrading to stock Chromium when the requested hardened runtime is unavailable (recommended for enterprise hCaptcha) | `false` |
+| `CAMOUFOX_HUMANIZE` | Enable Camoufox's built-in human-like cursor motion (only when `BROWSER_RUNTIME=camoufox`) | `true` |
+| `CAMOUFOX_BLOCK_WEBRTC` | Block WebRTC under Camoufox to prevent an IP leak past the proxy | `true` |
+| `CAMOUFOX_OS` | Optional OS pin for Camoufox's spoofed fingerprint (comma list of `windows`/`macos`/`linux`; empty = randomise) | unset |
+| `VISION_STITCH_GRID` | Compose multi-tile grid challenges into one montage image per model call (~N× cheaper tokens/latency); set `false` for max per-tile resolution | `true` |
+| `PROXY_MAX_GB` | Per-proxy bandwidth quota in GB before the proxy is burned (removed from rotation); `0` = unlimited | `0` |
 | `SERVER_HOST` | Bind host | `0.0.0.0` |
 | `SERVER_PORT` | Bind port | `8000` |
 
 ### Proxy & User-Agent binding (Turnstile / hCaptcha / reCAPTCHA)
 
-Cloudflare and Google bind tokens to the **egress IP** and **User-Agent** used at solve time. For real (non-test) sitekeys, pass a proxy and reuse the returned `solution.userAgent` (and the same proxy IP) when submitting the token downstream:
+Cloudflare and Google (and hCaptcha **Enterprise**) bind tokens to the **egress IP** and **User-Agent** used at solve time. For real (non-test) sitekeys, pass a proxy and reuse the returned `solution.userAgent` (and the same proxy IP) when submitting the token downstream.
+
+The solution also echoes the **egress identity** so you can align an IP-bound submit even when the service solved on its own pool proxy:
+
+- `solution.proxyKind` — `proxyless` \| `pool_proxy` \| `task_proxy`
+- `solution.egressServer` — the credential-free proxy gateway (`scheme://host:port`) that minted the token, or `null` for proxyless solves. Route your downstream request (e.g. the Stripe card-binding call) through this same egress when the token is IP-bound.
+
+> **Enterprise hCaptcha (e.g. Stripe):** supply your own proxy (`egress=task` / proxy fields) so the solve and your downstream submit share one IP, or route your submit through the returned `egressServer`. A token minted on a different IP than the submit will be rejected. Run the hardened **Camoufox** runtime (`BROWSER_RUNTIME=camoufox` + `BROWSER_RUNTIME_STRICT=true`; install per `requirements.txt`) — stock Chromium's automation signals are trivially flagged by enterprise detectors.
 
 ```jsonc
 "task": {
