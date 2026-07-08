@@ -1,12 +1,12 @@
 # 本地模型部署
 
-OhMyCaptcha 支持使用 [SGLang](https://github.com/sgl-project/sglang)、[vLLM](https://github.com/vllm-project/vllm) 或任何 OpenAI 兼容推理服务在本地部署图像识别和分类模型。
+CaptchAI 支持使用 [SGLang](https://github.com/sgl-project/sglang)、[vLLM](https://github.com/vllm-project/vllm) 或任何 OpenAI 兼容推理服务在本地部署图像识别和分类模型。
 
 本指南以 [Qwen3.5-2B](https://modelscope.cn/models/Qwen/Qwen3.5-2B) + SGLang 为例。
 
 ## 架构：本地模型 vs 云端模型
 
-OhMyCaptcha 使用两种模型后端：
+CaptchAI 使用两种模型后端：
 
 | 后端 | 角色 | 环境变量 | 默认值 |
 |------|------|---------|-------|
@@ -69,7 +69,7 @@ curl http://localhost:30000/v1/chat/completions \
   }'
 ```
 
-## 第四步：配置 OhMyCaptcha
+## 第四步：配置 CaptchAI
 
 ```bash
 # 本地模型（SGLang 自托管）
@@ -87,7 +87,7 @@ export CLIENT_KEY="your-client-key"
 export BROWSER_HEADLESS=true
 ```
 
-## 第五步：启动 OhMyCaptcha
+## 第五步：启动 CaptchAI
 
 ```bash
 python main.py

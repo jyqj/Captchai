@@ -79,7 +79,7 @@ def test_root_endpoint() -> None:
     response = client.get("/")
     assert response.status_code == 200
     body = response.json()
-    assert body["service"] == "captcha-solver"
+    assert body["service"] == "captchai"
     assert body["version"] == "3.0.0"
     assert "createTask" in body["endpoints"]
     assert isinstance(body["supported_task_types"], list)

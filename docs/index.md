@@ -1,22 +1,22 @@
-# OhMyCaptcha
+# CaptchAI
 
 <div class="hero hero--light" markdown>
 
 <div class="hero__visual">
-  <img src="assets/ohmycaptcha-hero.png" alt="OhMyCaptcha — self-hostable captcha solving service">
+  <img src="assets/captchai-hero.png" alt="CaptchAI — self-hostable captcha solving service">
 </div>
 
 <div class="hero__copy" markdown>
 
 ## ⚡ Self-hostable captcha solving with a clean YesCaptcha-style API
 
-OhMyCaptcha combines **FastAPI**, **Playwright**, and **OpenAI-compatible multimodal models** into a focused service for **flow2api** and similar integrations. Supports **19 task types** across reCAPTCHA, hCaptcha, Cloudflare Turnstile, and image classification.
+CaptchAI combines **FastAPI**, **Playwright**, and **OpenAI-compatible multimodal models** into a focused service for **flow2api** and similar integrations. Supports **19 task types** across reCAPTCHA, hCaptcha, Cloudflare Turnstile, and image classification.
 
 <div class="hero__actions" markdown>
 
 [Get started](getting-started.md){ .md-button .md-button--primary }
 [API reference](api-reference.md){ .md-button }
-[GitHub](https://github.com/shenhao-stu/ohmycaptcha){ .md-button }
+[GitHub](https://github.com/captchai-org/captchai){ .md-button }
 
 </div>
 
@@ -123,4 +123,4 @@ OhMyCaptcha combines **FastAPI**, **Playwright**, and **OpenAI-compatible multim
 
 ## 📌 Scope note
 
-OhMyCaptcha implements a **YesCaptcha-style API surface covering 19 task types** across reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile, and image classification. Browser-based tasks rely on Playwright automation and may require tuning for specific target sites. Image classification leverages multimodal vision models and accuracy depends on model quality.
+CaptchAI implements a **YesCaptcha-style API surface covering 19 task types** across reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile, and image classification. Browser-based tasks rely on Playwright automation and may require tuning for specific target sites. Image classification leverages multimodal vision models and accuracy depends on model quality.

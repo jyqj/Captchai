@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: captcha-solver
+    name: captchai
     runtime: docker
     dockerfilePath: ./Dockerfile.render
     dockerContext: .

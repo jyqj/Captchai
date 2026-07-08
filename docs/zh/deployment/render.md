@@ -1,6 +1,6 @@
 # Render 部署
 
-本指南说明如何使用仓库中已经提供的 Docker 文件，把 OhMyCaptcha 部署到 **Render**。
+本指南说明如何使用仓库中已经提供的 Docker 文件，把 CaptchAI 部署到 **Render**。
 
 ## 什么时候适合用 Render
 

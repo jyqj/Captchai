@@ -1,8 +1,8 @@
 # 项目定位
 
-## OhMyCaptcha 是什么
+## CaptchAI 是什么
 
-OhMyCaptcha 是一个可自托管的验证码解决服务，为本仓库已经实现的任务类型提供 YesCaptcha 风格的 API。
+CaptchAI 是一个可自托管的验证码解决服务，为本仓库已经实现的任务类型提供 YesCaptcha 风格的 API。
 
 它适合以下场景：
 
@@ -19,7 +19,7 @@ YesCaptcha 等托管服务通常提供：
 - 更广泛的任务类型目录
 - 商业 SLA 与供应商托管基础设施
 
-OhMyCaptcha 更关注：
+CaptchAI 更关注：
 
 - 自托管
 - 实现透明

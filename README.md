@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/OhMyCaptcha-YesCaptcha--style%20API-2F6BFF?style=for-the-badge" alt="OhMyCaptcha">
+  <img src="https://img.shields.io/badge/CaptchAI-YesCaptcha--style%20API-2F6BFF?style=for-the-badge" alt="CaptchAI">
   <br/>
   <img src="https://img.shields.io/badge/version-3.0-22C55E?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-2563EB?style=flat-square" alt="License">
@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/docs-bilingual-2563EB?style=flat-square" alt="Docs">
 </p>
 
-<h1 align="center">🧩 OhMyCaptcha</h1>
+<h1 align="center">🧩 CaptchAI</h1>
 
 <p align="center">
   <strong>Self-hostable YesCaptcha-style captcha solver for <a href="https://github.com/TheSmallHanCat/flow2api">flow2api</a> and similar integrations</strong>
@@ -27,20 +27,20 @@
 
 <p align="center">
   <a href="README.zh-CN.md">中文说明</a> •
-  <a href="https://shenhao-stu.github.io/ohmycaptcha/">Documentation</a> •
-  <a href="https://shenhao-stu.github.io/ohmycaptcha/deployment/render/">Render Guide</a> •
-  <a href="https://shenhao-stu.github.io/ohmycaptcha/deployment/huggingface/">Hugging Face Guide</a>
+  <a href="https://captchai-org.github.io/captchai/">Documentation</a> •
+  <a href="https://captchai-org.github.io/captchai/deployment/render/">Render Guide</a> •
+  <a href="https://captchai-org.github.io/captchai/deployment/huggingface/">Hugging Face Guide</a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/ohmycaptcha-hero.png" alt="OhMyCaptcha" width="680">
+  <img src="docs/assets/captchai-hero.png" alt="CaptchAI" width="680">
 </p>
 
 ---
 
 ## ✨ What Is This?
 
-**OhMyCaptcha** is a self-hosted captcha-solving service exposing a **YesCaptcha-style async API** with **19 supported task types**. Designed as a third-party captcha solver for **flow2api** and systems that expect `createTask` / `getTaskResult` semantics.
+**CaptchAI** is a self-hosted captcha-solving service exposing a **YesCaptcha-style async API** with **19 supported task types**. Designed as a third-party captcha solver for **flow2api** and systems that expect `createTask` / `getTaskResult` semantics.
 
 | Capability | Details |
 |-----------|---------|
@@ -83,7 +83,7 @@ curl http://localhost:8000/api/v1/health
 ## 🏗 Architecture
 
 <p align="center">
-  <img src="docs/assets/ohmycaptcha-diagram.png" alt="OhMyCaptcha architecture" width="560">
+  <img src="docs/assets/captchai-diagram.png" alt="CaptchAI architecture" width="560">
 </p>
 
 **Core components:**
@@ -214,7 +214,7 @@ curl -X POST http://localhost:8000/getTaskResult \
 
 ### Model backends
 
-OhMyCaptcha uses two model backends — a **local model** for image tasks and a **cloud model** for complex reasoning:
+CaptchAI uses two model backends — a **local model** for image tasks and a **cloud model** for complex reasoning:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -276,10 +276,10 @@ The solution also echoes the **egress identity** so you can align an IP-bound su
 
 ## 🚀 Deployment
 
-- [Local model (SGLang)](https://shenhao-stu.github.io/ohmycaptcha/deployment/local-model/) — deploy Qwen3.5-2B locally
-- [Render deployment](https://shenhao-stu.github.io/ohmycaptcha/deployment/render/)
-- [Hugging Face Spaces deployment](https://shenhao-stu.github.io/ohmycaptcha/deployment/huggingface/)
-- [Full documentation](https://shenhao-stu.github.io/ohmycaptcha/)
+- [Local model (SGLang)](https://captchai-org.github.io/captchai/deployment/local-model/) — deploy Qwen3.5-2B locally
+- [Render deployment](https://captchai-org.github.io/captchai/deployment/render/)
+- [Hugging Face Spaces deployment](https://captchai-org.github.io/captchai/deployment/huggingface/)
+- [Full documentation](https://captchai-org.github.io/captchai/)
 
 ---
 
@@ -306,7 +306,7 @@ This service is validated against the public reCAPTCHA v3 score detector:
 
 > **This project is intended for legitimate research, security testing, and educational purposes only.**
 
-- OhMyCaptcha is a self-hostable tool. You are solely responsible for how you deploy and use it.
+- CaptchAI is a self-hostable tool. You are solely responsible for how you deploy and use it.
 - CAPTCHA systems exist to protect services from abuse. **Do not use this tool to bypass CAPTCHAs on websites or services without explicit permission from the site owner.**
 - Unauthorized automated access to third-party services may violate their Terms of Service, and may be illegal under applicable laws (e.g., the Computer Fraud and Abuse Act, GDPR, or equivalent legislation in your jurisdiction).
 - The authors and contributors of this project **accept no liability** for any misuse, legal consequences, or damages arising from the use of this software.
@@ -326,7 +326,7 @@ python -m mkdocs build --strict
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=shenhao-stu/ohmycaptcha&type=Date)](https://www.star-history.com/#shenhao-stu/ohmycaptcha&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=captchai-org/captchai&type=Date)](https://www.star-history.com/#captchai-org/captchai&Date)
 
 ---
 

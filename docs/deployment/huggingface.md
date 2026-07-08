@@ -1,6 +1,6 @@
 # Hugging Face Spaces Deployment
 
-This guide shows how to deploy OhMyCaptcha on **Hugging Face Spaces** using a Docker-based Space.
+This guide shows how to deploy CaptchAI on **Hugging Face Spaces** using a Docker-based Space.
 
 ## When to choose Hugging Face Spaces
 

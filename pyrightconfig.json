@@ -5,8 +5,7 @@
     "tests"
   ],
   "extraPaths": [
-    ".",
-    "/home/shenhao/recaptcha"
+    "."
   ],
   "stubPath": "typings",
   "venvPath": ".",

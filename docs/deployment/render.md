@@ -1,6 +1,6 @@
 # Render Deployment
 
-This guide walks through a clean **Render** deployment for OhMyCaptcha using the Docker files already included in this repository.
+This guide walks through a clean **Render** deployment for CaptchAI using the Docker files already included in this repository.
 
 ## When to choose Render
 

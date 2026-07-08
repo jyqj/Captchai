@@ -1,19 +1,19 @@
 # Agent Skill
 
-OhMyCaptcha ships with reusable skills under `skills/`.
+CaptchAI ships with reusable skills under `skills/`.
 
 ## Available skills
 
-- `skills/ohmycaptcha/` — operate, deploy, validate, and integrate the service
-- `skills/ohmycaptcha-image/` — create public-safe visuals for README, docs, and launch assets
+- `skills/captchai/` — operate, deploy, validate, and integrate the service
+- `skills/captchai-image/` — create public-safe visuals for README, docs, and launch assets
 
 ## For humans
 
 If your tool can read a local skill folder directly, copy one or both of these directories into your local skills directory:
 
 ```text
-skills/ohmycaptcha/
-skills/ohmycaptcha-image/
+skills/captchai/
+skills/captchai-image/
 ```
 
 Then restart your tool if it caches skill metadata.
@@ -23,12 +23,12 @@ Then restart your tool if it caches skill metadata.
 Paste this into any capable agent environment:
 
 ```text
-Install the OhMyCaptcha skills from this repository and make them available in my local skills directory. Then show me how to use the operational skill for deployment and the image skill for generating README or docs visuals.
+Install the CaptchAI skills from this repository and make them available in my local skills directory. Then show me how to use the operational skill for deployment and the image skill for generating README or docs visuals.
 ```
 
 ## What the operational skill does
 
-The `ohmycaptcha` skill helps with:
+The `captchai` skill helps with:
 
 - local startup
 - environment setup
@@ -40,7 +40,7 @@ The `ohmycaptcha` skill helps with:
 
 ## What the image skill does
 
-The `ohmycaptcha-image` skill helps with:
+The `captchai-image` skill helps with:
 
 - README hero image prompts
 - docs illustrations

@@ -124,7 +124,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="Captcha Solver Service",
+    title="CaptchAI Service",
     version="3.0.0",
     description="YesCaptcha-compatible captcha solving service for flow2api.",
     lifespan=lifespan,
@@ -136,7 +136,7 @@ app.include_router(router)
 @app.get("/")
 async def root() -> dict[str, object]:
     return {
-        "service": "captcha-solver",
+        "service": "captchai",
         "version": "3.0.0",
         "endpoints": {
             "createTask": "/createTask",

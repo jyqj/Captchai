@@ -1,19 +1,19 @@
 # Agent Skill
 
-OhMyCaptcha 在 `skills/` 目录下附带了可复用的 skills。
+CaptchAI 在 `skills/` 目录下附带了可复用的 skills。
 
 ## 可用 skills
 
-- `skills/ohmycaptcha/` — 用于部署、验证、集成和运维服务
-- `skills/ohmycaptcha-image/` — 用于生成 README、文档和发布素材所需的公开安全图片
+- `skills/captchai/` — 用于部署、验证、集成和运维服务
+- `skills/captchai-image/` — 用于生成 README、文档和发布素材所需的公开安全图片
 
 ## For humans
 
 如果你的工具支持直接读取本地 skill 目录，可以把下面这些目录复制到你的本地 skills 目录中：
 
 ```text
-skills/ohmycaptcha/
-skills/ohmycaptcha-image/
+skills/captchai/
+skills/captchai-image/
 ```
 
 如果你的工具会缓存 skill 元信息，请复制后重启。
@@ -23,12 +23,12 @@ skills/ohmycaptcha-image/
 你也可以把下面这段话直接贴给支持工具调用的 LLM agent：
 
 ```text
-Install the OhMyCaptcha skills from this repository and make them available in my local skills directory. Then show me how to use the operational skill for deployment and the image skill for generating README or docs visuals.
+Install the CaptchAI skills from this repository and make them available in my local skills directory. Then show me how to use the operational skill for deployment and the image skill for generating README or docs visuals.
 ```
 
 ## 运维 skill 的作用
 
-`ohmycaptcha` skill 主要覆盖：
+`captchai` skill 主要覆盖：
 
 - 本地启动
 - 环境变量配置
@@ -40,7 +40,7 @@ Install the OhMyCaptcha skills from this repository and make them available in m
 
 ## 图片 skill 的作用
 
-`ohmycaptcha-image` skill 主要覆盖：
+`captchai-image` skill 主要覆盖：
 
 - README Hero 图 prompt
 - 文档插图

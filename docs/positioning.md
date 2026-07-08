@@ -1,8 +1,8 @@
 # Positioning
 
-## What OhMyCaptcha is
+## What CaptchAI is
 
-OhMyCaptcha is a self-hostable captcha solving service with a YesCaptcha-style API for the task types implemented in this repository.
+CaptchAI is a self-hostable captcha solving service with a YesCaptcha-style API for the task types implemented in this repository.
 
 It is designed for users who want:
 
@@ -19,7 +19,7 @@ Managed services such as YesCaptcha typically provide:
 - a broad task catalog
 - commercial SLAs and vendor-managed infrastructure
 
-OhMyCaptcha instead focuses on:
+CaptchAI instead focuses on:
 
 - self-hosting
 - transparent implementation

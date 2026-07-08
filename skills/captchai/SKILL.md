@@ -1,15 +1,15 @@
 ---
-name: ohmycaptcha
-description: Deploy, configure, validate, and integrate the OhMyCaptcha captcha-solving service. Use when working with YesCaptcha-style APIs, flow2api integration, reCAPTCHA/hCaptcha/Turnstile task creation, image classification, SGLang local model deployment, Render/Hugging Face cloud deployment, or OpenAI-compatible multimodal model setup. Also use when the user asks how to self-host a captcha-solving service or wants request/response examples for OhMyCaptcha.
+name: captchai
+description: Deploy, configure, validate, and integrate the CaptchAI captcha-solving service. Use when working with YesCaptcha-style APIs, flow2api integration, reCAPTCHA/hCaptcha/Turnstile task creation, image classification, SGLang local model deployment, Render/Hugging Face cloud deployment, or OpenAI-compatible multimodal model setup. Also use when the user asks how to self-host a captcha-solving service or wants request/response examples for CaptchAI.
 ---
 
-# OhMyCaptcha Skill
+# CaptchAI Skill
 
-Operational guidance for deploying and integrating the OhMyCaptcha service.
+Operational guidance for deploying and integrating the CaptchAI service.
 
 ## Model architecture
 
-OhMyCaptcha uses two model backends:
+CaptchAI uses two model backends:
 
 - **Local model** — self-hosted via SGLang/vLLM (e.g. `Qwen/Qwen3.5-2B`). Handles image recognition and classification tasks. Configured via `LOCAL_BASE_URL`, `LOCAL_API_KEY`, `LOCAL_MODEL`.
 - **Cloud model** — remote OpenAI-compatible API (e.g. `gpt-5.4`). Handles audio transcription and complex reasoning. Configured via `CLOUD_BASE_URL`, `CLOUD_API_KEY`, `CLOUD_MODEL`.
@@ -34,7 +34,7 @@ export SGLANG_USE_MODELSCOPE=true
 python -m sglang.launch_server --model-path Qwen/Qwen3.5-2B --port 30000
 ```
 
-Then configure OhMyCaptcha:
+Then configure CaptchAI:
 ```bash
 export LOCAL_BASE_URL="http://localhost:30000/v1"
 export LOCAL_MODEL="Qwen/Qwen3.5-2B"

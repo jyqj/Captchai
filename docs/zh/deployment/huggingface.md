@@ -1,6 +1,6 @@
 # Hugging Face Spaces 部署
 
-本指南说明如何使用 **Hugging Face Spaces** 的 Docker Space 来部署 OhMyCaptcha。
+本指南说明如何使用 **Hugging Face Spaces** 的 Docker Space 来部署 CaptchAI。
 
 ## 什么时候适合用 Hugging Face Spaces
 

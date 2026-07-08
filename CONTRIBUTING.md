@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to OhMyCaptcha.
+Thanks for contributing to CaptchAI.
 
 ## Development setup
 

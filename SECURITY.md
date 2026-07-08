@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-OhMyCaptcha is currently maintained from the `main` branch. Security fixes will be applied there first.
+CaptchAI is currently maintained from the `main` branch. Security fixes will be applied there first.
 
 ## Reporting a Vulnerability
 
@@ -37,7 +37,7 @@ This repository is designed for public use. Do not include any of the following 
 
 ## Operational guidance
 
-If you deploy OhMyCaptcha publicly:
+If you deploy CaptchAI publicly:
 
 - store secrets in environment variables or your hosting platform's secret manager
 - avoid committing `.env` files

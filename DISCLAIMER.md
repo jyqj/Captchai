@@ -1,6 +1,6 @@
 # Disclaimer
 
-**OhMyCaptcha is intended for legitimate research, security testing, and educational purposes only.**
+**CaptchAI is intended for legitimate research, security testing, and educational purposes only.**
 
 ## Intended use
 
@@ -13,7 +13,7 @@ This software is designed to help developers:
 
 ## Prohibited use
 
-You **must not** use OhMyCaptcha to:
+You **must not** use CaptchAI to:
 
 - Bypass CAPTCHAs on websites or services **without explicit written permission** from the site or service owner
 - Conduct unauthorized automated access to third-party systems
@@ -23,7 +23,7 @@ You **must not** use OhMyCaptcha to:
 ## Legal responsibility
 
 - Unauthorized automated access to third-party services may violate their Terms of Service and could be illegal under applicable laws, including but not limited to the Computer Fraud and Abuse Act (CFAA), the EU General Data Protection Regulation (GDPR), or equivalent legislation in your jurisdiction.
-- **The authors and contributors of OhMyCaptcha accept no liability** for any misuse, damages, legal consequences, or losses arising from the use or misuse of this software.
+- **The authors and contributors of CaptchAI accept no liability** for any misuse, damages, legal consequences, or losses arising from the use or misuse of this software.
 - By deploying or using this software, **you accept full responsibility** for ensuring that your usage complies with all applicable laws, regulations, and third-party terms of service.
 
 ## No warranty

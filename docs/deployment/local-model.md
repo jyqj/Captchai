@@ -1,12 +1,12 @@
 # Local Model Deployment
 
-OhMyCaptcha supports running image recognition and classification tasks on a **locally hosted model** served via [SGLang](https://github.com/sgl-project/sglang), [vLLM](https://github.com/vllm-project/vllm), or any OpenAI-compatible inference server.
+CaptchAI supports running image recognition and classification tasks on a **locally hosted model** served via [SGLang](https://github.com/sgl-project/sglang), [vLLM](https://github.com/vllm-project/vllm), or any OpenAI-compatible inference server.
 
 This guide covers deploying [Qwen3.5-2B](https://modelscope.cn/models/Qwen/Qwen3.5-2B) locally with SGLang.
 
 ## Architecture: Local vs Cloud
 
-OhMyCaptcha uses two model backends:
+CaptchAI uses two model backends:
 
 | Backend | Role | Env vars | Default |
 |---------|------|----------|---------|
@@ -15,7 +15,7 @@ OhMyCaptcha uses two model backends:
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                      OhMyCaptcha                            │
+│                      CaptchAI                            │
 │                                                            │
 │  Browser tasks ──► Playwright (reCAPTCHA, Turnstile)        │
 │                                                            │
@@ -86,7 +86,7 @@ curl http://localhost:30000/v1/chat/completions \
 
 You should receive a valid JSON response with model output.
 
-## Step 4: Configure OhMyCaptcha
+## Step 4: Configure CaptchAI
 
 Set the local model env vars to point at your SGLang server:
 
@@ -106,7 +106,7 @@ export CLIENT_KEY="your-client-key"
 export BROWSER_HEADLESS=true
 ```
 
-## Step 5: Start OhMyCaptcha
+## Step 5: Start CaptchAI
 
 ```bash
 python main.py
@@ -140,7 +140,7 @@ python -m vllm.entrypoints.openai.api_server \
   --port 30000
 ```
 
-No changes to the OhMyCaptcha configuration are needed — both SGLang and vLLM expose `/v1/chat/completions`.
+No changes to the CaptchAI configuration are needed — both SGLang and vLLM expose `/v1/chat/completions`.
 
 ## Backward compatibility
 
