@@ -172,6 +172,10 @@ def _config():
         vision_confidence_threshold=0.6,
         vision_tier2_detail="high",
         captcha_timeout=10,
+        # WP5: enterprise residential-proxy enforcement (default on).
+        enterprise_require_residential=True,
+        human_mouse_enabled=False,
+        human_mouse_jitter_ms=0,
     )
 
 
@@ -201,6 +205,7 @@ def _services(vision_router):
         accounting=Acc(),
         token_cache=TokenCache(),
         session_pool=None,
+        proxy_pool=None,
     )
 
 
@@ -429,6 +434,301 @@ def test_widget_error_surfaced() -> None:
     asyncio.run(run())
 
 
+# --------------------------------------------------------------------------- #
+# WP5: enterprise residential-proxy enforcement + WP3: solution geo surfacing
+# --------------------------------------------------------------------------- #
+
+
+def test_enterprise_with_explicit_proxyless_egress_raises() -> None:
+    """Enterprise + egress=proxyless is refused by _enforce_enterprise_egress."""
+    async def run() -> None:
+        page = FakePage(tile_count=0)
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(_config(), manager=manager, services=None)
+        try:
+            await solver.solve(
+                {
+                    "websiteURL": "https://example.com",
+                    "websiteKey": "sitekey-ent",
+                    "type": "HCaptchaTaskProxyless",
+                    "rqdata": "RQ-DATA-XYZ",
+                    "enterprisePayload": {"sentry": "value"},
+                    "egress": "proxyless",
+                }
+            )
+            assert False, "expected enterprise + egress=proxyless to raise"
+        except RuntimeError as exc:
+            assert "Enterprise hCaptcha requires" in str(exc)
+            assert "egress=proxyless is not allowed" in str(exc)
+
+    asyncio.run(run())
+
+
+def test_enterprise_with_no_residential_proxy_in_pool_raises() -> None:
+    """Enterprise + pool with only datacenter proxies raises a residential-specific error."""
+    async def run() -> None:
+        from src.assets.proxy_pool import ProxyAsset, ProxyPool
+        from src.assets.session_pool import SessionPool
+
+        page = FakePage(tile_count=0)
+
+        async def factory(fingerprint, proxy):
+            return FakeContext(page), fingerprint.user_agent
+
+        session_pool = SessionPool(factory, size=2, max_solves=8)
+        proxy_pool = ProxyPool()
+        proxy_pool.add(
+            ProxyAsset(id="dc-1", server="http://dc:1", kind="datacenter")
+        )
+
+        vision = FakeVisionRouter(indices=[0])
+        services = _services(vision)
+        services.session_pool = session_pool
+        services.proxy_pool = proxy_pool
+
+        solver = HCaptchaSolver(
+            _config(), manager=FakeManager(FakeContext(page)), services=services
+        )
+        try:
+            await solver.solve(
+                {
+                    "websiteURL": "https://example.com",
+                    "websiteKey": "sitekey-ent",
+                    "type": "HCaptchaTaskProxyless",
+                    "rqdata": "RQ-DATA-XYZ",
+                    "enterprisePayload": {"sentry": "value"},
+                }
+            )
+            assert False, "expected enterprise + no residential proxy to raise"
+        except RuntimeError as exc:
+            assert "residential" in str(exc).lower()
+        finally:
+            await session_pool.close_all()
+
+    asyncio.run(run())
+
+
+def test_enterprise_with_residential_proxy_succeeds_and_includes_geo() -> None:
+    """Enterprise + residential pool proxy: solve succeeds and solution carries geo.
+
+    Verifies the full WP3 + WP5 path: a German residential pool proxy is
+    checked out (kind filter), paired with a warm session whose fingerprint
+    is geo-aligned (Europe/Berlin + de-DE), the solve succeeds via
+    vision-driven challenge dispatch, and the returned solution includes
+    ``timezoneId`` / ``acceptLanguage`` from the fingerprint actually used.
+    """
+    async def run() -> None:
+        from src.assets.proxy_pool import ProxyAsset, ProxyPool
+        from src.assets.session_pool import SessionPool
+
+        page = FakePage(token_after=1, tile_count=9)
+
+        async def factory(fingerprint, proxy):
+            return FakeContext(page), fingerprint.user_agent
+
+        session_pool = SessionPool(factory, size=2, max_solves=8)
+        proxy_pool = ProxyPool()
+        proxy_pool.add(
+            ProxyAsset(
+                id="res-de",
+                server="http://res-de:1",
+                kind="residential",
+                country="DE",
+                timezone="Europe/Berlin",
+                locale="de-DE",
+            )
+        )
+
+        vision = FakeVisionRouter(indices=[0, 3, 5])
+        services = _services(vision)
+        services.session_pool = session_pool
+        services.proxy_pool = proxy_pool
+
+        solver = HCaptchaSolver(
+            _config(), manager=FakeManager(FakeContext(page)), services=services
+        )
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-ent",
+                "type": "HCaptchaTaskProxyless",
+                "rqdata": "RQ-DATA-XYZ",
+                "enterprisePayload": {"sentry": "value"},
+            }
+        )
+
+        assert result["gRecaptchaResponse"].startswith("P1_")
+        # WP3: solution surfaces the fingerprint geo actually used.
+        assert result["timezoneId"] == "Europe/Berlin"
+        assert result["acceptLanguage"] is not None
+        assert "de-DE" in result["acceptLanguage"]
+        # The residential proxy was checked out and reported per solve.
+        snap = proxy_pool.snapshot()[0]
+        assert snap["success_count"] == 1
+        assert snap["kind"] == "residential"
+        # The enterprise enforcement forced egress=pool and required residential.
+        # (Implicit: the solve succeeded, so the residential proxy was used.)
+        await session_pool.close_all()
+
+    asyncio.run(run())
+
+
+def test_enterprise_with_mobile_proxy_succeeds() -> None:
+    """Fix #2: enterprise hCaptcha accepts a mobile pool proxy, not just residential.
+
+    The enterprise enforcement now sets ``_required_proxy_kinds=("residential",
+    "mobile")`` so a pool that has only a ``kind="mobile"`` proxy is accepted.
+    A JP mobile proxy is used so the geo-alignment path is also exercised
+    (Asia/Tokyo + ja-JP — the locale added in Fix #3).
+    """
+    async def run() -> None:
+        from src.assets.proxy_pool import ProxyAsset, ProxyPool
+        from src.assets.session_pool import SessionPool
+
+        page = FakePage(token_after=1, tile_count=9)
+
+        async def factory(fingerprint, proxy):
+            return FakeContext(page), fingerprint.user_agent
+
+        session_pool = SessionPool(factory, size=2, max_solves=8)
+        proxy_pool = ProxyPool()
+        proxy_pool.add(
+            ProxyAsset(
+                id="mob-jp",
+                server="http://mob-jp:1",
+                kind="mobile",
+                country="JP",
+                timezone="Asia/Tokyo",
+                locale="ja-JP",
+            )
+        )
+
+        vision = FakeVisionRouter(indices=[0, 3, 5])
+        services = _services(vision)
+        services.session_pool = session_pool
+        services.proxy_pool = proxy_pool
+
+        solver = HCaptchaSolver(
+            _config(), manager=FakeManager(FakeContext(page)), services=services
+        )
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-ent",
+                "type": "HCaptchaTaskProxyless",
+                "rqdata": "RQ-DATA-XYZ",
+                "enterprisePayload": {"sentry": "value"},
+            }
+        )
+
+        assert result["gRecaptchaResponse"].startswith("P1_")
+        # The mobile proxy was checked out and reported per solve — no
+        # "no residential proxy" error was raised.
+        snap = proxy_pool.snapshot()[0]
+        assert snap["success_count"] == 1
+        assert snap["kind"] == "mobile"
+        # Geo alignment: the JP mobile proxy's fingerprint carries ja-JP.
+        assert result["timezoneId"] == "Asia/Tokyo"
+        assert result["acceptLanguage"] is not None
+        assert "ja-JP" in result["acceptLanguage"]
+        await session_pool.close_all()
+
+    asyncio.run(run())
+
+
+def test_enterprise_with_only_datacenter_proxy_raises_mentions_kinds() -> None:
+    """Fix #2: enterprise + pool with only datacenter proxies raises an error
+    that mentions both residential and mobile (the requested kinds)."""
+    async def run() -> None:
+        from src.assets.proxy_pool import ProxyAsset, ProxyPool
+        from src.assets.session_pool import SessionPool
+
+        page = FakePage(tile_count=0)
+
+        async def factory(fingerprint, proxy):
+            return FakeContext(page), fingerprint.user_agent
+
+        session_pool = SessionPool(factory, size=2, max_solves=8)
+        proxy_pool = ProxyPool()
+        proxy_pool.add(
+            ProxyAsset(id="dc-1", server="http://dc:1", kind="datacenter")
+        )
+
+        vision = FakeVisionRouter(indices=[0])
+        services = _services(vision)
+        services.session_pool = session_pool
+        services.proxy_pool = proxy_pool
+
+        solver = HCaptchaSolver(
+            _config(), manager=FakeManager(FakeContext(page)), services=services
+        )
+        try:
+            await solver.solve(
+                {
+                    "websiteURL": "https://example.com",
+                    "websiteKey": "sitekey-ent",
+                    "type": "HCaptchaTaskProxyless",
+                    "rqdata": "RQ-DATA-XYZ",
+                    "enterprisePayload": {"sentry": "value"},
+                }
+            )
+            assert False, "expected enterprise + no residential/mobile proxy to raise"
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            assert "residential" in msg
+            assert "mobile" in msg
+        finally:
+            await session_pool.close_all()
+
+    asyncio.run(run())
+
+
+def test_enterprise_with_task_proxy_allowed_without_pool() -> None:
+    """Enterprise + caller task proxy → egress=task, no pool required.
+
+    A caller-supplied task proxy is the caller's responsibility; the
+    enterprise enforcement honours it (egress=task) and does NOT force the
+    pool path. Verifies the existing test_enterprise_fields_forwarded
+    behaviour is preserved under the new enforcement helper.
+    """
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+
+        async def eval_token(script, *args):
+            has_token = "__omcToken" in script
+            has_error = "__omcError" in script
+            if has_error and not has_token:
+                return None
+            token = "P1_" + "y" * 40
+            if has_error:
+                return {"token": token, "error": None}
+            return token
+
+        page.evaluate = eval_token  # type: ignore[assignment]
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(_config(), manager=manager, services=None)
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-ent",
+                "type": "HCaptchaTaskProxyless",
+                "rqdata": "RQ-DATA-XYZ",
+                "enterprisePayload": {"sentry": "value"},
+                "proxy": "http://user:pass@proxy.example.com:8080",
+            }
+        )
+        assert result["gRecaptchaResponse"].startswith("P1_")
+        # Enterprise fields were forwarded to the real-page init script.
+        assert context.init_scripts
+        script = context.init_scripts[0]
+        assert "RQ-DATA-XYZ" in script
+        assert '"enterprise": {"sentry": "value"}' in script
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_grid_challenge_solved_via_vision_and_recorded()
     test_enterprise_fields_forwarded()
@@ -436,4 +736,10 @@ if __name__ == "__main__":
     test_enterprise_refuses_proxyless_fallback()
     test_invisible_skips_human_mouse()
     test_widget_error_surfaced()
+    test_enterprise_with_explicit_proxyless_egress_raises()
+    test_enterprise_with_no_residential_proxy_in_pool_raises()
+    test_enterprise_with_residential_proxy_succeeds_and_includes_geo()
+    test_enterprise_with_task_proxy_allowed_without_pool()
+    test_enterprise_with_mobile_proxy_succeeds()
+    test_enterprise_with_only_datacenter_proxy_raises_mentions_kinds()
     print("ok")

@@ -12,11 +12,12 @@ is guarded with ``is not None``.  Nothing here imports the ledger/budget modules
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from src.assets.model_pool import ModelPool, ModelUsage
@@ -155,16 +156,64 @@ class VisionRouter:
         threshold = float(getattr(self._config, "vision_confidence_threshold", 0.0))
         samples = int(getattr(self._config, "vision_vote_samples", 1))
         cloud_enabled = bool(getattr(self._config, "vision_cloud_enabled", False))
+        # getattr default False mirrors ``vision_cloud_enabled``: the Config /
+        # env default is True, but pre-existing test configs that don't set
+        # this field keep the old tier-1-no-escalation behavior.
+        inline_escalate = bool(
+            getattr(self._config, "vision_inline_escalate", False)
+        )
 
-        should_vote = (
+        votes = 1
+
+        # WP4: inline tier-1 → tier-2 escalation. A low-confidence local result
+        # gets a single cloud retry (optionally followed by cloud voting) before
+        # the solver falls back to a full browser redo. The cloud call goes
+        # through the same budget gate as the tier-2 path; a denial downgrades
+        # back to the local result (no escalation). Transparent to shape
+        # solvers — they still read result.indices / result.confidence.
+        if (
+            req.task_tier < 2
+            and confidence < threshold
+            and cloud_enabled
+            and inline_escalate
+            and await self._budget_allows_cloud(req, client_key)
+        ):
+            cloud_client = self._pool.get("cloud")
+            # Re-route detail to tier-2 ("high") without mutating the caller's
+            # request object. task_tier=2 only affects _detail_for; _vote and
+            # _build_messages ignore it.
+            cloud_req = replace(req, task_tier=2)
+            cloud_content, cloud_usage = await self._call(
+                cloud_client, cloud_req, temperature=0.0
+            )
+            total_usage = total_usage.add(cloud_usage)
+            cloud_indices, cloud_conf, cloud_raw = self._parse(cloud_content)
+
+            # The cloud result is authoritative now (it's the latest read).
+            indices = cloud_indices
+            confidence = cloud_conf
+            content = cloud_content
+            raw = cloud_raw
+            client = cloud_client
+
+            # If cloud confidence is still below threshold, engage the existing
+            # voting path on the cloud client (only when samples > 1).
+            if cloud_conf < threshold and samples > 1:
+                voted_indices, voted_conf, vote_usage, votes = await self._vote(
+                    cloud_client, cloud_req, samples
+                )
+                indices = voted_indices
+                confidence = voted_conf
+                total_usage = total_usage.add(vote_usage)
+
+        # Existing tier-2 voting path (only when no inline escalation happened
+        # — the elif is mutually exclusive with the if above).
+        elif (
             confidence < threshold
             and req.task_tier >= 2
             and cloud_enabled
             and samples > 1
-        )
-
-        votes = 1
-        if should_vote:
+        ):
             voted_indices, voted_conf, vote_usage, votes = await self._vote(
                 client, req, samples
             )
@@ -183,15 +232,53 @@ class VisionRouter:
             **shape_fields,
         )
 
+    async def _budget_allows_cloud(
+        self, req: VisionRequest, client_key: "str | None"
+    ) -> bool:
+        """Budget gate for an inline escalation cloud call.
+
+        Returns True when there is no budget, or when the budget allows the
+        cloud call. Returns False on denial — the caller keeps the local
+        result instead of escalating. Mirrors the existing tier-2 budget
+        check; a denial here does NOT downgrade (the local result is already
+        in hand and is the appropriate fallback).
+        """
+        if self._budget is None:
+            return True
+        est_cost = self._estimate_cost(req)
+        decision = await self._budget.check(client_key, est_cost, model="cloud")
+        if decision is None:
+            return True
+        return bool(getattr(decision, "allowed", True))
+
     # -- voting -----------------------------------------------------------
 
     async def _vote(self, client, req: VisionRequest, samples: int):
         counts: Counter = Counter()
         usage_total = ModelUsage()
-        for _ in range(samples):
-            content, usage = await self._call(
-                client, req, temperature=_VOTE_TEMPERATURE
+
+        # WP4: run vote samples concurrently via asyncio.gather (default) — the
+        # samples are independent and the dominant latency is model round-trip,
+        # so gathering cuts vote wall-time from samples×RTT to ~1×RTT. The
+        # serial loop is kept behind VISION_VOTE_CONCURRENT=false as an escape
+        # hatch for backends that rate-limit concurrent requests.
+        concurrent = bool(getattr(self._config, "vision_vote_concurrent", True))
+        if concurrent:
+            results = await asyncio.gather(
+                *(
+                    self._call(client, req, temperature=_VOTE_TEMPERATURE)
+                    for _ in range(samples)
+                )
             )
+        else:
+            results = []
+            for _ in range(samples):
+                content, usage = await self._call(
+                    client, req, temperature=_VOTE_TEMPERATURE
+                )
+                results.append((content, usage))
+
+        for content, usage in results:
             usage_total = usage_total.add(usage)
             sample_indices, _conf, _raw = self._parse(content)
             for idx in set(sample_indices):

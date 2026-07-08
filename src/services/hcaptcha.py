@@ -51,7 +51,12 @@ from ..parsing.shapes.dynamic_grid import DynamicGridSolver
 from ..parsing.shapes.grid_select import GridSelectSolver
 from ..parsing.shapes.slide import CanvasSlideSolver
 from ..parsing.vision_adapter import VisionAdapter
-from .browser_solver import BaseBrowserSolver, ProxyKind, has_task_proxy
+from .browser_solver import (
+    BaseBrowserSolver,
+    ProxyKind,
+    fingerprint_geo_from_params,
+    has_task_proxy,
+)
 
 log = logging.getLogger(__name__)
 
@@ -170,6 +175,11 @@ class HCaptchaSolver(BaseBrowserSolver):
         profile = self._profile(params)
         params["_hcaptcha_variant"] = profile.variant
         params["_hcaptcha_vision_tier"] = profile.vision_tier
+        # WP5: enterprise residential-proxy enforcement. Forces enterprise
+        # tasks onto a pool (residential) proxy — or a caller-supplied task
+        # proxy — and refuses proxyless server egress. Must run before
+        # _acquire_context so the egress / kind requirements are honoured.
+        self._enforce_enterprise_egress(params, profile.variant)
 
         last_error: Exception | None = None
         for attempt in range(self._config.captcha_retries):
@@ -194,7 +204,13 @@ class HCaptchaSolver(BaseBrowserSolver):
                 await self._record(
                     params, website_key, client_key, "ready", started
                 )
-                return {"gRecaptchaResponse": token, "userAgent": user_agent}
+                tz, accept = fingerprint_geo_from_params(params)
+                return {
+                    "gRecaptchaResponse": token,
+                    "userAgent": user_agent,
+                    "timezoneId": tz,
+                    "acceptLanguage": accept,
+                }
             except Exception as exc:
                 last_error = exc
                 await self._record(
@@ -239,6 +255,72 @@ class HCaptchaSolver(BaseBrowserSolver):
             vision_tier=1,
         )
 
+    def _enforce_enterprise_egress(
+        self, params: dict[str, Any], variant: str
+    ) -> None:
+        """WP5: force enterprise hCaptcha onto a residential pool proxy.
+
+        Enterprise tokens are IP-bound and enterprise detectors flag
+        datacenter / server egress, so:
+
+        * ``egress`` None / "auto" + a caller task proxy → ``"task"`` (the
+          caller took responsibility for the proxy's egress).
+        * ``egress`` None / "auto" + no task proxy → ``"pool"`` (force the
+          server-side residential pool).
+        * ``egress="proxyless"`` → raise (enterprise can't use server IP).
+        * ``egress="task"`` + task proxy → allowed (warn: caller's
+          responsibility; residential requirement is NOT enforced on task
+          proxies).
+        * ``egress="task"`` + no task proxy → raise.
+        * ``egress="pool"`` → fine; when ``ENTERPRISE_REQUIRE_RESIDENTIAL``
+          is true, set ``_required_proxy_kinds=("residential","mobile")`` so
+          the pool checkout in ``_acquire_pool`` filters by kind (mobile is
+          accepted too — it's a stricter residential-equivalent for hCaptcha).
+
+        Regular (non-enterprise) tasks are a no-op.
+        """
+        if variant != "enterprise":
+            return
+
+        egress = params.get("egress")
+        if egress is None or egress == "auto":
+            if has_task_proxy(params):
+                # Caller supplied a proxy: honour their intent (egress=task)
+                # rather than forcing the pool. The task proxy is the
+                # caller's responsibility.
+                params["egress"] = "task"
+                egress = "task"
+            else:
+                params["egress"] = "pool"
+                egress = "pool"
+
+        if egress == "proxyless":
+            raise RuntimeError(
+                "Enterprise hCaptcha requires a residential pool proxy; "
+                "egress=proxyless is not allowed"
+            )
+
+        if egress == "task":
+            if not has_task_proxy(params):
+                raise RuntimeError(
+                    "Enterprise hCaptcha with egress=task requires a "
+                    "caller-supplied proxy"
+                )
+            log.warning(
+                "Enterprise hCaptcha with egress=task — caller proxy is the "
+                "caller's responsibility; residential requirement not enforced"
+            )
+            return
+
+        # egress == "pool": require a residential OR mobile pool proxy when
+        # ENTERPRISE_REQUIRE_RESIDENTIAL is true. ``_acquire_pool`` reads
+        # ``_required_proxy_kinds`` and raises a specific error when no proxy
+        # of any requested kind is available. Mobile is accepted alongside
+        # residential because it's a stricter, carrier-IP egress that hCaptcha
+        # treats as residential-equivalent for enterprise risk scoring.
+        if getattr(self._config, "enterprise_require_residential", True):
+            params["_required_proxy_kinds"] = ("residential", "mobile")
+
     # ── one attempt ────────────────────────────────────────────
 
     async def _solve_once(
@@ -250,6 +332,7 @@ class HCaptchaSolver(BaseBrowserSolver):
         client_key: Optional[str],
     ) -> tuple[str, str]:
         solve_context = await self._acquire_context(params)
+        self._stash_fingerprint_geo(solve_context, params)
         context = solve_context.context
         user_agent = solve_context.user_agent
         html = _build_injected_page(website_key, render_options)
@@ -262,13 +345,18 @@ class HCaptchaSolver(BaseBrowserSolver):
 
         solved = False
         try:
+            # WP5: defensive guard — with ``_enforce_enterprise_egress`` run
+            # in ``solve()``, an enterprise task should never reach a
+            # proxyless context (egress is forced to pool/task, which raises
+            # before returning PROXYLESS). Kept as a backstop for the mocked
+            # path and any future code that bypasses the enforcement helper.
             if (
                 params.get("_hcaptcha_variant") == "enterprise"
                 and solve_context.proxy_kind == ProxyKind.PROXYLESS
                 and not has_task_proxy(params)
             ):
                 raise RuntimeError(
-                    "Enterprise hCaptcha requires a task or pool proxy; "
+                    "Enterprise hCaptcha requires a residential pool proxy; "
                     "server egress IP would not match the submission IP"
                 )
             page = await context.new_page()
@@ -328,17 +416,19 @@ class HCaptchaSolver(BaseBrowserSolver):
     ) -> tuple[str, str]:
         """Navigate to the real target page and hook hcaptcha callbacks."""
         solve_context = await self._acquire_context(params)
+        self._stash_fingerprint_geo(solve_context, params)
         context = solve_context.context
         user_agent = solve_context.user_agent
         solved = False
         try:
+            # WP5: defensive guard — see _solve_once for rationale.
             if (
                 params.get("_hcaptcha_variant") == "enterprise"
                 and solve_context.proxy_kind == ProxyKind.PROXYLESS
                 and not has_task_proxy(params)
             ):
                 raise RuntimeError(
-                    "Enterprise hCaptcha requires a task or pool proxy; "
+                    "Enterprise hCaptcha requires a residential pool proxy; "
                     "server egress IP would not match the submission IP"
                 )
             await context.add_init_script(_build_real_page_init_script(render_options))

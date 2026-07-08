@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
+from urllib.parse import urlparse
 
 from playwright.async_api import (
     Browser,
@@ -65,6 +66,11 @@ _LAUNCH_ARGS = [
 ]
 
 
+def _parse_csv(value: str) -> set[str]:
+    """Split a comma-separated config string into a lowercased set of tokens."""
+    return {token.strip().lower() for token in (value or "").split(",") if token.strip()}
+
+
 @dataclass
 class ContextOptions:
     """Resolved per-task browser context settings."""
@@ -100,6 +106,14 @@ def _count_response_bytes(response: Any) -> None:
         pass
 
 
+async def _safe_continue(route: Any) -> None:
+    """Best-effort ``route.continue_()`` — never raises into the route pipeline."""
+    try:
+        await route.continue_()
+    except Exception:
+        pass
+
+
 def resolve_context_options(config: Config, params: dict[str, Any]) -> ContextOptions:
     """Build a coherent fingerprint + proxy for a task.
 
@@ -108,9 +122,24 @@ def resolve_context_options(config: Config, params: dict[str, Any]) -> ContextOp
     fingerprint uses a random seed so each context gets a unique coherent
     identity; seeding by sitekey would let detectors cluster every solve of a
     given target as the same browser.
+
+    WP3 — pool-proxy geo alignment: when the solver stashes the pool proxy's
+    exit-IP geo (``_pool_geo``) and a deterministic seed (``_proxy_seed``)
+    onto ``params``, the fingerprint is drawn with that timezone/locale so a
+    German residential IP presents Europe/Berlin + de-DE rather than
+    en-US/New_York. Server-IP / proxyless solves keep the random coherent
+    identity (current behavior). The actually-used ``timezone_id`` and
+    ``languages`` are stashed back onto ``params`` (``_used_timezone``,
+    ``_used_languages``) so the solver can surface them in the solution for
+    callers to align their submit context with the solve context.
     """
     del config  # reserved for future per-config fingerprint policy
-    fingerprint = generate_fingerprint(seed=None)
+    pool_geo = params.get("_pool_geo") or {}
+    fingerprint = generate_fingerprint(
+        seed=params.get("_proxy_seed") or None,
+        timezone_id=pool_geo.get("timezone") or None,
+        locale=pool_geo.get("locale") or None,
+    )
     user_agent = params.get("userAgent") or fingerprint.user_agent
 
     if params.get("_proxy_override"):
@@ -122,6 +151,12 @@ def resolve_context_options(config: Config, params: dict[str, Any]) -> ContextOp
         proxy_dict = None
     else:
         proxy_dict = _proxy_dict_from_params(params)
+
+    # Surface the actually-used fingerprint geo so solvers can echo it back
+    # in the solution (SolutionObject.timezoneId / acceptLanguage). Stashing
+    # onto params avoids changing ``new_context``'s return signature.
+    params["_used_timezone"] = fingerprint.timezone_id
+    params["_used_languages"] = list(fingerprint.languages)
 
     return ContextOptions(
         user_agent=user_agent,
@@ -138,6 +173,26 @@ class BrowserManager:
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._runtime = getattr(config, "browser_runtime", "chromium")
+        # WP4: pre-parse the resource interception config so the per-request
+        # route handler does no string parsing on the hot path. Defaults match
+        # ``Config`` so a test ``SimpleNamespace`` without these attributes
+        # still behaves like production.
+        self._resource_block_enabled = bool(
+            getattr(config, "resource_block_enabled", True)
+        )
+        self._resource_block_types = _parse_csv(
+            getattr(config, "resource_block_types", "image,media,font,stylesheet")
+        )
+        self._resource_allow_hosts = _parse_csv(
+            getattr(
+                config,
+                "resource_allow_hosts",
+                "hcaptcha.com,challenges.cloudflare.com,google.com,recaptcha.net,gstatic.com,cloudflare.com",
+            )
+        )
+        self._resource_block_hosts = _parse_csv(
+            getattr(config, "resource_block_hosts", "")
+        )
 
     async def start(self) -> None:
         if self._browser is not None:
@@ -235,4 +290,70 @@ class BrowserManager:
         # and populate SolveRecord.proxy_bytes.
         context._omc_bytes_used = 0  # type: ignore[attr-defined]
         context.on("response", _count_response_bytes)
+        # WP4: per-context resource interception. Registered BEFORE the solver
+        # fulfill routes (hcaptcha/turnstile register ``context.route(website_url,
+        # _fulfill_document)`` after _acquire_context returns). Playwright runs
+        # route handlers in registration order, so this handler runs first and
+        # either ``continue_()``s the request (passing it to the next handler)
+        # or ``abort()``s it. The synthetic document request has resource_type
+        # "document" (not in the block types), so it continues through to the
+        # solver's fulfill handler; challenge asset hosts (hcaptcha.com etc.)
+        # are on the allowlist and always continue.
+        if self._resource_block_enabled:
+            await context.route("**/*", self._resource_handler)
         return context
+
+    async def _resource_handler(self, route: Any) -> None:
+        """Per-context route handler that aborts bandwidth-heavy resources.
+
+        Policy (in order, first match wins):
+          1. Allowlist host suffix (challenge hosts) → ``continue_``.
+          2. Blocklist host suffix (trackers) → ``abort``.
+          3. Resource type in the configured block set → ``abort``.
+          4. Otherwise → ``continue_``.
+
+        Every step is guarded so a malformed URL / missing attribute never
+        breaks solving — the handler falls through to ``continue_`` rather
+        than raising. Challenge resources (hCaptcha / Turnstile / reCAPTCHA
+        tile images, scripts) are on the allowlist and always pass through,
+        which is the highest-risk regression surface for this feature.
+        """
+        try:
+            url = route.request.url
+        except Exception:
+            await _safe_continue(route)
+            return
+
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            host = ""
+
+        try:
+            if host and any(
+                host == suffix or host.endswith("." + suffix)
+                for suffix in self._resource_allow_hosts
+            ):
+                await route.continue_()
+                return
+        except Exception:
+            pass
+
+        try:
+            if host and self._resource_block_hosts and any(
+                host == suffix or host.endswith("." + suffix)
+                for suffix in self._resource_block_hosts
+            ):
+                await route.abort()
+                return
+        except Exception:
+            pass
+
+        try:
+            if route.request.resource_type in self._resource_block_types:
+                await route.abort()
+                return
+        except Exception:
+            pass
+
+        await _safe_continue(route)

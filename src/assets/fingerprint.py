@@ -117,6 +117,15 @@ _LANGUAGE_SETS = {
     "de-DE": ["de-DE", "de", "en-US", "en"],
     "fr-FR": ["fr-FR", "fr", "en-US", "en"],
     "es-ES": ["es-ES", "es", "en"],
+    # Geo-derived locales (proxy_pool._COUNTRY_GEO derives these for RU/BR/JP/IN/CA
+    # exit IPs). Without explicit entries, generate_fingerprint fell back to
+    # ["en-US","en"], producing Playwright locale=ja-JP + timezone=Asia/Tokyo but
+    # navigator.language=en-US — an inconsistent fingerprint hCaptcha risk-models.
+    "ja-JP": ["ja-JP", "ja", "en"],
+    "pt-BR": ["pt-BR", "pt", "en"],
+    "ru-RU": ["ru-RU", "ru", "en"],
+    "hi-IN": ["hi-IN", "hi", "en-IN", "en"],
+    "en-CA": ["en-CA", "en", "fr-CA"],
 }
 
 _LOCALE_TIMEZONES = {
@@ -125,6 +134,13 @@ _LOCALE_TIMEZONES = {
     "de-DE": "Europe/Berlin",
     "fr-FR": "Europe/Paris",
     "es-ES": "Europe/Madrid",
+    # Mirror the geo-derived locales so a random draw (no proxy) still picks a
+    # coherent timezone for these locales.
+    "ja-JP": "Asia/Tokyo",
+    "pt-BR": "America/Sao_Paulo",
+    "ru-RU": "Europe/Moscow",
+    "hi-IN": "Asia/Kolkata",
+    "en-CA": "America/Toronto",
 }
 
 
@@ -188,11 +204,32 @@ def build_stealth_js(fp: FingerprintProfile) -> str:
     ``languages``, ``plugins``, ``hardwareConcurrency``, ``deviceMemory``,
     ``window.chrome``, ``permissions.query``) and rewrites the WebGL
     ``UNMASKED_VENDOR_WEBGL`` (37445) / ``UNMASKED_RENDERER_WEBGL`` (37446)
-    parameters to this fingerprint's GPU strings. Also injects a tiny, stable
-    per-canvas noise so the canvas hash differs from the un-patched default
-    without visibly corrupting rendered content.
+    parameters to this fingerprint's GPU strings. Also injects a sparse,
+    per-fingerprint canvas noise so the canvas hash differs from the
+    un-patched default without visibly corrupting rendered content.
+
+    WP5 stealth hardening:
+    * ``navigator.plugins`` is now a small array of realistic
+      ``Plugin``-shaped objects (name/filename/description/length) instead
+      of the bare ``[1,2,3,4,5]`` array (a trivial detection signal).
+    * The canvas noise step is a larger prime (509) that isn't a divisor of
+      common image widths, and the per-pixel offset is derived from the
+      fingerprint's UA hash so the same fingerprint produces a stable hash
+      but different fingerprints produce uncorrelated noise — defeating
+      naive canvas-fingerprint reuse without the previous fixed
+      ``(hc*7+mem)%8`` signature that was itself detectable across solves.
     """
     languages_array = "[" + ",".join(_js_str(lang) for lang in fp.languages) + "]"
+    # Per-fingerprint canvas noise offset: deterministic from the UA so the
+    # same fingerprint always produces the same canvas hash, but different
+    # fingerprints produce different (uncorrelated) noise. Replaces the old
+    # fixed ``(hc*7+mem)%8`` pattern that was a detectable signature.
+    fp_offset = int(hashlib.sha256(fp.user_agent.encode("utf-8")).hexdigest(), 16) % 64
+    # Sparse prime step — 509 is prime and not a divisor of common image
+    # widths (1920/1080/1440/900), so the noise doesn't align to a visible
+    # column pattern. Larger than the previous 251 so fewer pixels are
+    # touched (sparser) while still perturbing the canvas hash.
+    canvas_step = 509
 
     return f"""
 (() => {{
@@ -200,7 +237,17 @@ def build_stealth_js(fp: FingerprintProfile) -> str:
   Object.defineProperty(navigator, 'languages', {{get: () => {languages_array}}});
   Object.defineProperty(navigator, 'language', {{get: () => {_js_str(fp.languages[0])}}});
   Object.defineProperty(navigator, 'platform', {{get: () => {_js_str(fp.platform)}}});
-  Object.defineProperty(navigator, 'plugins', {{get: () => [1, 2, 3, 4, 5]}});
+  // Realistic PluginArray-shaped objects. Bare numbers like [1,2,3,4,5]
+  // are a trivial detection signal; real Chrome exposes ~5 PDF-related
+  // plugins, each with the standard (name/filename/description/length) shape.
+  const _plugins = [
+    {{name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1}},
+    {{name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1}},
+    {{name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1}},
+    {{name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1}},
+    {{name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1}}
+  ];
+  Object.defineProperty(navigator, 'plugins', {{get: () => _plugins}});
   Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => {fp.hardware_concurrency}}});
   Object.defineProperty(navigator, 'deviceMemory', {{get: () => {fp.device_memory}}});
   window.chrome = {{runtime: {{}}, app: {{}}, loadTimes: () => {{}}, csi: () => {{}}}};
@@ -228,16 +275,22 @@ def build_stealth_js(fp: FingerprintProfile) -> str:
   try {{ _patchGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype); }} catch (e) {{}}
   try {{ _patchGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype); }} catch (e) {{}}
 
-  // Small, deterministic canvas noise: nudges the pixel data hash without
-  // producing visible artefacts, defeating naive canvas-fingerprint reuse.
+  // Sparse, per-fingerprint canvas noise: nudges the pixel data hash
+  // without visible artefacts. The step ({canvas_step}) is prime and not a
+  // divisor of common image widths, so the noise doesn't align to a column
+  // pattern; the offset ({fp_offset}) is derived from the UA so the same
+  // fingerprint produces a stable hash but different fingerprints produce
+  // uncorrelated noise — defeating naive canvas-fingerprint reuse without
+  // the previous fixed (hc*7+mem)%8 signature.
   try {{
     const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
     const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
-    const _noise = ({fp.hardware_concurrency} * 7 + {fp.device_memory}) % 8;
+    const _step = {canvas_step};
+    const _offset = {fp_offset};
     CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {{
       const data = _getImageData.call(this, x, y, w, h);
-      for (let i = 0; i < data.data.length; i += 251) {{
-        data.data[i] = (data.data[i] + _noise) % 256;
+      for (let i = 0; i < data.data.length; i += _step) {{
+        data.data[i] = (data.data[i] + _offset) & 0xff;
       }}
       return data;
     }};

@@ -230,7 +230,10 @@ def test_accounting_optimistic_default() -> None:
         acc = SuccessAccounting()
         assert await acc.success_rate("never-seen") == 1.0
         stats = await acc.stats("never-seen")
-        assert stats == {"attempts": 0, "successes": 0, "rate": 1.0}
+        assert stats["attempts"] == 0
+        assert stats["successes"] == 0
+        assert stats["rate"] == 1.0
+        assert stats["real_attempts"] == 0
 
     asyncio.run(run())
 
@@ -407,6 +410,75 @@ def test_recaptcha_v2_records_to_ledger() -> None:
     asyncio.run(run())
 
 
+def test_recaptcha_v3_defaults_egress_proxyless() -> None:
+    """v3 is score-based: default egress=proxyless unless caller overrides."""
+    async def run() -> None:
+        from types import SimpleNamespace
+
+        from src.services.recaptcha_v3 import RecaptchaV3Solver
+
+        config = SimpleNamespace(captcha_retries=1)
+        solver = RecaptchaV3Solver(config, manager=SimpleNamespace(), services=None)
+
+        seen: list[dict] = []
+
+        async def _fake_solve_once(website_url, website_key, page_action, params):
+            seen.append(dict(params))
+            return "token-" + "x" * 30, "UA"
+
+        solver._solve_once = _fake_solve_once  # type: ignore[attr-defined]
+
+        # No egress, no task proxy → defaulted to proxyless.
+        p1 = {"websiteURL": "u", "websiteKey": "k"}
+        await solver.solve(p1)
+        assert p1["egress"] == "proxyless"
+
+        # Explicit caller egress is respected (not overridden).
+        p2 = {"websiteURL": "u", "websiteKey": "k", "egress": "auto"}
+        await solver.solve(p2)
+        assert p2["egress"] == "auto"
+
+        # A caller-supplied task proxy is left to auto egress (not forced
+        # proxyless, which would strip the proxy).
+        p3 = {
+            "websiteURL": "u",
+            "websiteKey": "k",
+            "proxyType": "http",
+            "proxyAddress": "1.2.3.4",
+            "proxyPort": 8080,
+        }
+        await solver.solve(p3)
+        assert "egress" not in p3
+
+    asyncio.run(run())
+
+
+def test_recaptcha_v2_defaults_egress_auto() -> None:
+    """v2 uses the standard auto egress selection when caller leaves it unset."""
+    async def run() -> None:
+        from types import SimpleNamespace
+
+        from src.services.recaptcha_v2 import RecaptchaV2Solver
+
+        config = SimpleNamespace(captcha_retries=1)
+        solver = RecaptchaV2Solver(config, manager=SimpleNamespace(), services=None)
+
+        async def _fake_solve_once(website_url, website_key, is_invisible, params):
+            return "token-" + "x" * 30, "UA"
+
+        solver._solve_once = _fake_solve_once  # type: ignore[attr-defined]
+
+        p1 = {"websiteURL": "u", "websiteKey": "k"}
+        await solver.solve(p1)
+        assert p1["egress"] == "auto"
+
+        p2 = {"websiteURL": "u", "websiteKey": "k", "egress": "pool"}
+        await solver.solve(p2)
+        assert p2["egress"] == "pool"
+
+    asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # RedisCostLedger (persisted spend / records across restarts)
 # ---------------------------------------------------------------------------
@@ -523,6 +595,89 @@ def test_redis_ledger_records_filter_by_client_and_sitekey() -> None:
     asyncio.run(run())
 
 
+def test_redis_ledger_try_claim_reported_claims_and_persists() -> None:
+    """RedisCostLedger.try_claim_reported atomically claims the reported flag
+    via SET NX: the first call for a task returns True (claim won), a second
+    call returns False (already claimed), and the informational ``reported``
+    field is synced into the by-task blob. The claim survives a reconnect
+    (the SET-NX key persists in Redis)."""
+    aioredis, url = _redis_helper()
+    prefix = "test:ledger:claim"
+
+    async def run() -> None:
+        from src.consumption.ledger import RedisCostLedger
+
+        _flush_prefix(prefix)
+        ledger = RedisCostLedger(url, key_prefix=prefix)
+        await ledger.record(_rec("t-claim", cost=0.5, client_key="c1"))
+
+        # Fresh record defaults to reported=False.
+        rec = await ledger.get_by_task_id("t-claim")
+        assert rec is not None
+        assert rec.reported is False
+
+        # First claim wins — SET NX set the key.
+        ok = await ledger.try_claim_reported("t-claim")
+        assert ok is True
+
+        # Informational sync: the by-task blob now reflects reported=True.
+        rec = await ledger.get_by_task_id("t-claim")
+        assert rec is not None
+        assert rec.reported is True
+
+        # Second claim loses — key already existed.
+        ok2 = await ledger.try_claim_reported("t-claim")
+        assert ok2 is False
+
+        # Unknown task returns False (no record to claim).
+        assert await ledger.try_claim_reported("nope") is False
+
+        await ledger.close()
+
+        # Claim survives a "restart" — re-read from a fresh ledger instance.
+        # The SET-NX key persisted in Redis, so a claim is still denied.
+        ledger2 = RedisCostLedger(url, key_prefix=prefix)
+        assert await ledger2.try_claim_reported("t-claim") is False
+        # And the informational flag is still True in the blob.
+        rec2 = await ledger2.get_by_task_id("t-claim")
+        assert rec2 is not None
+        assert rec2.reported is True
+        await ledger2.close()
+        _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_redis_ledger_try_claim_reported_atomic_under_concurrency() -> None:
+    """N concurrent try_claim_reported calls for the same task_id: exactly
+    one returns True (the SET-NX winner), the rest return False. Atomic at
+    the Redis server — no double-claims even under heavy concurrency."""
+    aioredis, url = _redis_helper()
+    prefix = "test:ledger:claim:race"
+
+    async def run() -> None:
+        from src.consumption.ledger import RedisCostLedger
+
+        _flush_prefix(prefix)
+        ledger = RedisCostLedger(url, key_prefix=prefix)
+        await ledger.record(_rec("t-race", cost=0.5, client_key="c1"))
+
+        n = 32
+        results = await asyncio.gather(
+            *[ledger.try_claim_reported("t-race") for _ in range(n)]
+        )
+        assert sum(1 for r in results if r is True) == 1
+        assert sum(1 for r in results if r is False) == n - 1
+
+        # A subsequent claim after the winner also returns False.
+        assert await ledger.try_claim_reported("t-race") is False
+
+        await ledger.close()
+        _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
 def test_build_ledger_selects_redis_when_configured() -> None:
     aioredis, url = _redis_helper()
     prefix = "test:ledger:build"
@@ -545,5 +700,225 @@ def test_build_ledger_selects_redis_when_configured() -> None:
         ledger = build_ledger(cfg_redis)
         assert isinstance(ledger, RedisCostLedger)
         await ledger.close()
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# RedisSuccessAccounting (shared routing stats across workers)
+# ---------------------------------------------------------------------------
+
+
+def _accounting_flush_prefix(prefix: str) -> None:
+    """Synchronously flush accounting test keys so tests don't see stale data."""
+    import redis as sync_redis
+
+    r = sync_redis.from_url("redis://localhost:6379/0", decode_responses=True)
+    for key in r.scan_iter(f"{prefix}*"):
+        r.delete(key)
+    r.close()
+
+
+def test_redis_accounting_optimistic_default() -> None:
+    aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:acc:opt:"
+
+    async def run() -> None:
+        from src.consumption.accounting import RedisSuccessAccounting
+
+        _accounting_flush_prefix(prefix)
+        acc = RedisSuccessAccounting(url, key_prefix=prefix)
+        try:
+            assert await acc.success_rate("never-seen") == 1.0
+            assert await acc.real_success_rate("never-seen") == 1.0
+            stats = await acc.stats("never-seen")
+            assert stats["attempts"] == 0
+            assert stats["successes"] == 0
+            assert stats["rate"] == 1.0
+            assert stats["real_attempts"] == 0
+            assert stats["real_rate"] == 1.0
+        finally:
+            await acc.close()
+            _accounting_flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_redis_accounting_record_and_rate() -> None:
+    aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:acc:record:"
+
+    async def run() -> None:
+        from src.consumption.accounting import RedisSuccessAccounting
+
+        _accounting_flush_prefix(prefix)
+        acc = RedisSuccessAccounting(url, key_prefix=prefix)
+        try:
+            await acc.record("sk", "ready")
+            await acc.record("sk", "failed")
+            await acc.record("sk", "timeout")
+            await acc.record("sk", "ready")
+            assert await acc.success_rate("sk") == 0.5
+        finally:
+            await acc.close()
+            _accounting_flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_redis_accounting_real_outcome_separate_bucket() -> None:
+    aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:acc:real:"
+
+    async def run() -> None:
+        from src.consumption.accounting import RedisSuccessAccounting
+
+        _accounting_flush_prefix(prefix)
+        acc = RedisSuccessAccounting(url, key_prefix=prefix)
+        try:
+            # Optimistic record + real outcome with a different signal:
+            # token obtained (ready) but rejected downstream (real=False).
+            await acc.record("sk", "ready")
+            await acc.record("sk", "ready")
+            await acc.record_real_outcome("sk", success=False)
+            await acc.record_real_outcome("sk", success=False)
+            assert await acc.success_rate("sk") == 1.0
+            assert await acc.real_success_rate("sk") == 0.0
+        finally:
+            await acc.close()
+            _accounting_flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_redis_accounting_dimensions_independent() -> None:
+    aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:acc:dim:"
+
+    async def run() -> None:
+        from src.consumption.accounting import RedisSuccessAccounting
+
+        _accounting_flush_prefix(prefix)
+        acc = RedisSuccessAccounting(url, key_prefix=prefix)
+        try:
+            await acc.record("sk", "failed", proxy_kind="residential", model="gpt-4o")
+            await acc.record("sk", "ready", proxy_kind="datacenter", model="gpt-4o")
+            rate_res = await acc.success_rate(
+                "sk", proxy_kind="residential", model="gpt-4o"
+            )
+            rate_dc = await acc.success_rate(
+                "sk", proxy_kind="datacenter", model="gpt-4o"
+            )
+            assert rate_res == 0.0
+            assert rate_dc == 1.0
+            # bare-sitekey bucket has no data → optimistic
+            assert await acc.success_rate("sk") == 1.0
+        finally:
+            await acc.close()
+            _accounting_flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_redis_accounting_respects_window() -> None:
+    aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:acc:window:"
+
+    async def run() -> None:
+        from src.consumption.accounting import RedisSuccessAccounting
+
+        _accounting_flush_prefix(prefix)
+        acc = RedisSuccessAccounting(url, window=4, key_prefix=prefix)
+        try:
+            for _ in range(4):
+                await acc.record("sk", "failed")
+            assert await acc.success_rate("sk") == 0.0
+            for _ in range(4):
+                await acc.record("sk", "ready")
+            assert await acc.success_rate("sk") == 1.0
+            stats = await acc.stats("sk")
+            assert stats["attempts"] == 4  # bounded by window
+        finally:
+            await acc.close()
+            _accounting_flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_redis_accounting_stats_aggregates_across_buckets() -> None:
+    aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:acc:stats:"
+
+    async def run() -> None:
+        from src.consumption.accounting import RedisSuccessAccounting
+
+        _accounting_flush_prefix(prefix)
+        acc = RedisSuccessAccounting(url, key_prefix=prefix)
+        try:
+            await acc.record("sk", "ready", proxy_kind="residential", model="m1")
+            await acc.record("sk", "failed", proxy_kind="datacenter", model="m2")
+            await acc.record_real_outcome("sk", success=True, proxy_kind="res")
+            await acc.record_real_outcome("sk", success=False, proxy_kind="dc")
+            stats = await acc.stats("sk")
+            assert stats["attempts"] == 2
+            assert stats["successes"] == 1
+            assert stats["real_attempts"] == 2
+            assert stats["real_successes"] == 1
+        finally:
+            await acc.close()
+            _accounting_flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_redis_accounting_survives_reconnect() -> None:
+    """A new accounting instance pointing at the same Redis sees the windows."""
+    aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:acc:restart:"
+
+    async def run() -> None:
+        from src.consumption.accounting import RedisSuccessAccounting
+
+        _accounting_flush_prefix(prefix)
+        acc1 = RedisSuccessAccounting(url, key_prefix=prefix)
+        try:
+            await acc1.record("sk", "ready")
+            await acc1.record("sk", "ready")
+        finally:
+            await acc1.close()
+
+        acc2 = RedisSuccessAccounting(url, key_prefix=prefix)
+        try:
+            assert await acc2.success_rate("sk") == 1.0
+            stats = await acc2.stats("sk")
+            assert stats["attempts"] == 2
+        finally:
+            await acc2.close()
+            _accounting_flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_build_accounting_selects_redis_when_configured() -> None:
+    aioredis, url = _redis_helper()  # noqa: F841
+
+    async def run() -> None:
+        from types import SimpleNamespace
+
+        from src.consumption.accounting import (
+            RedisSuccessAccounting,
+            SuccessAccounting,
+            build_accounting,
+        )
+
+        # No redis_url → in-memory SuccessAccounting.
+        cfg_mem = SimpleNamespace(redis_url=None)
+        assert isinstance(build_accounting(cfg_mem), SuccessAccounting)
+
+        # redis_url set → RedisSuccessAccounting.
+        cfg_redis = SimpleNamespace(redis_url=url)
+        acc = build_accounting(cfg_redis)
+        assert isinstance(acc, RedisSuccessAccounting)
+        await acc.close()
 
     asyncio.run(run())

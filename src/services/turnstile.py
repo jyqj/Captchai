@@ -28,7 +28,7 @@ from typing import Any, Optional
 
 from playwright.async_api import Route
 
-from .browser_solver import BaseBrowserSolver
+from .browser_solver import BaseBrowserSolver, fingerprint_geo_from_params
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +107,13 @@ class TurnstileSolver(BaseBrowserSolver):
                 await self._record(
                     params, website_key, client_key, "ready", started
                 )
-                return {"token": token, "userAgent": user_agent}
+                tz, accept = fingerprint_geo_from_params(params)
+                return {
+                    "token": token,
+                    "userAgent": user_agent,
+                    "timezoneId": tz,
+                    "acceptLanguage": accept,
+                }
             except Exception as exc:
                 last_error = exc
                 await self._record(
@@ -134,6 +140,7 @@ class TurnstileSolver(BaseBrowserSolver):
         params: dict[str, Any],
     ) -> tuple[str, str]:
         solve_context = await self._acquire_context(params)
+        self._stash_fingerprint_geo(solve_context, params)
         context = solve_context.context
         user_agent = solve_context.user_agent
         html = _build_injected_page(website_key, render_options)

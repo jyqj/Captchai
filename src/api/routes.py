@@ -14,6 +14,8 @@ from ..models.task import (
     GetBalanceResponse,
     GetTaskResultRequest,
     GetTaskResultResponse,
+    ReportTaskRequest,
+    ReportTaskResponse,
     SolutionObject,
 )
 from ..core.services import get_services
@@ -222,3 +224,141 @@ async def health() -> dict[str, object]:
         "cloud_model": config.cloud_model,
         "local_model": config.local_model,
     }
+
+
+# ── reportCorrect / reportIncorrect (WP6) ───────────────────
+
+
+async def _report_outcome(
+    request: ReportTaskRequest, *, correct: bool
+) -> ReportTaskResponse:
+    """Shared handler for /reportCorrect and /reportIncorrect.
+
+    Feeds the real (token-actually-accepted) outcome back into the proxy-pool
+    sitekey stats (the *real-outcome* bucket, separate from the token-obtained
+    bucket the solver writes), the success accounting, and the session
+    reputation. All downstream calls are non-fatal: a missing proxy / session
+    / record returns a clean error or ``errorId=0``, never a 500.
+
+    Security — task ownership: a report may only mutate the shared
+    proxy-pool / accounting / session state for a task the caller owns.
+    After the record is fetched, ``rec.client_key`` is checked against
+    ``request.clientKey``; a mismatch returns
+    ``ERROR_NO_SUCH_CAPCHA_ID`` (NOT a mismatch code, so task existence
+    isn't leaked to non-owners). When ``rec.client_key is None``
+    (anonymous / legacy ledger record) the report is allowed — there's no
+    owner to check against (backward compat).
+
+    Concurrency — atomic claim: a single atomic claim via
+    ``ledger.try_claim_reported(taskId)`` runs BEFORE any side effect and
+    replaces the old read-check-then-write race (pre-check ``rec.reported``
+    → side effects → post-mark). Exactly one concurrent report for a given
+    task wins the claim and runs the side effects; every other report
+    (concurrent or sequential retry) sees the claim already taken and
+    returns ``errorId=0`` without touching proxy-pool / accounting /
+    session state. The in-memory ledger claims under its lock; the Redis
+    ledger claims via ``SET {prefix}:reported:{task_id} 1 NX EX <ttl>``.
+    """
+    if not _authorized(request.clientKey):
+        return ReportTaskResponse(
+            errorId=1,
+            errorCode="ERROR_KEY_DOES_NOT_EXIST",
+            errorDescription="Invalid clientKey",
+        )
+
+    services = get_services()
+    if services is None:
+        return ReportTaskResponse(
+            errorId=1,
+            errorCode="ERROR_NO_SUCH_CAPCHA_ID",
+            errorDescription="No solve record for this task",
+        )
+
+    rec = await services.ledger.get_by_task_id(request.taskId)
+    if rec is None:
+        return ReportTaskResponse(
+            errorId=1,
+            errorCode="ERROR_NO_SUCH_CAPCHA_ID",
+            errorDescription="No solve record for this task",
+        )
+
+    # Security: only the task's owner may report on it. A mismatch returns
+    # the same "no such task" error as a missing record so the endpoint
+    # doesn't leak task existence to non-owners. Anonymous / legacy records
+    # (client_key is None) have no owner to check against and are allowed.
+    if rec.client_key is not None and rec.client_key != request.clientKey:
+        return ReportTaskResponse(
+            errorId=1,
+            errorCode="ERROR_NO_SUCH_CAPCHA_ID",
+            errorDescription="No solve record for this task",
+        )
+
+    # Atomic idempotency claim: flips reported False→True atomically BEFORE
+    # any side effect. Exactly one caller per task wins (returns True);
+    # everyone else — concurrent racers or sequential retries — loses
+    # (returns False) and short-circuits with errorId=0 without re-running
+    # the downstream proxy-pool / accounting / session-pool calls.
+    claimed = await services.ledger.try_claim_reported(request.taskId)
+    if not claimed:
+        return ReportTaskResponse(errorId=0)
+
+    # Proxy-pool per-sitekey real-outcome ranking — only when both ids are
+    # present. Writes into the *real* bucket (``report_sitekey_real``) so the
+    # solver's token-obtained bucket (``report_sitekey``) stays undiluted and
+    # checkout ranking can prefer the real signal when present.
+    if rec.proxy_id and rec.sitekey:
+        try:
+            await services.proxy_pool.report_sitekey_real(
+                rec.proxy_id, rec.sitekey, success=correct
+            )
+        except Exception:  # noqa: BLE001 - non-fatal: report must not 500
+            log.debug(
+                "proxy_pool.report_sitekey_real failed for task %s",
+                request.taskId,
+                exc_info=True,
+            )
+
+    # Real-outcome accounting (always recorded, even with an empty sitekey).
+    try:
+        await services.accounting.record_real_outcome(
+            rec.sitekey,
+            success=correct,
+            proxy_kind=rec.proxy_kind,
+            model=rec.model,
+        )
+    except Exception:  # noqa: BLE001 - non-fatal
+        log.debug(
+            "accounting.record_real_outcome failed for task %s",
+            request.taskId,
+            exc_info=True,
+        )
+
+    # Session reputation nudge — no-op if the session was already retired.
+    if rec.session_id and services.session_pool is not None:
+        try:
+            await services.session_pool.report_outcome(
+                rec.session_id, success=correct
+            )
+        except Exception:  # noqa: BLE001 - non-fatal
+            log.debug(
+                "session_pool.report_outcome failed for task %s",
+                request.taskId,
+                exc_info=True,
+            )
+
+    # No post-side-effect mark: the atomic claim above already set
+    # reported=True (in-memory under the lock, or via the Redis SET-NX
+    # key). A retry will see the claim taken and short-circuit.
+    return ReportTaskResponse(errorId=0)
+
+
+@router.post("/reportCorrect", response_model=ReportTaskResponse)
+async def report_correct(request: ReportTaskRequest) -> ReportTaskResponse:
+    """Caller reports the task's token was accepted downstream."""
+    return await _report_outcome(request, correct=True)
+
+
+@router.post("/reportIncorrect", response_model=ReportTaskResponse)
+async def report_incorrect(request: ReportTaskRequest) -> ReportTaskResponse:
+    """Caller reports the task's token was rejected downstream."""
+    return await _report_outcome(request, correct=False)

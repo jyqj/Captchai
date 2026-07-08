@@ -90,6 +90,11 @@ class SolutionObject(BaseModel):
     objects: list[int] | None = None
     answer: bool | list[int] | None = None
     userAgent: str | None = None
+    # WP3: fingerprint geo used for the solve, surfaced so callers can align
+    # their submit context (Accept-Language header / TZ) with the solve
+    # context. Optional — omitted when the solver didn't pin a fingerprint.
+    timezoneId: str | None = None
+    acceptLanguage: str | None = None
 
 
 class GetTaskResultResponse(BaseModel):
@@ -109,3 +114,16 @@ class GetBalanceRequest(BaseModel):
 class GetBalanceResponse(BaseModel):
     errorId: int = 0
     balance: float = 99999.0
+
+
+# ── reportCorrect / reportIncorrect ─────────────────────────
+
+class ReportTaskRequest(BaseModel):
+    clientKey: str
+    taskId: str
+
+
+class ReportTaskResponse(BaseModel):
+    errorId: int = 0
+    errorCode: str | None = None
+    errorDescription: str | None = None

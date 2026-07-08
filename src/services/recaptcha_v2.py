@@ -17,13 +17,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Optional
+from typing import Any
 
 import httpx
-from playwright.async_api import Browser
 
-from ..core.config import Config
-from .browser import BrowserManager
+from .browser_solver import BaseBrowserSolver, fingerprint_geo_from_params
 
 log = logging.getLogger(__name__)
 
@@ -43,42 +41,31 @@ _EXTRACT_TOKEN_JS = """
 }
 """
 
+# Selector for the reCAPTCHA challenge bframe (the iframe that contains the
+# visual/audio challenge once Google decides the bot needs to prove itself).
+_CHALLENGE_IFRAME = 'iframe[title*="recaptcha challenge"]'
+# The audio download link inside the bframe — used as the event-driven signal
+# that the audio player has finished rendering (replaces a fixed sleep).
+_AUDIO_DOWNLOAD_LINK = ".rc-audiochallenge-tdownload-link"
 
-class RecaptchaV2Solver:
+
+class RecaptchaV2Solver(BaseBrowserSolver):
     """Solves reCAPTCHA v2 tasks via headless Chromium with checkbox clicking.
 
     Falls back to the audio challenge path when Google presents a visual
-    challenge to the headless browser.
+    challenge to the headless browser. Context acquisition / release and
+    proxy categorisation are handled by :class:`BaseBrowserSolver`.
     """
-
-    def __init__(
-        self,
-        config: Config,
-        manager: BrowserManager | None = None,
-        browser: Browser | None = None,
-        services: Any | None = None,
-    ) -> None:
-        self._config = config
-        self._manager = manager or BrowserManager(config)
-        self._owns_manager = manager is None
-        if browser is not None:
-            self._manager._browser = browser  # type: ignore[attr-defined]
-        self._services = services
-
-    async def start(self) -> None:
-        if self._owns_manager:
-            await self._manager.start()
-
-    async def stop(self) -> None:
-        if self._owns_manager:
-            await self._manager.stop()
-        log.info("RecaptchaV2Solver stopped")
 
     async def solve(self, params: dict[str, Any]) -> dict[str, Any]:
         website_url = params["websiteURL"]
         website_key = params["websiteKey"]
         is_invisible = params.get("isInvisible", False)
         client_key = params.get("_clientKey")
+
+        # reCAPTCHA v2 uses the standard auto egress selection (task proxy →
+        # pool → proxyless); only set when the caller left it unspecified.
+        params.setdefault("egress", "auto")
 
         last_error: Exception | None = None
         for attempt in range(self._config.captcha_retries):
@@ -96,7 +83,13 @@ class RecaptchaV2Solver:
                     task_type=params.get("type", "RecaptchaV2TaskProxyless"),
                     challenge_shape="audio",
                 )
-                return {"gRecaptchaResponse": token, "userAgent": user_agent}
+                tz, accept = fingerprint_geo_from_params(params)
+                return {
+                    "gRecaptchaResponse": token,
+                    "userAgent": user_agent,
+                    "timezoneId": tz,
+                    "acceptLanguage": accept,
+                }
             except Exception as exc:
                 last_error = exc
                 await self._record(
@@ -121,71 +114,21 @@ class RecaptchaV2Solver:
             f"reCAPTCHA v2 failed after {self._config.captcha_retries} attempts: {last_error}"
         )
 
-    async def _record(
-        self,
-        params: dict[str, Any],
-        sitekey: str,
-        client_key: Optional[str],
-        outcome: str,
-        started: float,
-        *,
-        task_type: str | None = None,
-        challenge_shape: str = "audio",
-    ) -> None:
-        """Append a SolveRecord to the shared ledger and update accounting.
-
-        Metering failures are swallowed so they never fail a solve.
-        """
-        if self._services is None:
-            return
-        from ..consumption.ledger import SolveRecord, estimate_cost
-
-        vision = params.get("_vision")
-        model = getattr(vision, "last_model", None)
-        in_tok = getattr(vision, "total_input_tokens", 0) or 0
-        out_tok = getattr(vision, "total_output_tokens", 0) or 0
-        calls = getattr(vision, "total_vision_calls", 0) or 0
-        cost = estimate_cost(model or "local", in_tok, out_tok)
-
-        try:
-            await self._services.ledger.record(
-                SolveRecord(
-                    task_id=str(params.get("_taskId") or ""),
-                    sitekey=sitekey,
-                    task_type=task_type or params.get("type", "RecaptchaV2TaskProxyless"),
-                    proxy_id=params.get("_pool_proxy_id"),
-                    session_id=params.get("_sessionId"),
-                    proxy_kind=params.get("_proxyKind"),
-                    model=model,
-                    challenge_shape=challenge_shape,
-                    vision_calls=calls,
-                    input_tokens=in_tok,
-                    output_tokens=out_tok,
-                    proxy_bytes=int(params.get("_proxy_bytes", 0)),
-                    wall_ms=int((time.monotonic() - started) * 1000),
-                    outcome=outcome,
-                    est_cost_usd=cost,
-                    client_key=client_key,
-                )
-            )
-            await self._services.accounting.record(
-                sitekey,
-                outcome,
-                proxy_kind=params.get("_proxyKind"),
-                model=model,
-            )
-        except Exception as exc:
-            log.debug("ledger record failed: %s", exc)
-
     async def _solve_once(
         self, website_url: str, website_key: str, is_invisible: bool, params: dict[str, Any]
     ) -> tuple[str, str]:
-        context, user_agent = await self._manager.new_context(params)
+        solve_context = await self._acquire_context(params)
+        self._stash_fingerprint_geo(solve_context, params)
+        context = solve_context.context
+        user_agent = solve_context.user_agent
         page = await context.new_page()
 
+        solved = False
         try:
             timeout_ms = self._config.browser_timeout * 1000
-            await page.goto(website_url, wait_until="networkidle", timeout=timeout_ms)
+            await page.goto(
+                website_url, wait_until="domcontentloaded", timeout=timeout_ms
+            )
             await page.mouse.move(400, 300)
             await asyncio.sleep(0.5)
 
@@ -209,10 +152,10 @@ class RecaptchaV2Solver:
                 raise RuntimeError(f"Invalid reCAPTCHA v2 token: {token!r}")
 
             log.info("Got reCAPTCHA v2 token (len=%d)", len(token))
+            solved = True
             return token, user_agent
         finally:
-            params["_proxy_bytes"] = int(getattr(context, "_omc_bytes_used", 0))
-            await context.close()
+            await self._release_context(solve_context, solved, params)
 
     async def _solve_checkbox(self, page: Any) -> str | None:
         """Click the reCAPTCHA checkbox. If a visual challenge appears, try audio path."""
@@ -220,7 +163,13 @@ class RecaptchaV2Solver:
         checkbox_frame = page.frame_locator('iframe[title="reCAPTCHA"]').first
         checkbox = checkbox_frame.locator("#recaptcha-anchor")
         await checkbox.click(timeout=10_000)
-        await asyncio.sleep(2)
+
+        # Wait for the challenge bframe to appear (or a token to be issued
+        # immediately for low-risk sessions). Bounded; replaces a fixed 2s sleep.
+        try:
+            await page.wait_for_selector(_CHALLENGE_IFRAME, timeout=4_000)
+        except Exception:
+            pass
 
         # Check if token was issued immediately (low-risk sessions)
         token = await page.evaluate(_EXTRACT_TOKEN_JS)
@@ -239,18 +188,21 @@ class RecaptchaV2Solver:
 
     async def _solve_audio_challenge(self, page: Any) -> str | None:
         """Click the audio button in the bframe and transcribe the audio."""
-        # The challenge bframe has title containing "recaptcha challenge"
-        bframe = page.frame_locator('iframe[title*="recaptcha challenge"]')
-
         # Click the audio challenge button
+        bframe = page.frame_locator(_CHALLENGE_IFRAME)
         audio_btn = bframe.locator("#recaptcha-audio-button")
         await audio_btn.click(timeout=8_000)
 
-        # Wait for the audio challenge iframe to load its content
-        await asyncio.sleep(3)
-
-        # After clicking audio, a new bframe is rendered with the audio player
-        bframe = page.frame_locator('iframe[title*="recaptcha challenge"]')
+        # Wait for the audio download link to render inside the bframe
+        # (bounded; replaces a fixed 3s sleep). The locator's wait_for returns
+        # the instant the link exists in the iframe's DOM.
+        bframe = page.frame_locator(_CHALLENGE_IFRAME)
+        try:
+            await bframe.locator(_AUDIO_DOWNLOAD_LINK).wait_for(timeout=6_000)
+        except Exception:
+            # Fall back to a short grace period if the wait_for times out —
+            # the bframe might still be loading the audio player.
+            await asyncio.sleep(1)
 
         # Get the audio source URL — try multiple selectors
         audio_src = None

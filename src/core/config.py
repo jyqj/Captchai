@@ -76,6 +76,27 @@ class Config:
     vision_confidence_threshold: float
     # OpenAI image `detail` for tier-2 (hard) grids.
     vision_tier2_detail: str
+    # WP4: run vote samples concurrently via asyncio.gather (escape hatch for
+    # backends that rate-limit concurrent calls — set false to fall back serial).
+    vision_vote_concurrent: bool
+    # WP4: when a tier-1 (local) call returns confidence below threshold, retry
+    # inline on the cloud model before falling back to a full browser redo.
+    vision_inline_escalate: bool
+
+    # ── Resource interception (WP4 performance) ──
+    # When true, BrowserManager._build_context registers a per-context route
+    # handler that aborts bandwidth-heavy resource types (image/media/font/
+    # stylesheet) unless the host is on the allowlist. Challenge hosts
+    # (hcaptcha / cloudflare / google) are always allowlisted so the vision
+    # layer can screenshot challenge tiles.
+    resource_block_enabled: bool
+    # Comma-separated Playwright resource types to abort (image, media, font,
+    # stylesheet by default). document/script/xhr/fetch are NOT aborted.
+    resource_block_types: str
+    # Comma-separated host suffixes always allowed through (challenge hosts).
+    resource_allow_hosts: str
+    # Comma-separated host suffixes always aborted (trackers/ads). Empty disables.
+    resource_block_hosts: str
 
     # ── Asset pools ──
     session_pool_size: int
@@ -85,7 +106,19 @@ class Config:
     proxy_max_consecutive_fails: int
     token_cache_ttl: int  # seconds
     # Playwright runtime flavour: "chromium" (stock) | "rebrowser" | "camoufox".
+    # Enterprise hCaptcha deployments should set BROWSER_RUNTIME=camoufox (a
+    # hardened patched Firefox build) — stock Chromium's automation signals
+    # are trivially flagged by enterprise detectors. Per-variant runtime
+    # switching (running multiple browser processes side-by-side) is out of
+    # scope for the current batch; the runtime is process-wide.
     browser_runtime: str
+
+    # WP5: enterprise hCaptcha residential-proxy enforcement. When true (the
+    # default), enterprise tasks must use a residential or mobile pool proxy
+    # — a datacenter IP is rejected because enterprise detectors flag them.
+    # Set to false in tests / dev to relax the requirement (any pool proxy
+    # is accepted, or a task proxy if explicitly supplied).
+    enterprise_require_residential: bool
 
     # ── Human behavior / real-page mode ──
     hcaptcha_real_page: bool
@@ -198,6 +231,28 @@ def load_config() -> Config:
             os.environ.get("VISION_CONFIDENCE_THRESHOLD", "0.6")
         ),
         vision_tier2_detail=os.environ.get("VISION_TIER2_DETAIL", "high"),
+        # WP4: vision performance — concurrent voting + inline tier-1→tier-2 escalation.
+        vision_vote_concurrent=os.environ.get("VISION_VOTE_CONCURRENT", "true")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        vision_inline_escalate=os.environ.get("VISION_INLINE_ESCALATE", "true")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        # WP4: resource interception — per-context bandwidth shaping.
+        resource_block_enabled=os.environ.get("RESOURCE_BLOCK_ENABLED", "true")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        resource_block_types=os.environ.get(
+            "RESOURCE_BLOCK_TYPES", "image,media,font,stylesheet"
+        ),
+        resource_allow_hosts=os.environ.get(
+            "RESOURCE_ALLOW_HOSTS",
+            "hcaptcha.com,challenges.cloudflare.com,google.com,recaptcha.net,gstatic.com,cloudflare.com",
+        ),
+        resource_block_hosts=os.environ.get("RESOURCE_BLOCK_HOSTS", ""),
         # Asset pools
         session_pool_size=int(os.environ.get("SESSION_POOL_SIZE", "4")),
         session_max_solves=int(os.environ.get("SESSION_MAX_SOLVES", "8")),
@@ -209,6 +264,14 @@ def load_config() -> Config:
         ),
         token_cache_ttl=int(os.environ.get("TOKEN_CACHE_TTL", "110")),
         browser_runtime=os.environ.get("BROWSER_RUNTIME", "chromium").strip().lower(),
+        # WP5: enterprise residential-proxy enforcement (default on; set to
+        # "false"/"0" to relax for tests / dev).
+        enterprise_require_residential=os.environ.get(
+            "ENTERPRISE_REQUIRE_RESIDENTIAL", "true"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
         # Human behavior / real-page mode
         hcaptcha_real_page=os.environ.get("HCAPTCHA_REAL_PAGE", "false").strip().lower()
         in {"1", "true", "yes"},
