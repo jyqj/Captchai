@@ -19,6 +19,7 @@ class CanvasSlideSolver(BaseShapeSolver):
     SHAPE = ChallengeShape.CANVAS_SLIDE
 
     HANDLE_SELECTOR = ".slide-handle, .slider, .geetest_slider_button"
+    BG_SELECTOR = "canvas.slideBg, .geetest_canvas_bg, .slider-bg, .puzzle-image, .captcha-image"
     STEPS = 30
 
     async def run(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:
@@ -27,10 +28,12 @@ class CanvasSlideSolver(BaseShapeSolver):
             return token
 
         prompt = await self.read_prompt(frame) or ctx.prompt
+        shot = await self.screenshot_element(frame, self.BG_SELECTOR)
+        images = [shot] if shot else []
         result = await self.classify(
             ClassifyRequest(
                 prompt=prompt,
-                images=[],
+                images=images,
                 shape=self.SHAPE.value,
                 extra={"task_id": ctx.task_id, "want": "slide_distance"},
             )
@@ -43,7 +46,8 @@ class CanvasSlideSolver(BaseShapeSolver):
             return await self.poll_token()
 
         sx, sy = start
-        await self._slide(frame, sx, sy, distance)
+        page = ctx.extra.get("page")
+        await self._slide(frame, sx, sy, distance, page=page)
         return await self.poll_token()
 
     async def _handle_origin(
@@ -87,10 +91,10 @@ class CanvasSlideSolver(BaseShapeSolver):
             prev = cur
         return offsets
 
-    async def _slide(self, frame: Any, sx: float, sy: float, distance: float) -> bool:
-        mouse = getattr(frame, "mouse", None)
+    async def _slide(self, frame: Any, sx: float, sy: float, distance: float, *, page: Any = None) -> bool:
+        mouse = getattr(page, "mouse", None) or getattr(frame, "mouse", None)
         if mouse is None:
-            log.debug("canvas_slide: frame exposes no mouse")
+            log.debug("canvas_slide: no mouse available on page or frame")
             return False
         try:
             await mouse.move(sx, sy)

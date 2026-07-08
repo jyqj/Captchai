@@ -23,30 +23,33 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+import time
+from typing import Any, Optional
 
-from playwright.async_api import Browser, Route
+from playwright.async_api import Route
 
-from ..core.config import Config
-from .browser import BrowserManager
+from .browser_solver import BaseBrowserSolver
 
 log = logging.getLogger(__name__)
 
 _EXTRACT_TURNSTILE_TOKEN_JS = """
 () => {
-    if (window.__omcToken) return window.__omcToken;
-    const input = document.querySelector('[name="cf-turnstile-response"]')
-        || document.querySelector('input[name*="turnstile"]');
-    if (input && input.value && input.value.length > 20) {
-        return input.value;
+    let token = null;
+    if (window.__omcToken) {
+        token = window.__omcToken;
+    } else {
+        const input = document.querySelector('[name="cf-turnstile-response"]')
+            || document.querySelector('input[name*="turnstile"]');
+        if (input && input.value && input.value.length > 20) {
+            token = input.value;
+        } else if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+            try {
+                const resp = window.turnstile.getResponse();
+                if (resp && resp.length > 20) token = resp;
+            } catch (e) {}
+        }
     }
-    if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
-        try {
-            const resp = window.turnstile.getResponse();
-            if (resp && resp.length > 20) return resp;
-        } catch (e) {}
-    }
-    return null;
+    return {token: token, error: window.__omcError || null};
 }
 """
 
@@ -78,33 +81,13 @@ def _build_injected_page(website_key: str, options: dict[str, Any]) -> str:
 </html>"""
 
 
-class TurnstileSolver:
+class TurnstileSolver(BaseBrowserSolver):
     """Solves Cloudflare Turnstile tasks via a shared headless Chromium."""
-
-    def __init__(
-        self,
-        config: Config,
-        manager: BrowserManager | None = None,
-        browser: Browser | None = None,
-    ) -> None:
-        self._config = config
-        self._manager = manager or BrowserManager(config)
-        self._owns_manager = manager is None
-        if browser is not None:  # backwards-compat for tests passing a browser
-            self._manager._browser = browser  # type: ignore[attr-defined]
-
-    async def start(self) -> None:
-        if self._owns_manager:
-            await self._manager.start()
-
-    async def stop(self) -> None:
-        if self._owns_manager:
-            await self._manager.stop()
-        log.info("TurnstileSolver stopped")
 
     async def solve(self, params: dict[str, Any]) -> dict[str, Any]:
         website_url = params["websiteURL"]
         website_key = params["websiteKey"]
+        client_key = params.get("_clientKey")
 
         render_options: dict[str, Any] = {}
         if params.get("action"):
@@ -116,13 +99,20 @@ class TurnstileSolver:
 
         last_error: Exception | None = None
         for attempt in range(self._config.captcha_retries):
+            started = time.monotonic()
             try:
                 token, user_agent = await self._solve_once(
                     website_url, website_key, render_options, params
                 )
+                await self._record(
+                    params, website_key, client_key, "ready", started
+                )
                 return {"token": token, "userAgent": user_agent}
             except Exception as exc:
                 last_error = exc
+                await self._record(
+                    params, website_key, client_key, "failed", started
+                )
                 log.warning(
                     "Turnstile attempt %d/%d failed: %s",
                     attempt + 1,
@@ -143,8 +133,11 @@ class TurnstileSolver:
         render_options: dict[str, Any],
         params: dict[str, Any],
     ) -> tuple[str, str]:
-        context, user_agent = await self._manager.new_context(params)
+        solve_context = await self._acquire_context(params)
+        context = solve_context.context
+        user_agent = solve_context.user_agent
         html = _build_injected_page(website_key, render_options)
+        solved = False
 
         async def _fulfill_document(route: Route) -> None:
             request = route.request
@@ -155,19 +148,13 @@ class TurnstileSolver:
 
         page = await context.new_page()
         try:
-            # Intercept the top-level navigation so the synthetic widget page is
-            # served *as* the target origin (token is bound to this host).
             await context.route(website_url, _fulfill_document)
 
             timeout_ms = self._config.browser_timeout * 1000
             await page.goto(website_url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-            await page.mouse.move(400, 300)
+            await self._human_mouse(page)
 
-            # Try to click the interactive checkbox when the widget renders one.
-            # A failure here is a *signal* (managed / non-interactive widget, or a
-            # detached frame), not a no-op — log it distinctly so it shows up in
-            # traces instead of being silently swallowed.
             try:
                 frame = page.frame_locator(
                     'iframe[src*="challenges.cloudflare.com"]'
@@ -181,11 +168,12 @@ class TurnstileSolver:
             token = await self._poll_token(page)
             if token:
                 log.info("Got Turnstile token (len=%d)", len(token))
+                solved = True
                 return token, user_agent
 
             raise RuntimeError("Turnstile token not obtained within timeout")
         finally:
-            await context.close()
+            await self._release_context(solve_context, solved, params)
 
     async def _poll_token(self, page: Any) -> str | None:
         """Check-first, event-driven token wait bounded by the unified budget.
@@ -197,11 +185,11 @@ class TurnstileSolver:
         deadline = asyncio.get_event_loop().time() + self._config.poll_budget
         interval_ms = max(50, int(self._config.poll_interval * 1000))
         while asyncio.get_event_loop().time() < deadline:
-            token = await page.evaluate(_EXTRACT_TURNSTILE_TOKEN_JS)
+            result = await page.evaluate(_EXTRACT_TURNSTILE_TOKEN_JS)
+            token = result.get("token") if isinstance(result, dict) else None
+            err = result.get("error") if isinstance(result, dict) else None
             if isinstance(token, str) and len(token) > 20:
                 return token
-
-            err = await page.evaluate("() => window.__omcError || null")
             if err:
                 raise RuntimeError(f"Turnstile widget error: {err}")
 
@@ -220,3 +208,54 @@ class TurnstileSolver:
                 # the hidden input rather than the JS callback).
                 pass
         return None
+
+    # ── consumption metering ───────────────────────────────────
+
+    async def _record(
+        self,
+        params: dict[str, Any],
+        sitekey: str,
+        client_key: Optional[str],
+        outcome: str,
+        started: float,
+    ) -> None:
+        if self._services is None:
+            return
+        from ..consumption.ledger import SolveRecord, estimate_cost
+
+        vision = params.get("_vision")
+        model = getattr(vision, "last_model", None)
+        in_tok = getattr(vision, "total_input_tokens", 0)
+        out_tok = getattr(vision, "total_output_tokens", 0)
+        calls = getattr(vision, "total_vision_calls", 0)
+        cost = estimate_cost(model or "local", in_tok, out_tok)
+
+        try:
+            await self._services.ledger.record(
+                SolveRecord(
+                    task_id=str(params.get("_taskId") or ""),
+                    sitekey=sitekey,
+                    task_type=params.get("type", "TurnstileTaskProxyless"),
+                    proxy_id=params.get("_pool_proxy_id"),
+                    session_id=params.get("_sessionId"),
+                    proxy_kind=params.get("_proxyKind"),
+                    model=model,
+                    challenge_shape="widget",
+                    vision_calls=calls,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    proxy_bytes=int(params.get("_proxy_bytes", 0)),
+                    wall_ms=int((time.monotonic() - started) * 1000),
+                    outcome=outcome,
+                    est_cost_usd=cost,
+                    client_key=client_key,
+                )
+            )
+            await self._services.accounting.record(
+                sitekey,
+                outcome,
+                proxy_kind=params.get("_proxyKind"),
+                model=model,
+            )
+        except Exception as exc:  # metering must never fail a solve
+            log.debug("ledger record failed: %s", exc)

@@ -47,7 +47,8 @@ class AreaBBoxSolver(BaseShapeSolver):
             return await self.poll_token()
 
         x, y = point
-        await self._click_at(frame, x, y)
+        page = ctx.extra.get("page")
+        await self._click_at(frame, x, y, page=page)
         await self.click_submit(frame)
         return await self.poll_token()
 
@@ -78,7 +79,7 @@ class AreaBBoxSolver(BaseShapeSolver):
 
         return None
 
-    async def _click_at(self, frame: Any, x: float, y: float) -> bool:
+    async def _click_at(self, frame: Any, x: float, y: float, *, page: Any = None) -> bool:
         # Prefer clicking the image element at a relative position.
         try:
             await frame.locator(self.IMAGE_SELECTOR).first.click(
@@ -88,9 +89,10 @@ class AreaBBoxSolver(BaseShapeSolver):
         except Exception as exc:  # noqa: BLE001
             log.debug("area_bbox positional click failed: %s", exc)
 
-        # Fall back to raw page mouse if the frame exposes one.
+        # Fall back to raw page mouse.
         try:
-            await frame.mouse.click(x, y)
+            target = page or frame
+            await target.mouse.click(x, y)
             return True
         except Exception as exc:  # noqa: BLE001
             log.debug("area_bbox mouse click failed: %s", exc)

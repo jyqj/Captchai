@@ -44,6 +44,13 @@ class TaskObject(BaseModel):
     # Convenience single-string form: "http://user:pass@host:port"
     proxy: str | None = None
 
+    # Egress intent: "auto" (default, current behavior), "proxyless" (force server
+    # egress, refuse task proxy), "pool" (force server-side proxy pool, fail if
+    # empty), "task" (require caller-supplied proxy, fail if none). Used by the
+    # scheduler to pick the right concurrency pool and by the solver to enforce
+    # the caller's egress requirement.
+    egress: str | None = None
+
     # Image captcha / classification fields
     body: str | None = None
     image: str | None = None

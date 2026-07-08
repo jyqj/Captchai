@@ -5,7 +5,8 @@ Launching a fresh Playwright context per solve is slow and throws away the
 look human. ``SessionPool`` keeps a bounded set of live sessions, hands out a
 warm idle one when available, and only creates a new one — via an injected
 async ``context_factory`` — when it must. Sessions accrue a reputation and are
-retired (context closed) once they get burned or exceed ``max_solves``.
+retired (context closed) when their reputation drops below a threshold or they
+exceed ``max_solves``; a single solve failure no longer forces retirement.
 
 The factory is injected rather than importing ``browser.py`` directly so the
 pool is fully testable with fakes and has no hard Playwright dependency.
@@ -100,7 +101,10 @@ class SessionPool:
                 return session
 
         try:
-            fingerprint = generate_fingerprint(seed=sitekey)
+            # Random seed so each session gets a unique coherent identity. A
+            # sitekey-seeded fingerprint would make every session for the same
+            # target identical, which hCaptcha clusters and flags.
+            fingerprint = generate_fingerprint(seed=None)
             context, user_agent = await self._factory(fingerprint, None)
         except BaseException:
             self._slots.release()
@@ -119,6 +123,18 @@ class SessionPool:
             self._in_use[session.id] = session
         return session
 
+    async def prewarm(self, *, sitekey: Optional[str] = None) -> int:
+        """Create idle sessions up to the configured pool size."""
+
+        if self._size <= 0:
+            return 0
+        sessions = await asyncio.gather(
+            *[self.checkout(sitekey=sitekey) for _ in range(self._size)]
+        )
+        for session in sessions:
+            await self.release(session, success=True)
+        return len(sessions)
+
     def _pop_idle(self) -> Optional[BrowserSession]:
         while self._idle:
             session = self._idle.pop()
@@ -130,10 +146,18 @@ class SessionPool:
     ) -> None:
         """Return a session to the pool, updating its reputation.
 
-        Each release counts as one completed solve. A burned session, or one
-        that has reached ``max_solves``, is retired: its context is closed and
-        its slot freed so a replacement can be created lazily on the next
-        ``checkout``. Otherwise the session goes back to the warm idle set.
+        Each release counts as one completed solve. A session is retired (its
+        context closed and its slot freed so a replacement can be created lazily
+        on the next ``checkout``) when it has reached ``max_solves`` OR its
+        reputation has dropped below the eviction threshold (0.3). A single
+        solve failure no longer forces retirement: a fresh session (rep=1.0)
+        survives one failure (1.0→0.6) and is only evicted after a second
+        consecutive failure (0.6→0.2). Otherwise the session goes back to the
+        warm idle set.
+
+        ``burned`` is accepted for backward compat (callers such as
+        ``browser_solver`` still pass ``burned=not solved``) but no longer
+        forces retirement; reputation decay handles eviction.
         """
         async with self._lock:
             self._in_use.pop(session.id, None)
@@ -142,9 +166,9 @@ class SessionPool:
         if success:
             session.reputation = min(1.0, session.reputation + 0.05)
         else:
-            session.reputation = max(0.0, session.reputation - 0.25)
+            session.reputation = max(0.0, session.reputation - 0.4)
 
-        retire = burned or session.solves >= self._max_solves
+        retire = session.solves >= self._max_solves or session.reputation < 0.3
         if retire:
             await _maybe_await_close(session.context)
             session.warm = False

@@ -32,6 +32,41 @@ SYSTEM_PROMPT = (
     "your certainty from 0.0 to 1.0."
 )
 
+COORDINATE_PROMPT = (
+    "You are a strict CAPTCHA image analyzer. You are shown a challenge prompt "
+    "and a single image. Identify the pixel coordinates (x, y) of the point "
+    "that satisfies the prompt.\n"
+    "Respond with STRICT JSON ONLY, no markdown, no prose:\n"
+    '{"x": <int>, "y": <int>, "confidence": <float 0.0-1.0>}\n'
+    "x and y are pixel coordinates relative to the image's top-left corner."
+)
+
+SLIDE_DISTANCE_PROMPT = (
+    "You are a strict CAPTCHA slide-puzzle analyzer. You are shown a slider "
+    "puzzle image. Determine the horizontal pixel distance the slider piece "
+    "must travel to fill the gap.\n"
+    "Respond with STRICT JSON ONLY, no markdown, no prose:\n"
+    '{"distance": <int>, "confidence": <float 0.0-1.0>}\n'
+    "distance is in pixels from the handle's current position."
+)
+
+DRAG_PATH_PROMPT = (
+    "You are a strict CAPTCHA drag-and-drop analyzer. You are shown a puzzle "
+    "image where a piece must be dragged to a target slot. Identify the pixel "
+    "coordinates of the source (piece center) and target (slot center).\n"
+    "Respond with STRICT JSON ONLY, no markdown, no prose:\n"
+    '{"source": [<int>, <int>], "target": [<int>, <int>], "confidence": <float 0.0-1.0>}\n'
+    "Coordinates are pixels relative to the image's top-left corner."
+)
+
+_SHAPE_PROMPTS = {
+    "grid_select": SYSTEM_PROMPT,
+    "recaptcha_dynamic": SYSTEM_PROMPT,
+    "area_bbox": COORDINATE_PROMPT,
+    "canvas_slide": SLIDE_DISTANCE_PROMPT,
+    "drag_drop": DRAG_PATH_PROMPT,
+}
+
 # Temperature used for self-consistency voting samples (must be > 0 so the
 # model produces varied samples to vote over).
 _VOTE_TEMPERATURE = 0.8
@@ -48,6 +83,7 @@ class VisionRequest:
     task_id: "str | None" = None
     sitekey: "str | None" = None
     detail: "str | None" = None  # override; else tier default
+    shape: str = "grid_select"
 
 
 @dataclass
@@ -58,6 +94,10 @@ class VisionResult:
     usage: ModelUsage
     votes: int = 1
     raw: str = ""
+    point: "tuple[float, float] | None" = None
+    distance: "float | None" = None
+    source: "tuple[float, float] | None" = None
+    target: "tuple[float, float] | None" = None
 
 
 class VisionRouter:
@@ -70,11 +110,13 @@ class VisionRouter:
         *,
         ledger=None,
         budget=None,
+        accounting=None,
     ) -> None:
         self._pool = model_pool
         self._config = config
         self._ledger = ledger
         self._budget = budget
+        self._accounting = accounting
 
     # -- routing ----------------------------------------------------------
 
@@ -130,6 +172,7 @@ class VisionRouter:
             confidence = voted_conf
             total_usage = total_usage.add(vote_usage)
 
+        shape_fields = self._parse_shape_fields(content, req.shape)
         return VisionResult(
             indices=indices,
             confidence=confidence,
@@ -137,6 +180,7 @@ class VisionRouter:
             usage=total_usage,
             votes=votes,
             raw=raw,
+            **shape_fields,
         )
 
     # -- voting -----------------------------------------------------------
@@ -185,6 +229,7 @@ class VisionRouter:
 
     def _build_messages(self, req: VisionRequest) -> list:
         detail = self._detail_for(req)
+        system_prompt = _SHAPE_PROMPTS.get(req.shape, SYSTEM_PROMPT)
         user_content: list = [{"type": "text", "text": req.prompt}]
         for image in req.images:
             b64 = base64.b64encode(image).decode()
@@ -198,7 +243,7 @@ class VisionRouter:
                 }
             )
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
 
@@ -271,6 +316,40 @@ class VisionRouter:
             confidence = 1.0
 
         return indices, confidence, raw
+
+    @staticmethod
+    def _parse_shape_fields(content: str, shape: str) -> dict:
+        """Extract shape-specific fields from model output."""
+        raw = content or ""
+        text = raw.strip()
+        fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if fence:
+            text = fence.group(1).strip()
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        fields: dict = {}
+        if shape == "area_bbox":
+            x = data.get("x")
+            y = data.get("y")
+            if x is not None and y is not None:
+                fields["point"] = (float(x), float(y))
+        elif shape == "canvas_slide":
+            d = data.get("distance")
+            if d is not None:
+                fields["distance"] = float(d)
+        elif shape == "drag_drop":
+            src = data.get("source")
+            tgt = data.get("target")
+            if isinstance(src, (list, tuple)) and len(src) >= 2:
+                fields["source"] = (float(src[0]), float(src[1]))
+            if isinstance(tgt, (list, tuple)) and len(tgt) >= 2:
+                fields["target"] = (float(tgt[0]), float(tgt[1]))
+        return fields
 
 
 def _coerce_int_list(values: list) -> list:

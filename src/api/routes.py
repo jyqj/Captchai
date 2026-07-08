@@ -142,7 +142,7 @@ async def get_task_result(
             errorDescription="Invalid clientKey",
         )
 
-    task = task_manager.get_task(request.taskId)
+    task = await task_manager.aget_task(request.taskId)
     if task is None:
         return GetTaskResultResponse(
             errorId=1,

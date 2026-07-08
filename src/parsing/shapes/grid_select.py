@@ -27,10 +27,11 @@ log = logging.getLogger(__name__)
 
 class GridSelectSolver(BaseShapeSolver):
     SHAPE = ChallengeShape.GRID_SELECT
+    REFRESH_SELECTOR = ".refresh, .button-refresh, [aria-label='Get a new challenge']"
+    CONFIDENCE_FLOOR = 0.4
 
     async def run(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:
         for round_idx in range(self.MAX_ROUNDS):
-            # A token may already be present (e.g. previous round solved it).
             token = await self.poll_token()
             if token:
                 return token
@@ -50,10 +51,24 @@ class GridSelectSolver(BaseShapeSolver):
                     extra={"task_id": ctx.task_id, "round": round_idx},
                 )
             )
+
+            confidence = getattr(result, "confidence", 1.0) if result is not None else 0.0
             indices = self.valid_indices(
                 getattr(result, "indices", []) if result is not None else [], count
             )
-            log.info("grid_select round %d: prompt=%r selected=%s", round_idx + 1, prompt, indices)
+            log.info(
+                "grid_select round %d: prompt=%r selected=%s confidence=%.2f",
+                round_idx + 1, prompt, indices, confidence,
+            )
+
+            if confidence < self.CONFIDENCE_FLOOR and round_idx < self.MAX_ROUNDS - 1:
+                log.info(
+                    "grid_select: confidence %.2f below floor %.2f, attempting reload",
+                    confidence, self.CONFIDENCE_FLOOR,
+                )
+                reloaded = await self._try_reload(frame)
+                if reloaded:
+                    continue
 
             for i in indices:
                 await self.click_tile(frame, i)
@@ -64,8 +79,18 @@ class GridSelectSolver(BaseShapeSolver):
             if token:
                 return token
 
-            # If vision found nothing to click, another round is unlikely to help.
             if not indices:
                 break
 
         return await self.poll_token()
+
+    async def _try_reload(self, frame: Any) -> bool:
+        """Click the challenge refresh button if available. Returns True on success."""
+        try:
+            locator = frame.locator(self.REFRESH_SELECTOR).first
+            if await locator.count() > 0:
+                await locator.click(timeout=3_000)
+                return True
+        except Exception as exc:  # noqa: BLE001
+            log.debug("grid_select: reload click failed: %s", exc)
+        return False

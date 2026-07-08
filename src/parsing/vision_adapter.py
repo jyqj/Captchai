@@ -38,6 +38,7 @@ class VisionAdapter:
 
     async def classify(self, req: Any) -> VisionResult:
         extra = getattr(req, "extra", {}) or {}
+        shape = getattr(req, "shape", "") or "grid_select"
         vision_req = VisionRequest(
             prompt=getattr(req, "prompt", "") or "",
             images=list(getattr(req, "images", []) or []),
@@ -45,6 +46,7 @@ class VisionAdapter:
             grid_size=extra.get("grid_size"),
             task_id=extra.get("task_id"),
             sitekey=self._sitekey,
+            shape=shape,
         )
         result = await self._router.classify(vision_req, client_key=self._client_key)
 

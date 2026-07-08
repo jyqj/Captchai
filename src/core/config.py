@@ -50,6 +50,9 @@ class Config:
     # separate concurrency pools so a burst of image tasks can't starve browser
     # solvers. See services/task_manager.py.
     browser_concurrency: int
+    browser_proxyless_concurrency: int
+    browser_proxied_concurrency: int
+    browser_pool_proxy_concurrency: int
     vision_concurrency: int
     # Bounded task queue admission control; 0 disables the cap.
     queue_max_size: int
@@ -60,6 +63,8 @@ class Config:
     # Single poll budget shared by hCaptcha / Turnstile widget-token extraction.
     poll_budget: int  # seconds
     poll_interval: float  # seconds between checks
+    poll_budget_passive: float  # seconds – short budget for passive/checkbox polls
+    poll_budget_challenge: float  # seconds – longer budget after challenge dispatch
 
     # ── Vision routing (parsing plane) ──
     # When true, hard grid challenges may escalate to the powerful cloud model.
@@ -81,6 +86,11 @@ class Config:
     token_cache_ttl: int  # seconds
     # Playwright runtime flavour: "chromium" (stock) | "rebrowser" | "camoufox".
     browser_runtime: str
+
+    # ── Human behavior / real-page mode ──
+    hcaptcha_real_page: bool
+    human_mouse_enabled: bool
+    human_mouse_jitter_ms: int
 
     # ── State backend ──
     # Redis URL for the persistent task store; None => in-memory fallback.
@@ -150,6 +160,24 @@ def load_config() -> Config:
         browser_timeout=int(os.environ.get("BROWSER_TIMEOUT", "30")),
         # Runtime / concurrency
         browser_concurrency=int(os.environ.get("BROWSER_CONCURRENCY", "4")),
+        browser_proxyless_concurrency=int(
+            os.environ.get(
+                "BROWSER_PROXYLESS_CONCURRENCY",
+                os.environ.get("BROWSER_CONCURRENCY", "4"),
+            )
+        ),
+        browser_proxied_concurrency=int(
+            os.environ.get(
+                "BROWSER_PROXIED_CONCURRENCY",
+                os.environ.get("BROWSER_CONCURRENCY", "4"),
+            )
+        ),
+        browser_pool_proxy_concurrency=int(
+            os.environ.get(
+                "BROWSER_POOL_PROXY_CONCURRENCY",
+                os.environ.get("BROWSER_PROXIED_CONCURRENCY", os.environ.get("BROWSER_CONCURRENCY", "4")),
+            )
+        ),
         vision_concurrency=int(os.environ.get("VISION_CONCURRENCY", "8")),
         queue_max_size=int(os.environ.get("QUEUE_MAX_SIZE", "128")),
         solve_timeout=int(
@@ -158,6 +186,8 @@ def load_config() -> Config:
         # Token polling
         poll_budget=int(os.environ.get("POLL_BUDGET", "30")),
         poll_interval=float(os.environ.get("POLL_INTERVAL", "0.5")),
+        poll_budget_passive=float(os.environ.get("POLL_BUDGET_PASSIVE", "2.0")),
+        poll_budget_challenge=float(os.environ.get("POLL_BUDGET_CHALLENGE", "10.0")),
         # Vision routing
         vision_cloud_enabled=os.environ.get("VISION_CLOUD_ENABLED", "true")
         .strip()
@@ -179,6 +209,12 @@ def load_config() -> Config:
         ),
         token_cache_ttl=int(os.environ.get("TOKEN_CACHE_TTL", "110")),
         browser_runtime=os.environ.get("BROWSER_RUNTIME", "chromium").strip().lower(),
+        # Human behavior / real-page mode
+        hcaptcha_real_page=os.environ.get("HCAPTCHA_REAL_PAGE", "false").strip().lower()
+        in {"1", "true", "yes"},
+        human_mouse_enabled=os.environ.get("HUMAN_MOUSE_ENABLED", "true").strip().lower()
+        in {"1", "true", "yes"},
+        human_mouse_jitter_ms=int(os.environ.get("HUMAN_MOUSE_JITTER_MS", "80")),
         # State backend
         redis_url=os.environ.get("REDIS_URL", "").strip() or None,
         # Billing / budget

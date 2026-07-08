@@ -103,6 +103,13 @@ class BaseShapeSolver:
         except Exception:  # noqa: BLE001
             return b""
 
+    async def screenshot_element(self, frame: Any, selector: str) -> bytes:
+        """Screenshot the first element matching *selector*; empty bytes on failure."""
+        try:
+            return await frame.locator(selector).first.screenshot()
+        except Exception:  # noqa: BLE001
+            return b""
+
     async def screenshot_tiles(
         self, frame: Any, count: int, selector: Optional[str] = None
     ) -> List[bytes]:

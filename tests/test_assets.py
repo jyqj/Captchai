@@ -46,6 +46,38 @@ def test_fingerprint_deterministic_with_seed() -> None:
     ) or a != c
 
 
+def test_fingerprint_seed_none_produces_variety() -> None:
+    """seed=None draws from entropy, so repeated calls should not all collide."""
+    identities = set()
+    for _ in range(20):
+        fp = generate_fingerprint(seed=None)
+        identities.add((fp.user_agent, fp.screen_width, fp.locale))
+    assert len(identities) > 1
+
+
+def test_session_pool_fingerprint_not_sitekey_determined() -> None:
+    """Same sitekey must not produce identical fingerprints across sessions.
+
+    Regression for the sitekey-seeded cluster bug: hCaptcha clusters identical
+    fingerprints and flags them, so each session draws an independent
+    entropy-backed fingerprint even when the sitekey is the same.
+    """
+    async def scenario():
+        factory, _state = _make_factory()
+        pool = SessionPool(factory, size=10, max_solves=8)
+        sessions = await asyncio.gather(
+            *[pool.checkout(sitekey="same-sitekey") for _ in range(10)]
+        )
+        identities = {
+            (s.fingerprint.user_agent, s.fingerprint.screen_width, s.fingerprint.locale)
+            for s in sessions
+        }
+        assert len(identities) > 1
+        await pool.close_all()
+
+    asyncio.run(scenario())
+
+
 def test_fingerprint_is_coherent_ua_platform_webgl() -> None:
     for seed in [str(i) for i in range(40)]:
         fp = generate_fingerprint(seed=seed)
@@ -314,6 +346,21 @@ def test_session_checkout_creates_via_factory() -> None:
     asyncio.run(scenario())
 
 
+def test_session_prewarm_creates_idle_sessions() -> None:
+    async def scenario():
+        factory, state = _make_factory()
+        pool = SessionPool(factory, size=3, max_solves=8)
+        count = await pool.prewarm(sitekey="site")
+        assert count == 3
+        assert state["calls"] == 3
+        snap = pool.snapshot()
+        assert len(snap) == 3
+        assert all(row["warm"] is True and row["in_use"] is False for row in snap)
+        await pool.close_all()
+
+    asyncio.run(scenario())
+
+
 def test_session_reuse_idle_warm_session() -> None:
     async def scenario():
         factory, state = _make_factory()
@@ -346,15 +393,46 @@ def test_session_retire_on_max_solves_closes_context() -> None:
     asyncio.run(scenario())
 
 
-def test_session_retire_on_burned_closes_fake_context() -> None:
+def test_session_single_failure_does_not_retire() -> None:
+    """A single solve failure no longer retires a warmed session.
+
+    Two-strike policy: a fresh session (rep=1.0) survives one failure
+    (1.0→0.6, above the 0.3 eviction threshold) and returns to the idle pool.
+    """
     async def scenario():
-        factory, state = _make_factory(async_close=False)
+        factory, _state = _make_factory(async_close=False)
         pool = SessionPool(factory, size=2, max_solves=8)
         s1 = await pool.checkout()
         ctx = s1.context
         await pool.release(s1, success=False, burned=True)
-        assert ctx.closed is True
+        assert ctx.closed is False
         assert s1.reputation < 1.0
+        assert s1.reputation >= 0.3
+        # Session should still be live in the idle pool.
+        snap = pool.snapshot()
+        assert len(snap) == 1
+        assert snap[0]["in_use"] is False
+        await pool.close_all()
+
+    asyncio.run(scenario())
+
+
+def test_session_two_failures_retire() -> None:
+    """Two consecutive failures drop reputation below 0.3 and retire the session."""
+    async def scenario():
+        factory, _state = _make_factory(async_close=False)
+        pool = SessionPool(factory, size=2, max_solves=8)
+        s1 = await pool.checkout()
+        ctx = s1.context
+        # First failure: 1.0 -> 0.6 (still alive, returns to idle).
+        await pool.release(s1, success=False, burned=True)
+        assert not ctx.closed
+        s2 = await pool.checkout()
+        assert s2.id == s1.id  # reused the idle session
+        # Second failure: 0.6 -> 0.2 (below threshold, retired).
+        await pool.release(s2, success=False, burned=True)
+        assert ctx.closed is True
+        assert s2.reputation < 0.3
 
     asyncio.run(scenario())
 

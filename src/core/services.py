@@ -18,7 +18,7 @@ from ..assets.session_pool import SessionPool
 from ..assets.token_cache import TokenCache
 from ..consumption.accounting import SuccessAccounting
 from ..consumption.budget import BudgetGuard
-from ..consumption.ledger import CostLedger
+from ..consumption.ledger import CostLedger, build_ledger
 from ..parsing.vision import VisionRouter
 from .config import Config
 
@@ -31,8 +31,9 @@ class SolverServices:
     def __init__(self, config: Config) -> None:
         self.config = config
 
-        # Consumption plane.
-        self.ledger = CostLedger()
+        # Consumption plane. Use build_ledger so a Redis backend is selected
+        # when REDIS_URL is set — otherwise a restart zeroes getBalance spend.
+        self.ledger = build_ledger(config)
         self.budget = BudgetGuard(
             self.ledger,
             global_cap_usd=config.budget_global_cap_usd,
@@ -43,7 +44,8 @@ class SolverServices:
         # Parsing / model plane.
         self.model_pool = ModelPool(config)
         self.vision_router = VisionRouter(
-            self.model_pool, config, ledger=self.ledger, budget=self.budget
+            self.model_pool, config, ledger=self.ledger, budget=self.budget,
+            accounting=self.accounting,
         )
 
         # Asset plane.
@@ -58,11 +60,24 @@ class SolverServices:
 
     def attach_browser(self, manager) -> None:
         """Wire the warm session pool once the browser manager is available."""
+        if self.config.session_pool_size <= 0:
+            self.session_pool = None
+            return
         self.session_pool = SessionPool(
             manager.context_factory,
             size=self.config.session_pool_size,
             max_solves=self.config.session_max_solves,
         )
+
+    async def prewarm_sessions(self) -> int:
+        """Pre-create proxyless browser sessions when enabled."""
+
+        if self.session_pool is None or not self.config.session_prewarm:
+            return 0
+        count = await self.session_pool.prewarm()
+        if count:
+            log.info("Prewarmed %d proxyless browser sessions", count)
+        return count
 
     def _load_proxy_inventory(self) -> None:
         """Seed the proxy pool from PROXY_POOL env (one proxy per line/comma)."""
@@ -84,6 +99,10 @@ class SolverServices:
     async def close(self) -> None:
         if self.session_pool is not None:
             await self.session_pool.close_all()
+        # Redis ledger holds a connection pool that must be released on shutdown.
+        close_ledger = getattr(self.ledger, "close", None)
+        if close_ledger is not None:
+            await close_ledger()
 
 
 # Process-wide singleton, set at startup so API routes (getBalance, admin) can

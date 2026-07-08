@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ class SolveRecord:
     sitekey: str
     task_type: str
     proxy_id: str | None = None
+    proxy_kind: str | None = None
     session_id: str | None = None
     model: str | None = None
     challenge_shape: str | None = None      # "grid_select" | "area_bbox" | ...
@@ -123,10 +125,13 @@ class CostLedger:
 
         by_outcome: Dict[str, int] = {}
         by_model: Dict[str, Dict[str, float]] = {}
+        by_proxy_kind: Dict[str, int] = {}
         total_cost = 0.0
         for r in snapshot:
             total_cost += r.est_cost_usd
             by_outcome[r.outcome] = by_outcome.get(r.outcome, 0) + 1
+            proxy_kind = r.proxy_kind or "unknown"
+            by_proxy_kind[proxy_kind] = by_proxy_kind.get(proxy_kind, 0) + 1
             model = r.model or "unknown"
             slot = by_model.setdefault(model, {"count": 0, "cost_usd": 0.0})
             slot["count"] += 1
@@ -140,5 +145,189 @@ class CostLedger:
             "cost_usd": total_cost,
             "by_outcome": by_outcome,
             "by_model": by_model,
+            "by_proxy_kind": by_proxy_kind,
             "cost_per_success": cost_per_success,
         }
+
+
+# ── serialisation helpers (shared by RedisCostLedger) ───────────────
+
+def _serialize_record(rec: SolveRecord) -> dict[str, Any]:
+    return {
+        "task_id": rec.task_id,
+        "sitekey": rec.sitekey,
+        "task_type": rec.task_type,
+        "proxy_id": rec.proxy_id,
+        "proxy_kind": rec.proxy_kind,
+        "session_id": rec.session_id,
+        "model": rec.model,
+        "challenge_shape": rec.challenge_shape,
+        "rounds": rec.rounds,
+        "vision_calls": rec.vision_calls,
+        "input_tokens": rec.input_tokens,
+        "output_tokens": rec.output_tokens,
+        "proxy_bytes": rec.proxy_bytes,
+        "wall_ms": rec.wall_ms,
+        "outcome": rec.outcome,
+        "est_cost_usd": rec.est_cost_usd,
+        "client_key": rec.client_key,
+        "created_at": rec.created_at,
+    }
+
+
+def _deserialize_record(data: dict[str, Any]) -> SolveRecord:
+    return SolveRecord(
+        task_id=data.get("task_id", ""),
+        sitekey=data.get("sitekey", ""),
+        task_type=data.get("task_type", ""),
+        proxy_id=data.get("proxy_id"),
+        proxy_kind=data.get("proxy_kind"),
+        session_id=data.get("session_id"),
+        model=data.get("model"),
+        challenge_shape=data.get("challenge_shape"),
+        rounds=data.get("rounds", 0),
+        vision_calls=data.get("vision_calls", 0),
+        input_tokens=data.get("input_tokens", 0),
+        output_tokens=data.get("output_tokens", 0),
+        proxy_bytes=data.get("proxy_bytes", 0),
+        wall_ms=data.get("wall_ms", 0),
+        outcome=data.get("outcome", "failed"),
+        est_cost_usd=data.get("est_cost_usd", 0.0),
+        client_key=data.get("client_key"),
+        created_at=data.get("created_at", 0.0),
+    )
+
+
+class RedisCostLedger:
+    """Redis-backed ledger with O(1) balance reads and bounded record history.
+
+    Records are JSON blobs in a Redis list (``captcha:ledger:records``) capped
+    at ``max_records``. Running totals (cost + count) are kept in Redis strings
+    keyed globally and per-client so ``total_cost_usd`` is a single GET rather
+    than a full scan — important because ``getBalance`` calls it on every poll.
+
+    A restart no longer zeroes spend: the totals survive in Redis and the
+    record history is preserved up to ``max_records``.
+    """
+
+    _RECORDS_KEY = "captcha:ledger:records"
+    _TOTAL_GLOBAL = "captcha:ledger:total:global"
+    _COUNT_GLOBAL = "captcha:ledger:count:global"
+
+    def __init__(
+        self,
+        url: str,
+        max_records: int = 100_000,
+        *,
+        key_prefix: str = "captcha:ledger",
+    ) -> None:
+        try:
+            import redis.asyncio as aioredis  # noqa: WPS433
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "REDIS_URL is set but the 'redis' package is not installed; "
+                "add redis>=4.2 to requirements or unset REDIS_URL"
+            ) from exc
+        self._max = max_records
+        self._redis = aioredis.from_url(url, decode_responses=True)
+        self._prefix = key_prefix
+        self._records_key = f"{key_prefix}:records"
+        self._total_global = f"{key_prefix}:total:global"
+        self._count_global = f"{key_prefix}:count:global"
+
+    def _total_key(self, client_key: str | None) -> str:
+        return f"{self._prefix}:total:{client_key or 'anon'}"
+
+    def _count_key(self, client_key: str | None) -> str:
+        return f"{self._prefix}:count:{client_key or 'anon'}"
+
+    async def record(self, rec: SolveRecord) -> None:
+        if rec.created_at == 0:
+            rec.created_at = time.time()
+        blob = json.dumps(_serialize_record(rec))
+        pipe = self._redis.pipeline()
+        pipe.lpush(self._records_key, blob)
+        pipe.ltrim(self._records_key, 0, self._max - 1)
+        pipe.incrbyfloat(self._total_global, rec.est_cost_usd)
+        pipe.incrbyfloat(self._total_key(rec.client_key), rec.est_cost_usd)
+        pipe.incr(self._count_global)
+        pipe.incr(self._count_key(rec.client_key))
+        await pipe.execute()
+
+    async def total_cost_usd(self, client_key: str | None = None) -> float:
+        raw = await self._redis.get(
+            self._total_global if client_key is None else self._total_key(client_key)
+        )
+        return float(raw) if raw is not None else 0.0
+
+    async def records(
+        self,
+        client_key: str | None = None,
+        sitekey: str | None = None,
+        limit: int | None = None,
+    ) -> list[SolveRecord]:
+        raw_list = await self._redis.lrange(self._records_key, 0, -1)
+        out: list[SolveRecord] = []
+        for blob in raw_list:
+            try:
+                data = json.loads(blob)
+            except json.JSONDecodeError:
+                continue
+            if client_key is not None and data.get("client_key") != client_key:
+                continue
+            if sitekey is not None and data.get("sitekey") != sitekey:
+                continue
+            out.append(_deserialize_record(data))
+        if limit is not None:
+            out = out[-limit:]
+        return out
+
+    async def summary(self) -> dict[str, Any]:
+        raw_list = await self._redis.lrange(self._records_key, 0, -1)
+        records: list[SolveRecord] = []
+        for blob in raw_list:
+            try:
+                records.append(_deserialize_record(json.loads(blob)))
+            except json.JSONDecodeError:
+                continue
+
+        by_outcome: Dict[str, int] = {}
+        by_model: Dict[str, Dict[str, float]] = {}
+        by_proxy_kind: Dict[str, int] = {}
+        total_cost = 0.0
+        for r in records:
+            total_cost += r.est_cost_usd
+            by_outcome[r.outcome] = by_outcome.get(r.outcome, 0) + 1
+            proxy_kind = r.proxy_kind or "unknown"
+            by_proxy_kind[proxy_kind] = by_proxy_kind.get(proxy_kind, 0) + 1
+            model = r.model or "unknown"
+            slot = by_model.setdefault(model, {"count": 0, "cost_usd": 0.0})
+            slot["count"] += 1
+            slot["cost_usd"] += r.est_cost_usd
+
+        successes = by_outcome.get("ready", 0)
+        cost_per_success = (total_cost / successes) if successes else 0.0
+
+        return {
+            "count": len(records),
+            "cost_usd": total_cost,
+            "by_outcome": by_outcome,
+            "by_model": by_model,
+            "by_proxy_kind": by_proxy_kind,
+            "cost_per_success": cost_per_success,
+        }
+
+    async def close(self) -> None:
+        await self._redis.aclose()
+
+
+def build_ledger(config: Any) -> "CostLedger | RedisCostLedger":
+    """Select a ledger backend: Redis when configured, else in-memory.
+
+    Using Redis means a process restart no longer zeroes ``getBalance`` spend
+    and the record history survives up to ``max_records``.
+    """
+    redis_url = getattr(config, "redis_url", None)
+    if redis_url:
+        return RedisCostLedger(redis_url, max_records=100_000)
+    return CostLedger()

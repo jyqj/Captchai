@@ -80,21 +80,52 @@ def _proxy_dict_from_params(params: dict[str, Any]) -> Optional[dict]:
     return asset.playwright_proxy() if asset is not None else None
 
 
+def _count_response_bytes(response: Any) -> None:
+    """Accumulate Content-Length onto the owning context's byte counter.
+
+    Registered as a ``context.on("response", ...)`` listener so every response
+    in the context contributes to a running total. Chunked responses without a
+    Content-Length header undercount (acceptable for v1 — the dominant byte
+    sources for captcha solving all carry Content-Length).
+    """
+    try:
+        ctx = response.frame.page.context
+    except Exception:
+        return
+    try:
+        cl = response.headers.get("content-length") if response.headers else None
+        if cl:
+            ctx._omc_bytes_used += int(cl)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def resolve_context_options(config: Config, params: dict[str, Any]) -> ContextOptions:
     """Build a coherent fingerprint + proxy for a task.
 
     A caller-supplied ``userAgent`` still wins (so the token binds to the UA the
     caller will submit with); otherwise the fingerprint's UA is used. The
-    fingerprint is seeded by sitekey so repeat solves of the same target reuse a
-    stable, coherent identity.
+    fingerprint uses a random seed so each context gets a unique coherent
+    identity; seeding by sitekey would let detectors cluster every solve of a
+    given target as the same browser.
     """
     del config  # reserved for future per-config fingerprint policy
-    seed = params.get("websiteKey") or params.get("proxy")
-    fingerprint = generate_fingerprint(seed=seed)
+    fingerprint = generate_fingerprint(seed=None)
     user_agent = params.get("userAgent") or fingerprint.user_agent
+
+    if params.get("_proxy_override"):
+        proxy_dict = params["_proxy_override"]
+    elif params.get("_proxyKind") == "proxyless":
+        # egress=proxyless: a caller may have supplied task-proxy fields, but
+        # the solver has already classified this as a proxyless solve. Honour
+        # that intent and use the server egress IP instead of the task proxy.
+        proxy_dict = None
+    else:
+        proxy_dict = _proxy_dict_from_params(params)
+
     return ContextOptions(
         user_agent=user_agent,
-        proxy=_proxy_dict_from_params(params),
+        proxy=proxy_dict,
         fingerprint=fingerprint,
     )
 
@@ -197,4 +228,11 @@ class BrowserManager:
         kwargs = context_kwargs(fingerprint, proxy)
         context = await self._browser.new_context(**kwargs)  # type: ignore[arg-type]
         await context.add_init_script(build_stealth_js(fingerprint))
+        # Per-context response byte counter. Accumulated from Content-Length
+        # headers (chunked transfers undercount, but the bulk of captcha-solving
+        # traffic — images, scripts, stylesheets — carries Content-Length).
+        # Read by BaseBrowserSolver._release_context to report proxy bandwidth
+        # and populate SolveRecord.proxy_bytes.
+        context._omc_bytes_used = 0  # type: ignore[attr-defined]
+        context.on("response", _count_response_bytes)
         return context

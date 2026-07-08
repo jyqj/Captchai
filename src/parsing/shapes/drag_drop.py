@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 class DragDropSolver(BaseShapeSolver):
     SHAPE = ChallengeShape.DRAG_DROP
 
+    PUZZLE_SELECTOR = ".puzzle-image, .captcha-image, .drag-area, canvas, .task-image"
     STEPS = 25
 
     async def run(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:
@@ -28,10 +29,12 @@ class DragDropSolver(BaseShapeSolver):
             return token
 
         prompt = await self.read_prompt(frame) or ctx.prompt
+        shot = await self.screenshot_element(frame, self.PUZZLE_SELECTOR)
+        images = [shot] if shot else []
         result = await self.classify(
             ClassifyRequest(
                 prompt=prompt,
-                images=[],
+                images=images,
                 shape=self.SHAPE.value,
                 extra={"task_id": ctx.task_id, "want": "drag_path"},
             )
@@ -43,7 +46,8 @@ class DragDropSolver(BaseShapeSolver):
             return await self.poll_token()
 
         (sx, sy), (tx, ty) = endpoints
-        await self._drag(frame, sx, sy, tx, ty)
+        page = ctx.extra.get("page")
+        await self._drag(frame, sx, sy, tx, ty, page=page)
         await self.click_submit(frame)
         return await self.poll_token()
 
@@ -86,11 +90,11 @@ class DragDropSolver(BaseShapeSolver):
         return points
 
     async def _drag(
-        self, frame: Any, sx: float, sy: float, tx: float, ty: float
+        self, frame: Any, sx: float, sy: float, tx: float, ty: float, *, page: Any = None
     ) -> bool:
-        mouse = getattr(frame, "mouse", None)
+        mouse = getattr(page, "mouse", None) or getattr(frame, "mouse", None)
         if mouse is None:
-            log.debug("drag_drop: frame exposes no mouse")
+            log.debug("drag_drop: no mouse available on page or frame")
             return False
         try:
             await mouse.move(sx, sy)

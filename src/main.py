@@ -70,22 +70,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # One Chromium process shared by every browser-based solver. Each solve
     # still gets an isolated context (with its own proxy/UA), but we avoid
     # launching four separate browsers.
-    task_manager.configure(config)
-
     browser = BrowserManager(config)
     await browser.start()
 
     # Shared asset / consumption / vision layers, injected into the solvers.
     services = SolverServices(config)
     services.attach_browser(browser)
+    await services.prewarm_sessions()
     set_services(services)
 
-    v3_solver = RecaptchaV3Solver(config, manager=browser)
+    # Configure the task manager after services exist so the scheduler can peek
+    # the proxy pool for best-effort pool-proxy routing on egress="auto" tasks.
+    task_manager.configure(config, proxy_pool=services.proxy_pool)
+
+    v3_solver = RecaptchaV3Solver(config, manager=browser, services=services)
     for task_type in _RECAPTCHA_V3_TYPES:
         task_manager.register_solver(task_type, v3_solver, TaskCategory.BROWSER)
     log.info("Registered reCAPTCHA v3 solver for types: %s", _RECAPTCHA_V3_TYPES)
 
-    v2_solver = RecaptchaV2Solver(config, manager=browser)
+    v2_solver = RecaptchaV2Solver(config, manager=browser, services=services)
     for task_type in _RECAPTCHA_V2_TYPES:
         task_manager.register_solver(task_type, v2_solver, TaskCategory.BROWSER)
     log.info("Registered reCAPTCHA v2 solver for types: %s", _RECAPTCHA_V2_TYPES)
@@ -95,7 +98,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         task_manager.register_solver(task_type, hcaptcha_solver, TaskCategory.BROWSER)
     log.info("Registered hCaptcha solver for types: %s", _HCAPTCHA_TYPES)
 
-    turnstile_solver = TurnstileSolver(config, manager=browser)
+    turnstile_solver = TurnstileSolver(config, manager=browser, services=services)
     for task_type in _TURNSTILE_TYPES:
         task_manager.register_solver(task_type, turnstile_solver, TaskCategory.BROWSER)
     log.info("Registered Turnstile solver for types: %s", _TURNSTILE_TYPES)

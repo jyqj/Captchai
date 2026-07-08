@@ -155,6 +155,22 @@ class ProxyPool:
     def add(self, proxy: ProxyAsset) -> None:
         self._proxies[proxy.id] = proxy
 
+    def has_available(self, *, kind: Optional[str] = None) -> bool:
+        """Sync peek: True if any proxy is currently available (no checkout).
+
+        Best-effort read without the lock — a concurrent ``report`` may flip a
+        proxy's state mid-scan, but the caller (the scheduler) only uses this
+        to pick a concurrency pool, and a wrong guess still runs the task
+        (just on a suboptimal semaphore). Avoids acquiring the lock on every
+        task enqueue.
+        """
+        now = time.monotonic()
+        return any(
+            self._is_available(p, now)
+            and (kind is None or p.kind == kind)
+            for p in self._proxies.values()
+        )
+
     def _is_available(self, proxy: ProxyAsset, now: float) -> bool:
         if proxy.state == "burned":
             return False
