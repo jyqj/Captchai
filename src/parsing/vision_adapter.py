@@ -10,6 +10,7 @@ between the two and pins the task tier / sitekey / client_key for a given solve.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 from .vision import VisionRequest, VisionResult, VisionRouter
@@ -34,6 +35,8 @@ class VisionAdapter:
         self.total_vision_calls = 0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        # Wall time spent inside model calls, for the ledger's phase breakdown.
+        self.total_vision_ms = 0
         self.last_model: Optional[str] = None
 
     async def classify(self, req: Any) -> VisionResult:
@@ -48,7 +51,9 @@ class VisionAdapter:
             sitekey=self._sitekey,
             shape=shape,
         )
+        started = time.monotonic()
         result = await self._router.classify(vision_req, client_key=self._client_key)
+        self.total_vision_ms += int((time.monotonic() - started) * 1000)
 
         self.total_vision_calls += max(1, result.votes)
         self.total_input_tokens += result.usage.input_tokens

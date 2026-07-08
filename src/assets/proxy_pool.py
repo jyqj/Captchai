@@ -66,6 +66,11 @@ class ProxyAsset:
     country: Optional[str] = None
     timezone: Optional[str] = None
     locale: Optional[str] = None
+    # WP-geo: set once ``probe_proxy_geo`` has attempted an exit-IP geo lookup
+    # (success or failure) so a proxy whose IP has no resolvable geo isn't
+    # re-probed on every checkout. Manually-annotated proxies (``country`` set)
+    # never need probing.
+    geo_probed: bool = False
     # Per-sitekey counters: sitekey -> [success, fail]. Not part of the public
     # constructor contract but used by selection ranking and the snapshot.
     # ``sitekey_stats`` is the *token-obtained* bucket — written by the solver
@@ -80,15 +85,41 @@ class ProxyAsset:
     real_sitekey_stats: Dict[str, List[int]] = field(default_factory=dict)
 
     def playwright_proxy(self) -> Optional[Dict[str, str]]:
-        """Return a Playwright proxy dict, or ``None`` if no server configured."""
+        """Return a Playwright proxy dict, or ``None`` if no server configured.
+
+        Sticky-session support: residential gateways pin the exit IP for a
+        window when a session token is embedded in the username (or password).
+        When ``username`` / ``password`` contain a ``{session}`` placeholder it
+        is substituted with :attr:`sticky_session_id`, which is generated
+        lazily and cached on the asset so every ``playwright_proxy()`` call for
+        this proxy yields the *same* exit IP. This closes the gap where a
+        rotating gateway could hand the solve one IP and the caller's
+        downstream submit a different one — which gets an IP-bound token
+        rejected.
+        """
         if not self.server:
             return None
         proxy: Dict[str, str] = {"server": self.server}
-        if self.username:
-            proxy["username"] = self.username
-        if self.password:
-            proxy["password"] = self.password
+        username = self._inject_session(self.username)
+        password = self._inject_session(self.password)
+        if username:
+            proxy["username"] = username
+        if password:
+            proxy["password"] = password
         return proxy
+
+    def _inject_session(self, value: Optional[str]) -> Optional[str]:
+        """Substitute the ``{session}`` placeholder with the sticky session id.
+
+        No placeholder → the value is returned unchanged (no behaviour change
+        for non-sticky proxies). A placeholder forces a stable session id to be
+        generated once and reused, so the gateway keeps the same exit IP.
+        """
+        if not value or "{session}" not in value:
+            return value
+        if not self.sticky_session_id:
+            self.sticky_session_id = uuid.uuid4().hex[:16]
+        return value.replace("{session}", self.sticky_session_id)
 
     def success_rate(self) -> float:
         """Rolling success rate; unused proxies get an optimistic 1.0."""
@@ -180,6 +211,8 @@ def proxy_from_params(params: Dict[str, Any]) -> Optional[ProxyAsset]:
         timezone=params.get("timezone"),
         locale=params.get("locale"),
         kind=params.get("kind"),
+        session=params.get("session"),
+        sticky=params.get("sticky"),
     )
     return asset
 
@@ -209,13 +242,20 @@ def _apply_geo_metadata(
     timezone: Optional[str],
     locale: Optional[str],
     kind: Optional[str],
+    session: Optional[str] = None,
+    sticky: Optional[str] = None,
 ) -> None:
-    """Mutate ``asset`` in place to apply parsed geo / kind metadata.
+    """Mutate ``asset`` in place to apply parsed geo / kind / session metadata.
 
     Unknown / empty values are ignored. When ``country`` is given but
     ``timezone`` or ``locale`` are not, they are derived from ``_COUNTRY_GEO``.
     ``kind`` is normalised to one of {"datacenter","residential","mobile"} —
     anything else falls back to ``"datacenter"`` (the ProxyAsset default).
+
+    ``session`` pins an explicit sticky session id (substituted into a
+    ``{session}`` username/password placeholder). ``sticky`` (``true``/``1``)
+    auto-generates one so a gateway that reads the token from the username
+    keeps the same exit IP across the whole solve and any reused warm session.
     """
     if country:
         asset.country = str(country).upper()
@@ -227,6 +267,10 @@ def _apply_geo_metadata(
         norm = str(kind).lower()
         if norm in {"datacenter", "residential", "mobile"}:
             asset.kind = norm
+    if session:
+        asset.sticky_session_id = str(session)
+    elif sticky and str(sticky).strip().lower() in {"1", "true", "yes"}:
+        asset.sticky_session_id = uuid.uuid4().hex[:16]
     # Derive missing timezone / locale from country when possible.
     if asset.country and (not asset.timezone or not asset.locale):
         derived = _COUNTRY_GEO.get(asset.country)
@@ -301,6 +345,8 @@ def _from_single_string(value: str) -> Optional[ProxyAsset]:
         timezone=meta.get("timezone"),
         locale=meta.get("locale"),
         kind=meta.get("kind"),
+        session=meta.get("session"),
+        sticky=meta.get("sticky"),
     )
     return asset
 
@@ -452,6 +498,35 @@ class ProxyPool:
             ):
                 proxy.state = "burned"
 
+    async def set_geo(
+        self,
+        proxy_id: str,
+        *,
+        country: Optional[str],
+        timezone: Optional[str],
+        locale: Optional[str],
+        geo_probed: bool = True,
+    ) -> None:
+        """Persist probed exit-IP geo onto a proxy so later checkouts reuse it.
+
+        Called after ``geo_probe.probe_proxy_geo`` resolves (or fails to
+        resolve) a proxy's country, so the timezone/locale/country and the
+        ``geo_probed`` guard survive across checkouts. In-memory the checked-out
+        object is the live one, but writing through this method keeps the
+        contract identical to the Redis backend.
+        """
+        async with self._get_lock():
+            proxy = self._proxies.get(proxy_id)
+            if proxy is None:
+                return
+            if country:
+                proxy.country = country
+            if timezone:
+                proxy.timezone = timezone
+            if locale:
+                proxy.locale = locale
+            proxy.geo_probed = geo_probed
+
     async def report_sitekey(
         self, proxy_id: str, sitekey: str, *, success: bool
     ) -> None:
@@ -514,6 +589,7 @@ class ProxyPool:
                     "country": p.country,
                     "timezone": p.timezone,
                     "locale": p.locale,
+                    "geo_probed": p.geo_probed,
                     "sitekeys": {
                         sk: {"success": s[0], "fail": s[1]}
                         for sk, s in p.sitekey_stats.items()
@@ -552,6 +628,15 @@ class ProxyPoolProtocol(Protocol):
     ) -> None: ...
     async def report_sitekey_real(
         self, proxy_id: str, sitekey: str, *, success: bool
+    ) -> None: ...
+    async def set_geo(
+        self,
+        proxy_id: str,
+        *,
+        country: Optional[str],
+        timezone: Optional[str],
+        locale: Optional[str],
+        geo_probed: bool = True,
     ) -> None: ...
     def snapshot(self) -> List[Dict[str, Any]]: ...
 
@@ -642,6 +727,7 @@ class RedisProxyPool:
                 "country": proxy.country,
                 "timezone": proxy.timezone,
                 "locale": proxy.locale,
+                "geo_probed": proxy.geo_probed,
                 "sitekey_stats": {
                     sk: list(stats) for sk, stats in proxy.sitekey_stats.items()
                 },
@@ -674,6 +760,7 @@ class RedisProxyPool:
             country=data.get("country"),
             timezone=data.get("timezone"),
             locale=data.get("locale"),
+            geo_probed=bool(data.get("geo_probed", False)),
             sitekey_stats={
                 sk: [int(x) for x in stats] for sk, stats in sk_stats.items()
             },
@@ -930,6 +1017,38 @@ class RedisProxyPool:
         finally:
             await self._release_lock(token)
 
+    async def set_geo(
+        self,
+        proxy_id: str,
+        *,
+        country: Optional[str],
+        timezone: Optional[str],
+        locale: Optional[str],
+        geo_probed: bool = True,
+    ) -> None:
+        """Persist probed exit-IP geo so later cross-process checkouts reuse it."""
+        token = await self._acquire_lock()
+        try:
+            raw = await self._redis.hget(self._proxies_key, proxy_id)
+            if raw is None:
+                return
+            try:
+                proxy = self._deserialize(raw)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                return
+            if country:
+                proxy.country = country
+            if timezone:
+                proxy.timezone = timezone
+            if locale:
+                proxy.locale = locale
+            proxy.geo_probed = geo_probed
+            await self._redis.hset(
+                self._proxies_key, proxy_id, self._serialize(proxy)
+            )
+        finally:
+            await self._release_lock(token)
+
     def snapshot(self) -> List[Dict[str, Any]]:
         """Serialisable view of the pool for an admin endpoint (sync best-effort)."""
         now = time.time()
@@ -957,6 +1076,7 @@ class RedisProxyPool:
                         "country": p.country,
                         "timezone": p.timezone,
                         "locale": p.locale,
+                        "geo_probed": p.geo_probed,
                         "sitekeys": {
                             sk: {"success": s[0], "fail": s[1]}
                             for sk, s in p.sitekey_stats.items()

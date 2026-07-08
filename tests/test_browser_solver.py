@@ -547,6 +547,78 @@ def test_acquire_pool_required_kind_raises_when_none_available() -> None:
     asyncio.run(run())
 
 
+def test_force_fresh_context_bypasses_warm_session() -> None:
+    """_force_fresh_context makes a pool solve build a fresh context, not reuse a session."""
+    async def run() -> None:
+        manager = FakeManager()
+        pool = ProxyPool()
+        pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
+        session_pool = FakeSessionPool()
+        services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
+        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        params = {
+            "websiteKey": "site",
+            "egress": "pool",
+            "_force_fresh_context": True,
+        }
+
+        ctx = await solver._acquire_context(params)
+        assert ctx.proxy_kind == ProxyKind.POOL_PROXY
+        # Fresh context: no warm session was checked out; manager built one
+        # bound to the pool proxy via _proxy_override.
+        assert ctx.session is None
+        assert manager.calls and manager.calls[0]["_proxy_override"] == {
+            "server": "http://pool:8080"
+        }
+        await solver._release_context(ctx, True, params)
+
+    asyncio.run(run())
+
+
+def test_acquire_pool_probes_geo_when_unannotated() -> None:
+    """P0-2b: a pool proxy with no geo is probed on checkout; geo threads through."""
+    async def run() -> None:
+        import src.services.browser_solver as bs
+
+        manager = FakeManager()
+        pool = ProxyPool()
+        pool.add(ProxyAsset(id="p-nogeo", server="http://user:pass@gw:8080"))
+        services = SimpleNamespace(session_pool=None, proxy_pool=pool)
+        # Enable the probe on the config and stub the network fetch.
+        config = SimpleNamespace(
+            human_mouse_enabled=False,
+            human_mouse_jitter_ms=0,
+            proxy_geo_probe=True,
+            proxy_geo_probe_url="http://ip-api.com/json",
+        )
+        solver = BaseBrowserSolver(config, manager=manager, services=services)
+
+        import src.assets.geo_probe as gp
+
+        async def fake_fetch(url, proxy_url, timeout):
+            return {"countryCode": "DE"}
+
+        orig = gp._httpx_fetch_json
+        gp._httpx_fetch_json = fake_fetch  # type: ignore[assignment]
+        try:
+            params = {"websiteKey": "site", "egress": "pool"}
+            ctx = await solver._acquire_context(params)
+        finally:
+            gp._httpx_fetch_json = orig  # type: ignore[assignment]
+
+        assert ctx.proxy_kind == ProxyKind.POOL_PROXY
+        # The probed geo was threaded onto params for the fingerprint build.
+        assert params["_pool_geo"]["country"] == "DE"
+        assert params["_pool_geo"]["timezone"] == "Europe/Berlin"
+        assert params["_pool_geo"]["locale"] == "de-DE"
+        # And persisted back onto the pool so later checkouts skip the probe.
+        assert pool.snapshot()[0]["country"] == "DE"
+        assert pool.snapshot()[0]["geo_probed"] is True
+        await solver._release_context(ctx, True, params)
+
+    asyncio.run(run())
+
+
 def test_stash_fingerprint_geo_reads_session_fingerprint() -> None:
     """_stash_fingerprint_geo reads session.fingerprint for warm-session solves."""
     async def run() -> None:

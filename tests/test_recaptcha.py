@@ -103,7 +103,7 @@ def test_recaptcha_v2_uses_acquire_and_release_context() -> None:
         solver._acquire_context = fake_acquire  # type: ignore[assignment]
         solver._release_context = fake_release  # type: ignore[assignment]
 
-        async def fake_checkbox(p):
+        async def fake_checkbox(p, params=None):
             return "tok-" + "x" * 40
 
         solver._solve_checkbox = fake_checkbox  # type: ignore[assignment]
@@ -150,7 +150,7 @@ def test_recaptcha_v2_release_called_with_solved_false_on_failure() -> None:
         solver._acquire_context = fake_acquire  # type: ignore[assignment]
         solver._release_context = fake_release  # type: ignore[assignment]
 
-        async def fake_checkbox(p):
+        async def fake_checkbox(p, params=None):
             return None  # no token → _solve_once raises "Invalid token"
 
         solver._solve_checkbox = fake_checkbox  # type: ignore[assignment]
@@ -192,7 +192,7 @@ def test_recaptcha_v2_goto_uses_domcontentloaded() -> None:
         solver._acquire_context = fake_acquire  # type: ignore[assignment]
         solver._release_context = fake_release  # type: ignore[assignment]
 
-        async def fake_checkbox(p):
+        async def fake_checkbox(p, params=None):
             return "tok-" + "x" * 40
 
         solver._solve_checkbox = fake_checkbox  # type: ignore[assignment]
@@ -324,8 +324,93 @@ def test_recaptcha_v3_release_called_with_solved_false_on_failure() -> None:
     asyncio.run(run())
 
 
+# --------------------------------------------------------------------------- #
+# Audio transcription routes through the ModelPool (metered + budget-gated)
+# --------------------------------------------------------------------------- #
+
+
+def test_v2_audio_transcription_routes_through_model_pool() -> None:
+    """_transcribe_audio uses model_pool.cloud.transcribe_audio and meters it."""
+    from src.assets.model_pool import ModelUsage
+
+    async def run() -> None:
+        calls = {"n": 0, "model": None}
+
+        class _CloudClient:
+            async def transcribe_audio(self, audio_bytes, *, model=None, filename=None, timeout=None):
+                calls["n"] += 1
+                calls["model"] = model
+                return "3 1 4", ModelUsage(input_tokens=0, output_tokens=4)
+
+        class _Budget:
+            def __init__(self):
+                self.checks = []
+
+            async def check(self, client_key, est, *, model=None):
+                self.checks.append((client_key, est, model))
+                return SimpleNamespace(allowed=True)
+
+        budget = _Budget()
+        services = SimpleNamespace(
+            model_pool=SimpleNamespace(cloud=_CloudClient()),
+            budget=budget,
+        )
+        config = SimpleNamespace(
+            captcha_retries=1,
+            cloud_audio_model="whisper-1",
+            cloud_base_url="http://cloud",
+            cloud_api_key="k",
+            captcha_timeout=10,
+        )
+        solver = RecaptchaV2Solver(config, manager=None, services=services)
+
+        params = {"_clientKey": "acct-1"}
+        text = await solver._transcribe_audio(b"FAKEMP3", params)
+        assert text == "3 1 4"
+        assert calls["n"] == 1
+        assert calls["model"] == "whisper-1"
+        # Budget was consulted for the paid cloud transcription.
+        assert budget.checks and budget.checks[0][2] == "cloud"
+        # Usage was stashed for the ledger recorder.
+        meter = params["_vision"]
+        assert meter.last_model == "cloud"
+        assert meter.total_vision_calls == 1
+
+    asyncio.run(run())
+
+
+def test_v2_audio_transcription_denied_by_budget_raises() -> None:
+    """A budget denial stops the (unmetered-in-the-past) cloud transcription."""
+    async def run() -> None:
+        class _CloudClient:
+            async def transcribe_audio(self, *a, **k):
+                raise AssertionError("must not call the model when budget denies")
+
+        class _Budget:
+            async def check(self, client_key, est, *, model=None):
+                return SimpleNamespace(allowed=False, downgrade_to="local")
+
+        services = SimpleNamespace(
+            model_pool=SimpleNamespace(cloud=_CloudClient()),
+            budget=_Budget(),
+        )
+        config = SimpleNamespace(
+            cloud_audio_model="whisper-1", captcha_timeout=10
+        )
+        solver = RecaptchaV2Solver(config, manager=None, services=services)
+        try:
+            await solver._transcribe_audio(b"FAKEMP3", {"_clientKey": "acct-1"})
+            assert False, "expected a budget denial to raise"
+        except RuntimeError as exc:
+            assert "budget" in str(exc).lower()
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_recaptcha_v2_uses_acquire_and_release_context()
+    test_v2_audio_transcription_routes_through_model_pool()
+    test_v2_audio_transcription_denied_by_budget_raises()
     test_recaptcha_v2_release_called_with_solved_false_on_failure()
     test_recaptcha_v2_goto_uses_domcontentloaded()
     test_recaptcha_v3_uses_acquire_and_release_context()

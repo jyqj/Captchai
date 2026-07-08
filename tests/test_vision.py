@@ -326,6 +326,167 @@ def test_usage_tokens_captured_into_result():
     assert result.usage.output_tokens == 12
 
 
+# ---------------------------------------------------------------------------
+# Model concurrency semaphore + connection-error backend fallback
+# ---------------------------------------------------------------------------
+
+
+def test_model_client_bounds_concurrency():
+    """max_concurrency caps simultaneous in-flight chat() calls."""
+    import asyncio as _asyncio
+
+    from src.assets.model_pool import ModelClient, ModelUsage
+
+    state = {"in_flight": 0, "peak": 0}
+
+    class _SlowCompletions:
+        async def create(self, **kwargs):
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+            await _asyncio.sleep(0.02)
+            state["in_flight"] -= 1
+            return _fake_response('{"indices":[],"confidence":1.0}')
+
+    def factory(base_url, api_key):
+        return SimpleNamespace(chat=SimpleNamespace(completions=_SlowCompletions()))
+
+    async def run():
+        client = ModelClient(
+            name="cloud",
+            model="m",
+            base_url="u",
+            api_key="k",
+            client_factory=factory,
+            max_concurrency=2,
+        )
+        await _asyncio.gather(
+            *(client.chat(messages=[{"role": "user", "content": "x"}]) for _ in range(8))
+        )
+
+    asyncio.run(run())
+    # Never more than 2 concurrent calls despite 8 being launched at once.
+    assert state["peak"] <= 2
+
+
+def test_local_connection_error_falls_back_to_cloud():
+    """A dead local backend transparently falls back to cloud (tier-1)."""
+    from src.assets.model_pool import ModelUsage
+
+    class _DeadLocalClient:
+        name = "local"
+
+        async def chat(self, **kwargs):
+            raise ConnectionError("local model service down")
+
+    class _CloudClient:
+        name = "cloud"
+
+        async def chat(self, **kwargs):
+            return '{"indices":[2,4],"confidence":0.9}', ModelUsage(5, 2)
+
+    class _Pool:
+        def get(self, name):
+            return _DeadLocalClient() if name == "local" else _CloudClient()
+
+    config = _make_config(
+        vision_cloud_enabled=True,
+        vision_stitch_grid=False,
+        model_connection_fallback=True,
+    )
+    router = VisionRouter(_Pool(), config)
+    result = asyncio.run(router.classify(_req(task_tier=1)))
+    assert result.model == "cloud"  # fell back to cloud
+    assert result.indices == [2, 4]
+
+
+def test_cloud_connection_error_falls_back_to_local():
+    """A dead cloud backend falls back to the free local model (tier-2)."""
+    from src.assets.model_pool import ModelUsage
+
+    class _DeadCloudClient:
+        name = "cloud"
+
+        async def chat(self, **kwargs):
+            raise TimeoutError("cloud timed out")
+
+    class _LocalClient:
+        name = "local"
+
+        async def chat(self, **kwargs):
+            return '{"indices":[1],"confidence":0.8}', ModelUsage(3, 1)
+
+    class _Pool:
+        def get(self, name):
+            return _DeadCloudClient() if name == "cloud" else _LocalClient()
+
+    config = _make_config(
+        vision_cloud_enabled=True,
+        vision_stitch_grid=False,
+        model_connection_fallback=True,
+    )
+    router = VisionRouter(_Pool(), config)
+    result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
+    assert result.model == "local"
+    assert result.indices == [1]
+
+
+def test_connection_fallback_disabled_reraises():
+    """With fallback disabled, a connection error propagates (no silent swap)."""
+    class _DeadLocalClient:
+        name = "local"
+
+        async def chat(self, **kwargs):
+            raise ConnectionError("down")
+
+    class _Pool:
+        def get(self, name):
+            return _DeadLocalClient()
+
+    config = _make_config(
+        vision_cloud_enabled=True,
+        vision_stitch_grid=False,
+        model_connection_fallback=False,
+    )
+    router = VisionRouter(_Pool(), config)
+    try:
+        asyncio.run(router.classify(_req(task_tier=1)))
+        raise AssertionError("expected the connection error to propagate")
+    except ConnectionError:
+        pass
+
+
+def test_non_connection_error_does_not_fall_back():
+    """A non-connection error (e.g. ValueError) is not retried on the other backend."""
+    class _BadLocalClient:
+        name = "local"
+
+        async def chat(self, **kwargs):
+            raise ValueError("malformed request")
+
+    class _Pool:
+        def __init__(self):
+            self.cloud_calls = 0
+
+        def get(self, name):
+            if name == "cloud":
+                self.cloud_calls += 1
+            return _BadLocalClient()
+
+    pool = _Pool()
+    config = _make_config(
+        vision_cloud_enabled=True,
+        vision_stitch_grid=False,
+        model_connection_fallback=True,
+    )
+    router = VisionRouter(pool, config)
+    try:
+        asyncio.run(router.classify(_req(task_tier=1)))
+        raise AssertionError("expected the ValueError to propagate")
+    except ValueError:
+        pass
+    assert pool.cloud_calls == 0  # no fallback attempted for a non-connection error
+
+
 def test_usage_accumulates_across_votes():
     config = _make_config(vision_vote_samples=3, vision_confidence_threshold=0.6)
     contents = [

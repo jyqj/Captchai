@@ -244,6 +244,37 @@ def test_grid_challenge_solved_via_vision_and_recorded() -> None:
     asyncio.run(run())
 
 
+def test_solve_records_phase_timing() -> None:
+    """The ledger record breaks wall_ms into page-load / challenge / vision phases."""
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=9)
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        vision = FakeVisionRouter(indices=[0, 3, 5])
+        services = _services(vision)
+
+        solver = HCaptchaSolver(_config(), manager=manager, services=services)
+        await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-phase",
+                "type": "HCaptchaTaskProxyless",
+                "userAgent": "UA-FAKE",
+            }
+        )
+        recs = await services.ledger.records()
+        assert recs
+        rec = recs[-1]
+        # Phase fields are populated (page-load + challenge instrumented on the
+        # injected-page path; all are non-negative and bounded by wall_ms).
+        assert rec.page_load_ms >= 0
+        assert rec.challenge_ms >= 0
+        assert rec.vision_ms >= 0
+        assert rec.challenge_ms <= rec.wall_ms + 5
+
+    asyncio.run(run())
+
+
 def test_enterprise_fields_forwarded() -> None:
     async def run() -> None:
         page = FakePage(token_after=1, tile_count=0)
@@ -731,6 +762,7 @@ def test_enterprise_with_task_proxy_allowed_without_pool() -> None:
 
 if __name__ == "__main__":
     test_grid_challenge_solved_via_vision_and_recorded()
+    test_solve_records_phase_timing()
     test_enterprise_fields_forwarded()
     test_token_cache_not_consulted()
     test_enterprise_refuses_proxyless_fallback()

@@ -17,17 +17,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-from .browser_solver import (
-    BaseBrowserSolver,
-    egress_from_params,
-    fingerprint_geo_from_params,
-)
+from .browser_solver import BaseBrowserSolver
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class _AudioMeter:
+    """Vision-shaped usage accumulator so ``BaseBrowserSolver._record`` can meter
+    the audio-transcription call (model / tokens / calls / latency) the same way
+    it meters a vision solve — stashed on ``params["_vision"]``."""
+
+    last_model: str | None = None
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_vision_calls: int = 0
+    total_vision_ms: int = 0
 
 _EXTRACT_TOKEN_JS = """
 () => {
@@ -71,52 +81,20 @@ class RecaptchaV2Solver(BaseBrowserSolver):
         # pool → proxyless); only set when the caller left it unspecified.
         params.setdefault("egress", "auto")
 
-        last_error: Exception | None = None
-        for attempt in range(self._config.captcha_retries):
-            started = time.monotonic()
-            try:
-                token, user_agent = await self._solve_once(
-                    website_url, website_key, is_invisible, params
-                )
-                await self._record(
-                    params,
-                    website_key,
-                    client_key,
-                    "ready",
-                    started,
-                    task_type=params.get("type", "RecaptchaV2TaskProxyless"),
-                    challenge_shape="audio",
-                )
-                tz, accept = fingerprint_geo_from_params(params)
-                return {
-                    "gRecaptchaResponse": token,
-                    "userAgent": user_agent,
-                    "timezoneId": tz,
-                    "acceptLanguage": accept,
-                    **egress_from_params(params),
-                }
-            except Exception as exc:
-                last_error = exc
-                await self._record(
-                    params,
-                    website_key,
-                    client_key,
-                    "failed",
-                    started,
-                    task_type=params.get("type", "RecaptchaV2TaskProxyless"),
-                    challenge_shape="audio",
-                )
-                log.warning(
-                    "reCAPTCHA v2 attempt %d/%d failed: %s",
-                    attempt + 1,
-                    self._config.captcha_retries,
-                    exc,
-                )
-                if attempt < self._config.captcha_retries - 1:
-                    await asyncio.sleep(2)
-
-        raise RuntimeError(
-            f"reCAPTCHA v2 failed after {self._config.captcha_retries} attempts: {last_error}"
+        return await self._solve_with_retries(
+            params,
+            sitekey=website_key,
+            client_key=client_key,
+            attempt_fn=lambda: self._solve_once(
+                website_url, website_key, is_invisible, params
+            ),
+            build_solution=lambda token, ua: {
+                "gRecaptchaResponse": token,
+                "userAgent": ua,
+            },
+            provider="reCAPTCHA v2",
+            default_task_type=params.get("type", "RecaptchaV2TaskProxyless"),
+            default_challenge_shape="audio",
         )
 
     async def _solve_once(
@@ -151,7 +129,7 @@ class RecaptchaV2Solver(BaseBrowserSolver):
                     [website_key],
                 )
             else:
-                token = await self._solve_checkbox(page)
+                token = await self._solve_checkbox(page, params)
 
             if not isinstance(token, str) or len(token) < 20:
                 raise RuntimeError(f"Invalid reCAPTCHA v2 token: {token!r}")
@@ -162,7 +140,7 @@ class RecaptchaV2Solver(BaseBrowserSolver):
         finally:
             await self._release_context(solve_context, solved, params)
 
-    async def _solve_checkbox(self, page: Any) -> str | None:
+    async def _solve_checkbox(self, page: Any, params: dict[str, Any]) -> str | None:
         """Click the reCAPTCHA checkbox. If a visual challenge appears, try audio path."""
         # The checkbox iframe always has title="reCAPTCHA"
         checkbox_frame = page.frame_locator('iframe[title="reCAPTCHA"]').first
@@ -184,14 +162,14 @@ class RecaptchaV2Solver(BaseBrowserSolver):
         # Challenge dialog appeared — try audio challenge path
         log.info("reCAPTCHA challenge detected, attempting audio path")
         try:
-            token = await self._solve_audio_challenge(page)
+            token = await self._solve_audio_challenge(page, params)
         except Exception as exc:
             log.warning("Audio challenge path failed: %s", exc)
             token = None
 
         return token
 
-    async def _solve_audio_challenge(self, page: Any) -> str | None:
+    async def _solve_audio_challenge(self, page: Any, params: dict[str, Any]) -> str | None:
         """Click the audio button in the bframe and transcribe the audio."""
         # Click the audio challenge button
         bframe = page.frame_locator(_CHALLENGE_IFRAME)
@@ -233,8 +211,8 @@ class RecaptchaV2Solver(BaseBrowserSolver):
             resp.raise_for_status()
             audio_bytes = resp.content
 
-        # Transcribe via the vision/language model (base64 audio → text)
-        transcript = await self._transcribe_audio(audio_bytes)
+        # Transcribe via the shared model pool (metered + budget-gated).
+        transcript = await self._transcribe_audio(audio_bytes, params)
         log.info("Audio transcribed: %r", transcript[:40] if transcript else None)
 
         if not transcript:
@@ -249,44 +227,61 @@ class RecaptchaV2Solver(BaseBrowserSolver):
 
         return await page.evaluate(_EXTRACT_TOKEN_JS)
 
-    async def _transcribe_audio(self, audio_bytes: bytes) -> str | None:
-        """Send audio bytes to the OpenAI-compatible audio transcription endpoint."""
-        import base64
+    async def _transcribe_audio(
+        self, audio_bytes: bytes, params: dict[str, Any]
+    ) -> str | None:
+        """Transcribe the challenge audio through the shared ModelPool.
 
-        audio_b64 = base64.b64encode(audio_bytes).decode()
-        payload = {
-            "model": self._config.captcha_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "This is a reCAPTCHA audio challenge. "
-                                "The audio contains spoken digits or words. "
-                                "Transcribe exactly what is spoken, digits only, "
-                                "separated by spaces. Reply with only the transcription."
-                            ),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:audio/mp3;base64,{audio_b64}"},
-                        },
-                    ],
-                }
-            ],
-            "max_tokens": 50,
-            "temperature": 0,
-        }
+        Routes through ``services.model_pool`` so the call is (a) made against
+        the proper speech-to-text endpoint (``audio.transcriptions``, not a
+        chat call with the mp3 wedged into an ``image_url`` — which a text model
+        can't decode), (b) bounded by the model concurrency semaphore, (c)
+        budget-gated, and (d) metered: a usage accumulator is stashed on
+        ``params["_vision"]`` so the base ``_record`` attributes the cost to the
+        cloud model in the ledger. Without wired services it falls back to a
+        direct transcription call (still the correct endpoint).
+        """
+        model = getattr(self._config, "cloud_audio_model", "whisper-1")
+        services = self._services
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{self._config.captcha_base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self._config.captcha_api_key}"},
-                json=payload,
+        if services is not None and getattr(services, "model_pool", None) is not None:
+            # Budget gate for the paid cloud transcription (rough per-clip est).
+            budget = getattr(services, "budget", None)
+            client_key = params.get("_clientKey")
+            if budget is not None:
+                decision = await budget.check(client_key, 0.006, model="cloud")
+                if decision is not None and not getattr(decision, "allowed", True):
+                    raise RuntimeError(
+                        "audio transcription denied by budget cap"
+                    )
+            started = time.monotonic()
+            text, usage = await services.model_pool.cloud.transcribe_audio(
+                audio_bytes,
+                model=model,
+                filename="challenge.mp3",
+                timeout=float(getattr(self._config, "captcha_timeout", 30)),
             )
-            if resp.status_code != 200:
-                raise RuntimeError(f"Transcription API error {resp.status_code}: {resp.text[:200]}")
-            data = resp.json()
-            return data["choices"][0]["message"]["content"].strip()
+            # Meter it: stash a vision-shaped accumulator the base _record reads.
+            params["_vision"] = _AudioMeter(
+                last_model="cloud",
+                total_input_tokens=usage.input_tokens,
+                total_output_tokens=usage.output_tokens,
+                total_vision_calls=1,
+                total_vision_ms=int((time.monotonic() - started) * 1000),
+            )
+            return text or None
+
+        # No wired services (e.g. standalone use): call the transcription
+        # endpoint directly. Still the correct endpoint — not a chat/image hack.
+        try:
+            from openai import AsyncOpenAI  # noqa: WPS433 - optional at runtime
+        except Exception as exc:  # pragma: no cover - openai is in requirements
+            raise RuntimeError("openai package required for audio transcription") from exc
+        client = AsyncOpenAI(
+            base_url=self._config.cloud_base_url, api_key=self._config.cloud_api_key
+        )
+        resp = await client.audio.transcriptions.create(
+            model=model, file=("challenge.mp3", audio_bytes)
+        )
+        text = getattr(resp, "text", None)
+        return (text or "").strip() or None

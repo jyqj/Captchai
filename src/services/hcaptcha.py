@@ -39,6 +39,7 @@ from typing import Any, Optional
 
 from playwright.async_api import FrameLocator, Route
 
+from .browser import set_context_resource_blocking
 from ..parsing.dispatcher import (
     ChallengeClassifier,
     ChallengeContext,
@@ -51,12 +52,10 @@ from ..parsing.shapes.dynamic_grid import DynamicGridSolver
 from ..parsing.shapes.grid_select import GridSelectSolver
 from ..parsing.shapes.slide import CanvasSlideSolver
 from ..parsing.vision_adapter import VisionAdapter
-from .captcha_errors import CaptchaError, classify_widget_error
+from .captcha_errors import classify_widget_error
 from .browser_solver import (
     BaseBrowserSolver,
     ProxyKind,
-    egress_from_params,
-    fingerprint_geo_from_params,
     has_task_proxy,
 )
 
@@ -183,80 +182,43 @@ class HCaptchaSolver(BaseBrowserSolver):
         # _acquire_context so the egress / kind requirements are honoured.
         self._enforce_enterprise_egress(params, profile.variant)
 
-        last_error: Exception | None = None
-        for attempt in range(self._config.captcha_retries):
-            started = time.monotonic()
-            try:
-                if profile.use_real_page:
-                    token, user_agent = await self._solve_once_real_page(
-                        website_url,
-                        website_key,
-                        profile.render_options,
-                        params,
-                        client_key,
-                    )
-                else:
-                    token, user_agent = await self._solve_once(
-                        website_url,
-                        website_key,
-                        profile.render_options,
-                        params,
-                        client_key,
-                    )
-                await self._record(
-                    params, website_key, client_key, "ready", started
+        async def _attempt() -> tuple[str, str]:
+            if profile.use_real_page:
+                return await self._solve_once_real_page(
+                    website_url,
+                    website_key,
+                    profile.render_options,
+                    params,
+                    client_key,
                 )
-                tz, accept = fingerprint_geo_from_params(params)
-                return {
-                    "gRecaptchaResponse": token,
-                    "userAgent": user_agent,
-                    "timezoneId": tz,
-                    "acceptLanguage": accept,
-                    **egress_from_params(params),
-                }
-            except CaptchaError as exc:
-                # A classified widget error: record its specific outcome
-                # (e.g. "rate_limited") and fail fast when retrying can't help
-                # (rate-limit / bad request). The proxy is already cooled down
-                # by _release_context(solved=False), so the next task lands on a
-                # different egress instead of hammering this one.
-                last_error = exc
-                await self._record(
-                    params, website_key, client_key, exc.outcome, started
-                )
-                log.warning(
-                    "HCaptcha attempt %d/%d: %s (retryable=%s)",
-                    attempt + 1,
-                    self._config.captcha_retries,
-                    exc,
-                    exc.retryable,
-                )
-                if not exc.retryable:
-                    raise
-                params["_hcaptcha_vision_tier"] = 2
-                if attempt < self._config.captcha_retries - 1:
-                    await asyncio.sleep(2)
-            except Exception as exc:
-                last_error = exc
-                await self._record(
-                    params, website_key, client_key, "failed", started
-                )
-                # Escalate vision tier for the next attempt: the first attempt
-                # used the cheaper local model (tier=1). A failure suggests the
-                # challenge is hard, so bump to tier=2 to let VisionRouter's
-                # cloud + self-consistency voting path engage.
-                params["_hcaptcha_vision_tier"] = 2
-                log.warning(
-                    "HCaptcha attempt %d/%d failed: %s",
-                    attempt + 1,
-                    self._config.captcha_retries,
-                    exc,
-                )
-                if attempt < self._config.captcha_retries - 1:
-                    await asyncio.sleep(2)
+            return await self._solve_once(
+                website_url,
+                website_key,
+                profile.render_options,
+                params,
+                client_key,
+            )
 
-        raise RuntimeError(
-            f"HCaptcha failed after {self._config.captcha_retries} attempts: {last_error}"
+        def _escalate_tier(attempt: int, exc: Exception) -> None:
+            # Escalate the vision tier for the next attempt: attempt 1 uses the
+            # cheaper local model (tier=1); a failure suggests a hard challenge,
+            # so bump to tier=2 to engage VisionRouter's cloud + self-consistency
+            # voting path.
+            params["_hcaptcha_vision_tier"] = 2
+
+        return await self._solve_with_retries(
+            params,
+            sitekey=website_key,
+            client_key=client_key,
+            attempt_fn=_attempt,
+            build_solution=lambda token, ua: {
+                "gRecaptchaResponse": token,
+                "userAgent": ua,
+            },
+            provider="HCaptcha",
+            default_task_type=params.get("type", "HCaptchaTaskProxyless"),
+            default_challenge_shape="grid_select",
+            on_error=_escalate_tier,
         )
 
     def _profile(self, params: dict[str, Any]) -> HCaptchaProfile:
@@ -346,6 +308,13 @@ class HCaptchaSolver(BaseBrowserSolver):
         if getattr(self._config, "enterprise_require_residential", True):
             params["_required_proxy_kinds"] = ("residential", "mobile")
 
+        # Optionally force a fresh context per enterprise solve so one sticky
+        # proxy's warm session (cookie jar + fingerprint) isn't reused to
+        # repeatedly hit the same sitekey — a pattern enterprise risk models
+        # cluster on. Read by ``_acquire_pool``.
+        if getattr(self._config, "enterprise_fresh_context", False):
+            params["_force_fresh_context"] = True
+
     # ── one attempt ────────────────────────────────────────────
 
     async def _solve_once(
@@ -360,6 +329,10 @@ class HCaptchaSolver(BaseBrowserSolver):
         self._stash_fingerprint_geo(solve_context, params)
         context = solve_context.context
         user_agent = solve_context.user_agent
+        # Synthetic injected page: resource interception is a safe bandwidth
+        # win here (no real page to make look human). Re-assert ON in case a
+        # reused warm session had it turned off by a prior real-page solve.
+        set_context_resource_blocking(context, True)
         html = _build_injected_page(website_key, render_options)
 
         async def _fulfill_document(route: Route) -> None:
@@ -369,6 +342,9 @@ class HCaptchaSolver(BaseBrowserSolver):
                 await route.continue_()
 
         solved = False
+        # Initialised before the try so the finally's challenge-phase timing is
+        # always defined even if context setup / goto raises early.
+        _challenge_started = time.monotonic()
         try:
             # WP5: defensive guard — with ``_enforce_enterprise_egress`` run
             # in ``solve()``, an enterprise task should never reach a
@@ -387,7 +363,12 @@ class HCaptchaSolver(BaseBrowserSolver):
             page = await context.new_page()
             await context.route(website_url, _fulfill_document)
             timeout_ms = self._config.browser_timeout * 1000
+            _page_started = time.monotonic()
             await page.goto(website_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            params["_phase_page_load_ms"] = int(
+                (time.monotonic() - _page_started) * 1000
+            )
+            _challenge_started = time.monotonic()
 
             if not params.get("isInvisible") and render_options.get("size") != "invisible":
                 await self._human_mouse(page)
@@ -403,12 +384,14 @@ class HCaptchaSolver(BaseBrowserSolver):
                 solved = True
                 return token, user_agent
 
-            # Click the checkbox to trigger the challenge. A failure here is a
-            # signal (managed widget / detached frame), logged rather than
-            # silently swallowed.
+            # Click the checkbox to trigger the challenge with a human-like
+            # pointer path (P1-5): hCaptcha scores checkbox click dynamics as
+            # part of motionData, so a raw teleport-click is a bot tell — reuse
+            # the same humanised path the tile clicks use. A failure here is a
+            # signal (managed widget / detached frame), logged not swallowed.
             try:
                 checkbox_frame = page.frame_locator(_CHECKBOX_IFRAME)
-                await checkbox_frame.locator("#checkbox").click(timeout=10_000)
+                await self._human_click_in_frame(page, checkbox_frame, "#checkbox")
             except Exception as exc:
                 log.info("hCaptcha checkbox click skipped: %s", exc)
 
@@ -427,6 +410,9 @@ class HCaptchaSolver(BaseBrowserSolver):
 
             raise RuntimeError("hCaptcha token not obtained within budget")
         finally:
+            params["_phase_challenge_ms"] = int(
+                (time.monotonic() - _challenge_started) * 1000
+            )
             await self._release_context(solve_context, solved, params)
 
     # ── real-page mode ─────────────────────────────────────────
@@ -444,7 +430,14 @@ class HCaptchaSolver(BaseBrowserSolver):
         self._stash_fingerprint_geo(solve_context, params)
         context = solve_context.context
         user_agent = solve_context.user_agent
+        # P0-1: real-page solves navigate to the *real* merchant/Stripe page,
+        # so resource interception must be OFF — a browser that aborts every
+        # CSS/font/image on a real page is one of the easiest enterprise-bot
+        # signals. Interception stays on for the synthetic injected page
+        # (_solve_once) where it's a harmless bandwidth win.
+        set_context_resource_blocking(context, False)
         solved = False
+        _challenge_started = time.monotonic()
         try:
             # WP5: defensive guard — see _solve_once for rationale.
             if (
@@ -459,7 +452,12 @@ class HCaptchaSolver(BaseBrowserSolver):
             await context.add_init_script(_build_real_page_init_script(render_options))
             page = await context.new_page()
             timeout_ms = self._config.browser_timeout * 1000
+            _page_started = time.monotonic()
             await page.goto(website_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            params["_phase_page_load_ms"] = int(
+                (time.monotonic() - _page_started) * 1000
+            )
+            _challenge_started = time.monotonic()
 
             if not params.get("isInvisible") and render_options.get("size") != "invisible":
                 await self._human_mouse(page)
@@ -473,7 +471,7 @@ class HCaptchaSolver(BaseBrowserSolver):
 
             try:
                 checkbox_frame = page.frame_locator(_CHECKBOX_IFRAME)
-                await checkbox_frame.locator("#checkbox").click(timeout=10_000)
+                await self._human_click_in_frame(page, checkbox_frame, "#checkbox")
             except Exception as exc:
                 log.info("hCaptcha checkbox click skipped (real page): %s", exc)
 
@@ -491,6 +489,9 @@ class HCaptchaSolver(BaseBrowserSolver):
 
             raise RuntimeError("hCaptcha token not obtained (real page mode)")
         finally:
+            params["_phase_challenge_ms"] = int(
+                (time.monotonic() - _challenge_started) * 1000
+            )
             await self._release_context(solve_context, solved, params)
 
     # ── challenge dispatch ─────────────────────────────────────
@@ -617,53 +618,3 @@ class HCaptchaSolver(BaseBrowserSolver):
                 pass
         return None
 
-    # ── consumption metering ───────────────────────────────────
-
-    async def _record(
-        self,
-        params: dict[str, Any],
-        sitekey: str,
-        client_key: Optional[str],
-        outcome: str,
-        started: float,
-    ) -> None:
-        if self._services is None:
-            return
-        from ..consumption.ledger import SolveRecord, estimate_cost
-
-        vision = params.get("_vision")
-        model = getattr(vision, "last_model", None)
-        in_tok = getattr(vision, "total_input_tokens", 0)
-        out_tok = getattr(vision, "total_output_tokens", 0)
-        calls = getattr(vision, "total_vision_calls", 0)
-        cost = estimate_cost(model or "local", in_tok, out_tok)
-
-        try:
-            await self._services.ledger.record(
-                SolveRecord(
-                    task_id=str(params.get("_taskId") or ""),
-                    sitekey=sitekey,
-                    task_type=params.get("type", "HCaptchaTaskProxyless"),
-                    proxy_id=params.get("_pool_proxy_id"),
-                    session_id=params.get("_sessionId"),
-                    proxy_kind=params.get("_proxyKind"),
-                    model=model,
-                    challenge_shape=params.get("_challenge_shape", "grid_select"),
-                    vision_calls=calls,
-                    input_tokens=in_tok,
-                    output_tokens=out_tok,
-                    proxy_bytes=int(params.get("_proxy_bytes", 0)),
-                    wall_ms=int((time.monotonic() - started) * 1000),
-                    outcome=outcome,
-                    est_cost_usd=cost,
-                    client_key=client_key,
-                )
-            )
-            await self._services.accounting.record(
-                sitekey,
-                outcome,
-                proxy_kind=params.get("_proxyKind"),
-                model=model,
-            )
-        except Exception as exc:  # metering must never fail a solve
-            log.debug("ledger record failed: %s", exc)

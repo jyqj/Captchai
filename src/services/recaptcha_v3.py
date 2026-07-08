@@ -2,17 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from typing import Any
 
-from .browser_solver import (
-    BaseBrowserSolver,
-    egress_from_params,
-    fingerprint_geo_from_params,
-    has_task_proxy,
-)
+from .browser_solver import BaseBrowserSolver, has_task_proxy
 
 log = logging.getLogger(__name__)
 
@@ -61,53 +54,20 @@ class RecaptchaV3Solver(BaseBrowserSolver):
         if not has_task_proxy(params):
             params.setdefault("egress", "proxyless")
 
-        last_error: Exception | None = None
-        for attempt in range(self._config.captcha_retries):
-            started = time.monotonic()
-            try:
-                token, user_agent = await self._solve_once(
-                    website_url, website_key, page_action, params
-                )
-                await self._record(
-                    params,
-                    website_key,
-                    client_key,
-                    "ready",
-                    started,
-                    task_type=params.get("type", "RecaptchaV3TaskProxyless"),
-                    challenge_shape="widget",
-                )
-                tz, accept = fingerprint_geo_from_params(params)
-                return {
-                    "gRecaptchaResponse": token,
-                    "userAgent": user_agent,
-                    "timezoneId": tz,
-                    "acceptLanguage": accept,
-                    **egress_from_params(params),
-                }
-            except Exception as exc:
-                last_error = exc
-                await self._record(
-                    params,
-                    website_key,
-                    client_key,
-                    "failed",
-                    started,
-                    task_type=params.get("type", "RecaptchaV3TaskProxyless"),
-                    challenge_shape="widget",
-                )
-                log.warning(
-                    "Attempt %d/%d failed for %s: %s",
-                    attempt + 1,
-                    self._config.captcha_retries,
-                    website_url,
-                    exc,
-                )
-                if attempt < self._config.captcha_retries - 1:
-                    await asyncio.sleep(2)
-
-        raise RuntimeError(
-            f"Failed after {self._config.captcha_retries} attempts: {last_error}"
+        return await self._solve_with_retries(
+            params,
+            sitekey=website_key,
+            client_key=client_key,
+            attempt_fn=lambda: self._solve_once(
+                website_url, website_key, page_action, params
+            ),
+            build_solution=lambda token, ua: {
+                "gRecaptchaResponse": token,
+                "userAgent": ua,
+            },
+            provider="reCAPTCHA v3",
+            default_task_type=params.get("type", "RecaptchaV3TaskProxyless"),
+            default_challenge_shape="widget",
         )
 
     async def _solve_once(

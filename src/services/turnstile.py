@@ -20,20 +20,14 @@ Key correctness details for real production widgets:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import time
-from typing import Any, Optional
+from typing import Any
 
 from playwright.async_api import Route
 
-from .browser_solver import (
-    BaseBrowserSolver,
-    egress_from_params,
-    fingerprint_geo_from_params,
-)
-from .captcha_errors import CaptchaError, classify_widget_error
+from .browser_solver import BaseBrowserSolver
+from .captcha_errors import classify_widget_error
 
 log = logging.getLogger(__name__)
 
@@ -102,56 +96,17 @@ class TurnstileSolver(BaseBrowserSolver):
         if params.get("chlPageData"):
             render_options["chlPageData"] = params["chlPageData"]
 
-        last_error: Exception | None = None
-        for attempt in range(self._config.captcha_retries):
-            started = time.monotonic()
-            try:
-                token, user_agent = await self._solve_once(
-                    website_url, website_key, render_options, params
-                )
-                await self._record(
-                    params, website_key, client_key, "ready", started
-                )
-                tz, accept = fingerprint_geo_from_params(params)
-                return {
-                    "token": token,
-                    "userAgent": user_agent,
-                    "timezoneId": tz,
-                    "acceptLanguage": accept,
-                    **egress_from_params(params),
-                }
-            except CaptchaError as exc:
-                last_error = exc
-                await self._record(
-                    params, website_key, client_key, exc.outcome, started
-                )
-                log.warning(
-                    "Turnstile attempt %d/%d: %s (retryable=%s)",
-                    attempt + 1,
-                    self._config.captcha_retries,
-                    exc,
-                    exc.retryable,
-                )
-                if not exc.retryable:
-                    raise
-                if attempt < self._config.captcha_retries - 1:
-                    await asyncio.sleep(2)
-            except Exception as exc:
-                last_error = exc
-                await self._record(
-                    params, website_key, client_key, "failed", started
-                )
-                log.warning(
-                    "Turnstile attempt %d/%d failed: %s",
-                    attempt + 1,
-                    self._config.captcha_retries,
-                    exc,
-                )
-                if attempt < self._config.captcha_retries - 1:
-                    await asyncio.sleep(2)
-
-        raise RuntimeError(
-            f"Turnstile failed after {self._config.captcha_retries} attempts: {last_error}"
+        return await self._solve_with_retries(
+            params,
+            sitekey=website_key,
+            client_key=client_key,
+            attempt_fn=lambda: self._solve_once(
+                website_url, website_key, render_options, params
+            ),
+            build_solution=lambda token, ua: {"token": token, "userAgent": ua},
+            provider="Turnstile",
+            default_task_type=params.get("type", "TurnstileTaskProxyless"),
+            default_challenge_shape="widget",
         )
 
     async def _solve_once(
@@ -188,9 +143,14 @@ class TurnstileSolver(BaseBrowserSolver):
                 frame = page.frame_locator(
                     'iframe[src*="challenges.cloudflare.com"]'
                 )
-                await frame.locator(
-                    'input[type="checkbox"], label'
-                ).first.click(timeout=5_000)
+                # Human-like checkbox click (P1-5): Turnstile also scores the
+                # pointer dynamics of the checkbox interaction.
+                await self._human_click_in_frame(
+                    page,
+                    frame,
+                    'input[type="checkbox"], label',
+                    timeout_ms=5_000,
+                )
             except Exception as exc:
                 log.info("Turnstile checkbox click skipped (managed widget?): %s", exc)
 
@@ -204,7 +164,7 @@ class TurnstileSolver(BaseBrowserSolver):
         finally:
             await self._release_context(solve_context, solved, params)
 
-    async def _poll_token(self, page: Any) -> str | None:
+    async def _poll_token(self, page: Any) -> "str | None":
         """Check-first, event-driven token wait bounded by the unified budget.
 
         Returns the instant the widget callback fires (``page.wait_for_function``
@@ -237,54 +197,3 @@ class TurnstileSolver(BaseBrowserSolver):
                 # the hidden input rather than the JS callback).
                 pass
         return None
-
-    # ── consumption metering ───────────────────────────────────
-
-    async def _record(
-        self,
-        params: dict[str, Any],
-        sitekey: str,
-        client_key: Optional[str],
-        outcome: str,
-        started: float,
-    ) -> None:
-        if self._services is None:
-            return
-        from ..consumption.ledger import SolveRecord, estimate_cost
-
-        vision = params.get("_vision")
-        model = getattr(vision, "last_model", None)
-        in_tok = getattr(vision, "total_input_tokens", 0)
-        out_tok = getattr(vision, "total_output_tokens", 0)
-        calls = getattr(vision, "total_vision_calls", 0)
-        cost = estimate_cost(model or "local", in_tok, out_tok)
-
-        try:
-            await self._services.ledger.record(
-                SolveRecord(
-                    task_id=str(params.get("_taskId") or ""),
-                    sitekey=sitekey,
-                    task_type=params.get("type", "TurnstileTaskProxyless"),
-                    proxy_id=params.get("_pool_proxy_id"),
-                    session_id=params.get("_sessionId"),
-                    proxy_kind=params.get("_proxyKind"),
-                    model=model,
-                    challenge_shape="widget",
-                    vision_calls=calls,
-                    input_tokens=in_tok,
-                    output_tokens=out_tok,
-                    proxy_bytes=int(params.get("_proxy_bytes", 0)),
-                    wall_ms=int((time.monotonic() - started) * 1000),
-                    outcome=outcome,
-                    est_cost_usd=cost,
-                    client_key=client_key,
-                )
-            )
-            await self._services.accounting.record(
-                sitekey,
-                outcome,
-                proxy_kind=params.get("_proxyKind"),
-                model=model,
-            )
-        except Exception as exc:  # metering must never fail a solve
-            log.debug("ledger record failed: %s", exc)

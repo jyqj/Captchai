@@ -32,14 +32,35 @@ class Config:
     cloud_base_url: str
     cloud_api_key: str
     cloud_model: str
+    # Speech-to-text model for the reCAPTCHA v2 audio-challenge path. A chat
+    # model can't transcribe audio, so this points at a Whisper-family model on
+    # the same OpenAI-compatible endpoint (``audio.transcriptions``).
+    cloud_audio_model: str
 
     # ── Local model (self-hosted via SGLang / vLLM) ──
     local_base_url: str
     local_api_key: str
     local_model: str
 
+    # Per-backend max concurrent model calls (0 = unlimited). Browser solves and
+    # pure-vision tasks both call the model layer, and self-consistency voting
+    # fans out ``vision_vote_samples`` concurrent calls per solve — so without a
+    # bound the peak is ``browser_concurrency × vote_samples`` simultaneous cloud
+    # calls, which trips cloud-provider rate limits. The cloud backend gets a
+    # tight default; the self-hosted local backend defaults to unlimited.
+    cloud_max_concurrency: int
+    local_max_concurrency: int
+    # When a routed backend call fails with a *connection* error (service down,
+    # timeout, refused), retry once on the other backend (local↔cloud) instead
+    # of bubbling the failure up as a solve failure.
+    model_connection_fallback: bool
+
     captcha_retries: int
     captcha_timeout: int
+    # Retry backoff between retryable attempts: ``base * 2**attempt`` seconds,
+    # capped at ``max``, plus up to 25% jitter. Replaces the fixed 2s sleep.
+    retry_backoff_base: float
+    retry_backoff_max: float
 
     # Playwright browser
     browser_headless: bool
@@ -113,6 +134,13 @@ class Config:
     # Per-proxy bandwidth quota in GB; 0 disables. A proxy that exceeds it is
     # burned (removed from rotation) to cap metered residential/mobile spend.
     proxy_max_gb: float
+    # WP-geo: probe a pool proxy's exit-IP country on its first checkout (through
+    # the proxy itself) and cache the derived timezone/locale, so geo alignment
+    # no longer depends on a manual |country= annotation. Best-effort; a probe
+    # failure leaves the proxy's geo unset (random coherent fingerprint, as
+    # before). ``proxy_geo_probe_url`` is the IP-geo endpoint to hit.
+    proxy_geo_probe: bool
+    proxy_geo_probe_url: str
     token_cache_ttl: int  # seconds
     # Playwright runtime flavour: "chromium" (stock) | "rebrowser" | "camoufox".
     # Enterprise hCaptcha deployments should set BROWSER_RUNTIME=camoufox (a
@@ -141,6 +169,12 @@ class Config:
     # Set to false in tests / dev to relax the requirement (any pool proxy
     # is accepted, or a task proxy if explicitly supplied).
     enterprise_require_residential: bool
+    # When true, enterprise hCaptcha solves use a fresh browser context per
+    # solve instead of a reused warm session, so a single sticky proxy's cookie
+    # jar / fingerprint isn't reused to repeatedly hit the same sitekey (a
+    # pattern enterprise risk models cluster on). Off by default (warm-session
+    # reuse is faster); turn on for the hardest enterprise targets.
+    enterprise_fresh_context: bool
 
     # ── Human behavior / real-page mode ──
     hcaptcha_real_page: bool
@@ -195,6 +229,7 @@ def load_config() -> Config:
             "CLOUD_MODEL",
             os.environ.get("CAPTCHA_MODEL", "gpt-5.4"),
         ),
+        cloud_audio_model=os.environ.get("CLOUD_AUDIO_MODEL", "whisper-1"),
         # Local model
         local_base_url=os.environ.get(
             "LOCAL_BASE_URL",
@@ -208,8 +243,18 @@ def load_config() -> Config:
             "LOCAL_MODEL",
             os.environ.get("CAPTCHA_MULTIMODAL_MODEL", "Qwen/Qwen3.5-2B"),
         ),
+        cloud_max_concurrency=int(os.environ.get("CLOUD_MAX_CONCURRENCY", "4")),
+        local_max_concurrency=int(os.environ.get("LOCAL_MAX_CONCURRENCY", "0")),
+        model_connection_fallback=os.environ.get(
+            "MODEL_CONNECTION_FALLBACK", "true"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
         captcha_retries=int(os.environ.get("CAPTCHA_RETRIES", "3")),
         captcha_timeout=int(os.environ.get("CAPTCHA_TIMEOUT", "30")),
+        retry_backoff_base=float(os.environ.get("RETRY_BACKOFF_BASE", "1.0")),
+        retry_backoff_max=float(os.environ.get("RETRY_BACKOFF_MAX", "8.0")),
         browser_headless=os.environ.get("BROWSER_HEADLESS", "true").strip().lower()
         in {"1", "true", "yes"},
         browser_timeout=int(os.environ.get("BROWSER_TIMEOUT", "30")),
@@ -289,6 +334,11 @@ def load_config() -> Config:
             os.environ.get("PROXY_MAX_CONSECUTIVE_FAILS", "3")
         ),
         proxy_max_gb=_optional_float(os.environ.get("PROXY_MAX_GB")) or 0.0,
+        proxy_geo_probe=os.environ.get("PROXY_GEO_PROBE", "true").strip().lower()
+        in {"1", "true", "yes"},
+        proxy_geo_probe_url=os.environ.get(
+            "PROXY_GEO_PROBE_URL", "http://ip-api.com/json"
+        ),
         token_cache_ttl=int(os.environ.get("TOKEN_CACHE_TTL", "110")),
         browser_runtime=os.environ.get("BROWSER_RUNTIME", "chromium").strip().lower(),
         browser_runtime_strict=os.environ.get("BROWSER_RUNTIME_STRICT", "false")
@@ -306,6 +356,12 @@ def load_config() -> Config:
         # "false"/"0" to relax for tests / dev).
         enterprise_require_residential=os.environ.get(
             "ENTERPRISE_REQUIRE_RESIDENTIAL", "true"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        enterprise_fresh_context=os.environ.get(
+            "ENTERPRISE_FRESH_CONTEXT", "false"
         )
         .strip()
         .lower()

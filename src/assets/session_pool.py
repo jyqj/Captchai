@@ -160,6 +160,8 @@ class SessionPool:
                 seed=proxy.id if proxy else None,
                 timezone_id=proxy.timezone if proxy else None,
                 locale=proxy.locale if proxy else None,
+                # P1-4: a mobile pool proxy gets an Android Chrome fingerprint.
+                mobile=bool(proxy and getattr(proxy, "kind", None) == "mobile"),
             )
             context, user_agent = await self._factory(fingerprint, proxy)
         except BaseException:

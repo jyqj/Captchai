@@ -485,7 +485,11 @@ def test_redis_proxy_pool_kind_list_filter() -> None:
                 _flush_prefix(prefix + "2")
             # has_available also honours the kind list.
             assert pool.has_available(kind=["residential", "mobile"]) is True
-            assert pool.has_available(kind=["residential", "datacenter"]) is False
+            # This pool holds a datacenter + a mobile proxy, so a list that
+            # matches neither (residential only) returns False; a list that
+            # includes datacenter matches the dc proxy and returns True.
+            assert pool.has_available(kind=["residential"]) is False
+            assert pool.has_available(kind=["residential", "datacenter"]) is True
         finally:
             await pool.close()
             _flush_prefix(prefix)

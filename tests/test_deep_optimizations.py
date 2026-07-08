@@ -199,6 +199,74 @@ def test_grid_select_falls_back_to_locator_click_without_page() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# P1-5: checkbox click uses the human-like pointer path (not a teleport click)
+# --------------------------------------------------------------------------- #
+
+
+def test_checkbox_click_uses_human_path_when_enabled() -> None:
+    """_human_click_in_frame moves page.mouse along a path + presses (no teleport)."""
+    async def run() -> None:
+        from src.services.browser_solver import BaseBrowserSolver
+
+        class _Loc:
+            async def bounding_box(self):
+                return {"x": 30.0, "y": 40.0, "width": 24.0, "height": 24.0}
+
+            @property
+            def first(self):
+                return self
+
+            async def click(self, timeout=None):
+                raise AssertionError("should use human path, not locator.click")
+
+        class _Frame:
+            def locator(self, selector):
+                return _Loc()
+
+        page = _RecordingPage()
+        config = SimpleNamespace(human_mouse_enabled=True, human_mouse_jitter_ms=0)
+        solver = BaseBrowserSolver(config, manager=SimpleNamespace(), services=None)
+        await solver._human_click_in_frame(page, _Frame(), "#checkbox")
+        # Real pointer travel + a real press, exactly like the tile clicks.
+        assert len(page.mouse.moves) > 5
+        assert page.mouse.downs == 1 and page.mouse.ups == 1
+
+    asyncio.run(run())
+
+
+def test_checkbox_click_falls_back_to_locator_click_when_disabled() -> None:
+    """With humanisation off, the checkbox uses a plain locator.click()."""
+    async def run() -> None:
+        from src.services.browser_solver import BaseBrowserSolver
+
+        clicked = {"n": 0}
+
+        class _Loc:
+            @property
+            def first(self):
+                return self
+
+            async def bounding_box(self):
+                raise AssertionError("must not read geometry when disabled")
+
+            async def click(self, timeout=None):
+                clicked["n"] += 1
+
+        class _Frame:
+            def locator(self, selector):
+                return _Loc()
+
+        page = _RecordingPage()
+        config = SimpleNamespace(human_mouse_enabled=False, human_mouse_jitter_ms=0)
+        solver = BaseBrowserSolver(config, manager=SimpleNamespace(), services=None)
+        await solver._human_click_in_frame(page, _Frame(), "#checkbox")
+        assert clicked["n"] == 1
+        assert page.mouse.downs == 0
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
 # client-hint coherence
 # --------------------------------------------------------------------------- #
 
@@ -879,6 +947,50 @@ def test_effective_user_agent_resolution() -> None:
     assert chrome._effective_user_agent("ChromeUA", None) == "ChromeUA"
 
 
+# --------------------------------------------------------------------------- #
+# P1-3: startup engine-version validation (stale _CHROME_MAJOR can't rot silently)
+# --------------------------------------------------------------------------- #
+
+
+def test_engine_version_match_is_silent_ok() -> None:
+    """A live engine major equal to the pinned Chrome major passes validation."""
+    from src.assets.fingerprint import chrome_major
+
+    async def run() -> None:
+        mgr = BrowserManager(_runtime_config("chromium", strict=True))
+        mgr._browser = SimpleNamespace(version=f"{chrome_major()}.0.7827.55")
+        # Strict mode + matching version → no raise.
+        await mgr._validate_engine_version()
+
+    asyncio.run(run())
+
+
+def test_engine_version_mismatch_raises_in_strict_mode() -> None:
+    """A drifted engine major fails fast under BROWSER_RUNTIME_STRICT."""
+    async def run() -> None:
+        mgr = BrowserManager(_runtime_config("chromium", strict=True))
+        mgr._browser = SimpleNamespace(version="131.0.6778.86")  # stale
+        try:
+            await mgr._validate_engine_version()
+            raise AssertionError("expected a version-mismatch RuntimeError")
+        except RuntimeError as exc:
+            assert "131" in str(exc)
+            assert "STRICT" in str(exc).upper()
+
+    asyncio.run(run())
+
+
+def test_engine_version_mismatch_warns_in_lenient_mode() -> None:
+    """A drifted engine major only warns (doesn't raise) when strict is off."""
+    async def run() -> None:
+        mgr = BrowserManager(_runtime_config("chromium", strict=False))
+        mgr._browser = SimpleNamespace(version="131.0.6778.86")
+        # Lenient mode → no raise even on mismatch.
+        await mgr._validate_engine_version()
+
+    asyncio.run(run())
+
+
 def test_chromium_context_still_injects_stealth_and_client_hints() -> None:
     """Regression: the camoufox branch must not change the Chromium path."""
     mgr = BrowserManager(_ctx_config("chromium"))
@@ -898,6 +1010,8 @@ if __name__ == "__main__":
     test_human_click_returns_none_without_mouse()
     test_grid_select_uses_human_path_when_page_present()
     test_grid_select_falls_back_to_locator_click_without_page()
+    test_checkbox_click_uses_human_path_when_enabled()
+    test_checkbox_click_falls_back_to_locator_click_when_disabled()
     test_client_hints_match_ua_version_and_platform()
     test_context_kwargs_carries_client_hints()
     test_stealth_js_useragentdata_matches_ua()
@@ -920,5 +1034,8 @@ if __name__ == "__main__":
     test_camoufox_context_skips_chromium_spoofing()
     test_camoufox_context_honours_forced_ua()
     test_effective_user_agent_resolution()
+    test_engine_version_match_is_silent_ok()
+    test_engine_version_mismatch_raises_in_strict_mode()
+    test_engine_version_mismatch_warns_in_lenient_mode()
     test_chromium_context_still_injects_stealth_and_client_hints()
     print("ok")

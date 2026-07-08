@@ -159,6 +159,68 @@ def test_fingerprint_proxy_locale_threads_match_languages_first() -> None:
     assert fp.languages[1] == "ja"
 
 
+# --------------------------------------------------------------------------- #
+# P1-4: mobile (Android Chrome) fingerprint for mobile-proxy egress
+# --------------------------------------------------------------------------- #
+
+
+def test_mobile_fingerprint_is_android_chrome() -> None:
+    """mobile=True draws an Android Chrome profile (mobile UA, Android platform)."""
+    fp = generate_fingerprint(seed="m1", mobile=True)
+    assert fp.is_mobile is True
+    assert "Android" in fp.user_agent
+    assert "Mobile Safari" in fp.user_agent
+    assert fp.platform == "Linux armv8l"
+    # Mobile viewport is phone-sized, not a desktop resolution.
+    assert fp.screen_width <= 480
+    assert fp.device_scale_factor >= 2.0
+
+
+def test_mobile_client_hints_signal_mobile_and_android() -> None:
+    """Mobile fingerprint emits sec-ch-ua-mobile: ?1 and platform Android."""
+    from src.assets.fingerprint import client_hint_headers
+
+    fp = generate_fingerprint(seed="m2", mobile=True)
+    headers = client_hint_headers(fp)
+    assert headers["sec-ch-ua-mobile"] == "?1"
+    assert headers["sec-ch-ua-platform"] == '"Android"'
+
+
+def test_mobile_context_kwargs_have_touch_and_dpr() -> None:
+    """Mobile context is touch-enabled, is_mobile, high-DPR."""
+    from src.assets.fingerprint import context_kwargs
+
+    fp = generate_fingerprint(seed="m3", mobile=True)
+    kwargs = context_kwargs(fp)
+    assert kwargs["is_mobile"] is True
+    assert kwargs["has_touch"] is True
+    assert kwargs["device_scale_factor"] >= 2.0
+
+
+def test_mobile_stealth_js_sets_touch_and_mobile_uadata() -> None:
+    """Mobile stealth JS spoofs maxTouchPoints>0 and userAgentData.mobile=true."""
+    from src.assets.fingerprint import build_stealth_js
+
+    fp = generate_fingerprint(seed="m4", mobile=True)
+    js = build_stealth_js(fp)
+    assert "maxTouchPoints" in js
+    assert "mobile: true" in js
+    # Desktop must remain ?0 / mobile: false.
+    desktop = build_stealth_js(generate_fingerprint(seed="d4"))
+    assert "mobile: false" in desktop
+
+
+def test_mobile_fingerprint_deterministic_with_seed() -> None:
+    """A seeded mobile fingerprint is stable (sticky mobile proxy identity)."""
+    a = generate_fingerprint(seed="sticky-mobile", mobile=True)
+    b = generate_fingerprint(seed="sticky-mobile", mobile=True)
+    assert a == b
+    # Desktop and mobile draws for the same seed differ (different pools).
+    d = generate_fingerprint(seed="sticky-mobile", mobile=False)
+    assert d.is_mobile is False
+    assert a.user_agent != d.user_agent
+
+
 def test_build_stealth_js_contains_fp_values() -> None:
     fp = generate_fingerprint(seed="stealth")
     js = build_stealth_js(fp)
@@ -169,6 +231,19 @@ def test_build_stealth_js_contains_fp_values() -> None:
     assert str(fp.hardware_concurrency) in js
     assert str(fp.device_memory) in js
     assert fp.languages[0] in js
+
+
+def test_build_stealth_js_is_cached_by_identity() -> None:
+    """Two builds for the same fingerprint identity reuse the cached script."""
+    from src.assets.fingerprint import build_stealth_js
+
+    fp1 = generate_fingerprint(seed="cache-a")
+    fp2 = generate_fingerprint(seed="cache-a")  # identical identity
+    js1 = build_stealth_js(fp1)
+    js2 = build_stealth_js(fp2)
+    # Same content and the same cached object (identity), not a re-render.
+    assert js1 == js2
+    assert js1 is js2
 
 
 def test_build_stealth_js_plugins_are_realistic_objects() -> None:
@@ -568,6 +643,143 @@ def test_proxy_no_creds_with_metadata() -> None:
     assert p.timezone == "Asia/Tokyo"
     assert p.locale == "ja-JP"
     assert p.kind == "mobile"
+
+
+# --------------------------------------------------------------------------- #
+# P0-2a: sticky-session support (make sticky_session_id an actually-used field)
+# --------------------------------------------------------------------------- #
+
+
+def test_proxy_session_metadata_injects_username_placeholder() -> None:
+    """``|session=abc`` substitutes the {session} placeholder in the username."""
+    p = proxy_from_params(
+        {"proxy": "http://user-{session}:pass@gw.example.com:8080|session=abc123"}
+    )
+    assert p is not None
+    assert p.sticky_session_id == "abc123"
+    pw = p.playwright_proxy()
+    assert pw["username"] == "user-abc123"
+    # The gateway host is untouched; only the credential token changes.
+    assert pw["server"] == "http://gw.example.com:8080"
+
+
+def test_proxy_sticky_true_autogenerates_stable_session() -> None:
+    """``|sticky=true`` auto-generates a session id that is stable across calls."""
+    p = proxy_from_params(
+        {"proxy": "http://u-{session}:p@gw:8080|sticky=true|kind=residential"}
+    )
+    assert p is not None
+    assert p.sticky_session_id  # auto-generated, non-empty
+    first = p.playwright_proxy()["username"]
+    second = p.playwright_proxy()["username"]
+    # Same exit IP across calls: the substituted username is stable.
+    assert first == second
+    assert p.sticky_session_id in first
+
+
+def test_proxy_placeholder_without_metadata_lazy_generates_once() -> None:
+    """A {session} placeholder with no explicit session lazily pins one, stably."""
+    p = proxy_from_params({"proxy": "http://u_{session}:p@gw:8080"})
+    assert p is not None
+    assert p.sticky_session_id is None  # not generated until first use
+    first = p.playwright_proxy()["username"]
+    assert p.sticky_session_id is not None  # generated on first playwright_proxy()
+    second = p.playwright_proxy()["username"]
+    assert first == second  # stable thereafter
+
+
+def test_proxy_no_placeholder_leaves_username_untouched() -> None:
+    """No {session} placeholder → username is unchanged (no regression)."""
+    p = proxy_from_params({"proxy": "http://user:pass@gw:8080|sticky=true"})
+    assert p is not None
+    # sticky=true set an id, but with no placeholder the username is literal.
+    assert p.playwright_proxy()["username"] == "user"
+
+
+# --------------------------------------------------------------------------- #
+# P0-2b: exit-IP geo probing (no manual annotation needed)
+# --------------------------------------------------------------------------- #
+
+
+def test_geo_probe_resolves_country_and_derives_tz_locale() -> None:
+    """A probe that returns countryCode=DE derives Europe/Berlin + de-DE."""
+    from src.assets.geo_probe import probe_proxy_geo
+
+    async def fake_fetch(url, proxy_url, timeout):
+        # The probe egresses through the proxy's credentials.
+        assert proxy_url is not None
+        return {"countryCode": "DE"}
+
+    async def scenario():
+        proxy = ProxyAsset(id="p", server="http://user:pass@gw:8080")
+        applied = await probe_proxy_geo(
+            proxy, url="http://ip-api.com/json", fetch=fake_fetch
+        )
+        assert applied is True
+        assert proxy.country == "DE"
+        assert proxy.timezone == "Europe/Berlin"
+        assert proxy.locale == "de-DE"
+        assert proxy.geo_probed is True
+
+    asyncio.run(scenario())
+
+
+def test_geo_probe_marks_probed_even_on_failure() -> None:
+    """A failed/empty probe still sets geo_probed so it isn't retried."""
+    from src.assets.geo_probe import probe_proxy_geo
+
+    async def fake_fetch(url, proxy_url, timeout):
+        return None  # simulate proxy down / non-200 / bad JSON
+
+    async def scenario():
+        proxy = ProxyAsset(id="p", server="http://gw:8080")
+        applied = await probe_proxy_geo(
+            proxy, url="http://ip-api.com/json", fetch=fake_fetch
+        )
+        assert applied is False
+        assert proxy.country is None  # no regression: geo stays unset
+        assert proxy.geo_probed is True  # but won't be re-probed
+
+    asyncio.run(scenario())
+
+
+def test_geo_probe_skips_manually_annotated_proxy() -> None:
+    """A proxy with a manual |country= annotation is never probed."""
+    from src.assets.geo_probe import probe_proxy_geo
+
+    calls = {"n": 0}
+
+    async def fake_fetch(url, proxy_url, timeout):
+        calls["n"] += 1
+        return {"countryCode": "US"}
+
+    async def scenario():
+        proxy = proxy_from_params({"proxy": "http://gw:8080|country=DE"})
+        applied = await probe_proxy_geo(
+            proxy, url="http://ip-api.com/json", fetch=fake_fetch
+        )
+        assert applied is False
+        assert calls["n"] == 0  # manual annotation wins, no network probe
+        assert proxy.country == "DE"
+
+    asyncio.run(scenario())
+
+
+def test_set_geo_persists_on_pool() -> None:
+    """ProxyPool.set_geo writes probed geo back onto the stored proxy."""
+    async def scenario():
+        pool = ProxyPool()
+        pool.add(ProxyAsset(id="p", server="http://gw:8080"))
+        await pool.set_geo(
+            "p", country="JP", timezone="Asia/Tokyo", locale="ja-JP"
+        )
+        row = pool.snapshot()[0]
+        assert row["country"] == "JP"
+        assert row["timezone"] == "Asia/Tokyo"
+        assert row["locale"] == "ja-JP"
+        assert row["geo_probed"] is True
+
+    asyncio.run(scenario())
 
 
 def test_pool_snapshot_includes_geo_fields() -> None:

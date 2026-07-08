@@ -298,6 +298,68 @@ def test_build_context_resource_route_ordered_before_solver_fulfill() -> None:
     assert ctx.routes[1][0] == "https://example.com/checkout"
 
 
+# --------------------------------------------------------------------------- #
+# P0-1: per-context resource-blocking toggle (real-page / enterprise safety)
+# --------------------------------------------------------------------------- #
+
+
+class _FakeRoute:
+    """Minimal Route stand-in exposing request.frame.page.context + resource_type."""
+
+    def __init__(self, context, url: str, resource_type: str) -> None:
+        page = SimpleNamespace(context=context)
+        frame = SimpleNamespace(page=page)
+        self.request = SimpleNamespace(
+            url=url, resource_type=resource_type, frame=frame
+        )
+        self.continued = False
+        self.aborted = False
+
+    async def continue_(self) -> None:
+        self.continued = True
+
+    async def abort(self) -> None:
+        self.aborted = True
+
+
+def test_resource_handler_aborts_blockable_type_by_default() -> None:
+    """Default (blocking on): an image on a non-allowlisted host is aborted."""
+    import asyncio
+
+    from src.assets.fingerprint import generate_fingerprint
+    from src.services.browser import BrowserManager
+
+    manager = BrowserManager(_resource_block_config(True))
+    manager._browser = _RecordingFakeBrowser()
+    ctx = asyncio.run(manager._build_context(generate_fingerprint(seed="rb1"), None))
+
+    route = _FakeRoute(ctx, "https://cdn.example.com/x.png", "image")
+    asyncio.run(manager._resource_handler(route))
+    assert route.aborted is True
+    assert route.continued is False
+
+
+def test_resource_handler_passes_everything_when_context_blocking_off() -> None:
+    """P0-1: set_context_resource_blocking(ctx, False) → blockable types pass through."""
+    import asyncio
+
+    from src.assets.fingerprint import generate_fingerprint
+    from src.services.browser import BrowserManager, set_context_resource_blocking
+
+    manager = BrowserManager(_resource_block_config(True))
+    manager._browser = _RecordingFakeBrowser()
+    ctx = asyncio.run(manager._build_context(generate_fingerprint(seed="rb2"), None))
+
+    # Real-page / enterprise solve disables blocking on the context.
+    set_context_resource_blocking(ctx, False)
+
+    route = _FakeRoute(ctx, "https://cdn.example.com/style.css", "stylesheet")
+    asyncio.run(manager._resource_handler(route))
+    # The real page's own CSS is NOT aborted — it loads like a human browser.
+    assert route.continued is True
+    assert route.aborted is False
+
+
 if __name__ == "__main__":
     test_egress_proxyless_strips_task_proxy()
     test_auto_with_task_proxy_binds_task_proxy()
@@ -312,4 +374,6 @@ if __name__ == "__main__":
     test_build_context_registers_resource_route_when_enabled()
     test_build_context_does_not_register_resource_route_when_disabled()
     test_build_context_resource_route_ordered_before_solver_fulfill()
+    test_resource_handler_aborts_blockable_type_by_default()
+    test_resource_handler_passes_everything_when_context_blocking_off()
     print("ok")

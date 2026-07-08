@@ -30,22 +30,36 @@ class FingerprintProfile:
     webgl_renderer: str
     timezone_id: str
     locale: str
+    # P1-4: mobile (Android Chrome) profile. A carrier / mobile proxy egress
+    # paired with a desktop Chrome fingerprint (sec-ch-ua-mobile: ?0, no touch)
+    # is an obvious contradiction; when the pool proxy is ``kind="mobile"`` the
+    # solver draws a mobile fingerprint so the UA, client hints (?1 + Android),
+    # touch capability, and viewport all agree with the carrier IP.
+    is_mobile: bool = False
+    device_scale_factor: float = 1.0
 
 
 # Chrome major version presented by every profile. This MUST track the major
-# version of the Chromium that Playwright bundles (playwright==1.49.1 ships
-# Chromium build 1148 == Chrome 131). Pinning the whole pool to the engine's
-# real major version is deliberate: a UA / client-hint version that disagrees
-# with the actual browser build is a stronger detection signal than a uniform,
+# version of the Chromium that Playwright bundles (playwright==1.61.0 ships
+# Chromium 149.0.7827.55). Pinning the whole pool to the engine's real major
+# version is deliberate: a UA / client-hint version that disagrees with the
+# actual browser build is a stronger detection signal than a uniform,
 # engine-matched version. Bump this in lockstep with the Playwright upgrade in
-# requirements.txt; GPU / OS / screen / locale still vary per profile for
-# diversity.
-_CHROME_MAJOR = "131"
+# requirements.txt; ``BrowserManager`` validates the running engine's major
+# against this value at startup and warns (or fails, in strict mode) on drift
+# so a stale pin can't silently rot into a "Chrome/131 in 2026" signal. GPU /
+# OS / screen / locale still vary per profile for diversity.
+_CHROME_MAJOR = "149"
 # A recent, plausible full build for the pinned major (surfaced only via
 # userAgentData high-entropy values; the UA string keeps the ``.0.0.0`` form
 # Chrome uses in its reduced User-Agent).
-_CHROME_FULL_VERSION = f"{_CHROME_MAJOR}.0.6778.86"
-# GREASE brand + version Chrome 131 emits in sec-ch-ua / userAgentData.brands.
+_CHROME_FULL_VERSION = "149.0.7827.55"
+
+
+def chrome_major() -> str:
+    """The Chrome major version the fingerprint pool presents (see ``_CHROME_MAJOR``)."""
+    return _CHROME_MAJOR
+# GREASE brand + version Chrome emits in sec-ch-ua / userAgentData.brands.
 _UA_GREASE = ("Not_A Brand", "24")
 
 
@@ -62,6 +76,14 @@ def _mac_ua(major: str) -> str:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         f"Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
+def _android_ua(major: str, device: str) -> str:
+    return (
+        f"Mozilla/5.0 (Linux; Android 14; {device}) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.0.0 Mobile Safari/537.36"
     )
 
 
@@ -115,6 +137,41 @@ _MAC_PROFILES = [
 
 _ALL_PROFILES = _WINDOWS_PROFILES + _MAC_PROFILES
 
+# Coherent Android Chrome profiles. navigator.platform on Android Chrome is
+# "Linux armv8l"; the GPU is a mobile SoC reported through ANGLE's OpenGL ES
+# backend (Adreno / Mali / Xclipse), matching the ``Mobile Safari`` UA. Each
+# entry pairs a plausible device model with its GPU + CSS viewport + DPR.
+_ANDROID_PROFILES = [
+    {
+        "device": "Pixel 8",
+        "webgl_vendor": "Google Inc. (Qualcomm)",
+        "webgl_renderer": "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)",
+        "screen": (412, 915),
+        "dpr": 2.625,
+    },
+    {
+        "device": "SM-S918B",  # Galaxy S23 Ultra
+        "webgl_vendor": "Google Inc. (Qualcomm)",
+        "webgl_renderer": "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)",
+        "screen": (384, 824),
+        "dpr": 3.0,
+    },
+    {
+        "device": "SM-A546B",  # Galaxy A54 (Exynos / Mali)
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G68 MC4, OpenGL ES 3.2)",
+        "screen": (360, 780),
+        "dpr": 3.0,
+    },
+    {
+        "device": "Pixel 7a",
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G710, OpenGL ES 3.2)",
+        "screen": (412, 892),
+        "dpr": 2.625,
+    },
+]
+
 _SCREEN_SIZES = [
     (1920, 1080),
     (2560, 1440),
@@ -125,6 +182,9 @@ _SCREEN_SIZES = [
 
 _HARDWARE_CONCURRENCY = [4, 8, 12, 16]
 _DEVICE_MEMORY = [4, 8, 16]
+# Mobile SoCs report fewer logical cores / less device memory than desktops.
+_MOBILE_HARDWARE_CONCURRENCY = [6, 8]
+_MOBILE_DEVICE_MEMORY = [4, 6, 8]
 
 _LANGUAGE_SETS = {
     "en-US": ["en-US", "en"],
@@ -172,6 +232,7 @@ def generate_fingerprint(
     seed: Optional[str] = None,
     timezone_id: Optional[str] = None,
     locale: Optional[str] = None,
+    mobile: bool = False,
 ) -> FingerprintProfile:
     """Pick a coherent, realistic fingerprint.
 
@@ -179,15 +240,42 @@ def generate_fingerprint(
     single profile so they stay mutually consistent. When ``seed`` is given the
     result is fully deterministic (used by tests and for pinning a fingerprint
     to a sticky proxy). ``timezone_id`` / ``locale`` override the derived values.
+
+    ``mobile=True`` draws from the Android Chrome profile pool instead of the
+    desktop pool, so a carrier / mobile-proxy egress gets a mobile UA, an
+    Android platform, a mobile GPU, a phone-sized viewport, and (via
+    ``client_hint_headers`` / ``build_stealth_js``) ``sec-ch-ua-mobile: ?1`` +
+    touch capability — closing the desktop-fingerprint-on-a-mobile-IP
+    contradiction.
     """
     rng = _rng(seed)
 
-    profile = rng.choice(_ALL_PROFILES)
     resolved_locale = locale or rng.choice(list(_LANGUAGE_SETS.keys()))
     languages = _LANGUAGE_SETS.get(resolved_locale, ["en-US", "en"])
     resolved_tz = timezone_id or _LOCALE_TIMEZONES.get(
         resolved_locale, "America/New_York"
     )
+
+    if mobile:
+        profile = rng.choice(_ANDROID_PROFILES)
+        width, height = profile["screen"]
+        return FingerprintProfile(
+            user_agent=_android_ua(_CHROME_MAJOR, profile["device"]),
+            platform="Linux armv8l",
+            languages=list(languages),
+            hardware_concurrency=rng.choice(_MOBILE_HARDWARE_CONCURRENCY),
+            device_memory=rng.choice(_MOBILE_DEVICE_MEMORY),
+            screen_width=width,
+            screen_height=height,
+            webgl_vendor=profile["webgl_vendor"],
+            webgl_renderer=profile["webgl_renderer"],
+            timezone_id=resolved_tz,
+            locale=resolved_locale,
+            is_mobile=True,
+            device_scale_factor=float(profile["dpr"]),
+        )
+
+    profile = rng.choice(_ALL_PROFILES)
     width, height = rng.choice(_SCREEN_SIZES)
 
     return FingerprintProfile(
@@ -229,8 +317,20 @@ def _chrome_major_from_ua(user_agent: str) -> str:
     return m.group(1) if m else _CHROME_MAJOR
 
 
-def _ch_platform(platform: str) -> str:
+def _android_model_from_ua(user_agent: str) -> str:
+    """Extract the Android device model token from a mobile UA (best-effort).
+
+    ``... (Linux; Android 14; Pixel 8) ...`` → ``"Pixel 8"``. Returns an empty
+    string when the UA isn't an Android UA.
+    """
+    m = re.search(r"Android [\d.]+; ([^)]+?)\)", user_agent or "")
+    return m.group(1).strip() if m else ""
+
+
+def _ch_platform(platform: str, *, is_mobile: bool = False) -> str:
     """Map ``navigator.platform`` to the Sec-CH-UA-Platform token."""
+    if is_mobile:
+        return "Android"
     if platform == "MacIntel":
         return "macOS"
     if platform.startswith("Linux"):
@@ -238,11 +338,19 @@ def _ch_platform(platform: str) -> str:
     return "Windows"
 
 
-def _ch_platform_version(platform: str) -> str:
-    """A plausible platformVersion for getHighEntropyValues (best-effort)."""
+def _ch_platform_version(platform: str, *, is_mobile: bool = False) -> str:
+    """A plausible platformVersion for getHighEntropyValues (best-effort).
+
+    Windows 11 reports platformVersion ``15.0.0`` (13.0.0+ = Win11) via UA-CH;
+    macOS reports a current major; Android reports its release ("14.0.0").
+    Kept roughly aligned with the UA so a high-entropy read doesn't pair a
+    modern Chrome with a stale OS.
+    """
+    if is_mobile:
+        return "14.0.0"
     if platform == "MacIntel":
-        return "13.5.0"
-    return "10.0.0"
+        return "14.6.0"
+    return "15.0.0"
 
 
 def sec_ch_ua(user_agent: str) -> str:
@@ -264,8 +372,8 @@ def client_hint_headers(fp: FingerprintProfile) -> Dict[str, str]:
     """
     return {
         "sec-ch-ua": sec_ch_ua(fp.user_agent),
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": f'"{_ch_platform(fp.platform)}"',
+        "sec-ch-ua-mobile": "?1" if fp.is_mobile else "?0",
+        "sec-ch-ua-platform": f'"{_ch_platform(fp.platform, is_mobile=fp.is_mobile)}"',
         "accept-language": _accept_language(fp.languages),
     }
 
@@ -281,7 +389,50 @@ def _accept_language(languages: List[str]) -> str:
     return ",".join(parts)
 
 
+# Bounded cache of built stealth scripts keyed by the fingerprint identity that
+# affects the JS. The script is a large f-string rebuilt on every fresh context
+# (once per task-proxy solve); caching by identity means two solves that draw
+# the same coherent fingerprint reuse the string instead of re-rendering it.
+_STEALTH_JS_CACHE: Dict[tuple, str] = {}
+_STEALTH_JS_CACHE_MAX = 256
+
+
+def _stealth_identity(fp: FingerprintProfile) -> tuple:
+    """Hashable key of the fingerprint fields that influence the stealth JS."""
+    return (
+        fp.user_agent,
+        fp.platform,
+        tuple(fp.languages),
+        fp.hardware_concurrency,
+        fp.device_memory,
+        fp.screen_width,
+        fp.screen_height,
+        fp.webgl_vendor,
+        fp.webgl_renderer,
+        fp.locale,
+        fp.is_mobile,
+    )
+
+
 def build_stealth_js(fp: FingerprintProfile) -> str:
+    """Build (and cache) a Playwright init-script projecting ``fp`` onto the page.
+
+    Results are memoised by :func:`_stealth_identity` so repeated solves with
+    the same coherent fingerprint don't re-render the ~2KB script each time.
+    """
+    key = _stealth_identity(fp)
+    cached = _STEALTH_JS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    script = _build_stealth_js_uncached(fp)
+    if len(_STEALTH_JS_CACHE) >= _STEALTH_JS_CACHE_MAX:
+        # Simple bound: drop an arbitrary entry (FIFO-ish) to cap memory.
+        _STEALTH_JS_CACHE.pop(next(iter(_STEALTH_JS_CACHE)), None)
+    _STEALTH_JS_CACHE[key] = script
+    return script
+
+
+def _build_stealth_js_uncached(fp: FingerprintProfile) -> str:
     """Build a Playwright init-script that projects ``fp`` onto the page.
 
     Patches the signals detectors commonly read (``navigator.webdriver``,
@@ -324,9 +475,19 @@ def build_stealth_js(fp: FingerprintProfile) -> str:
         f'{{"brand":"Chromium","version":{_js_str(_CHROME_FULL_VERSION)}}},'
         f'{{"brand":{_js_str(grease_brand)},"version":"{grease_ver}.0.0.0"}}]'
     )
-    ch_platform = _ch_platform(fp.platform)
-    ch_platform_version = _ch_platform_version(fp.platform)
-    ua_arch = "arm" if "Apple M" in fp.webgl_renderer else "x86"
+    ch_platform = _ch_platform(fp.platform, is_mobile=fp.is_mobile)
+    ch_platform_version = _ch_platform_version(fp.platform, is_mobile=fp.is_mobile)
+    # Mobile UA-CH report an empty architecture/bitness; desktop reports arm/x86.
+    if fp.is_mobile:
+        ua_arch = ""
+    else:
+        ua_arch = "arm" if "Apple M" in fp.webgl_renderer else "x86"
+    ua_bitness = "" if fp.is_mobile else "64"
+    ua_mobile_js = "true" if fp.is_mobile else "false"
+    # Real Android Chrome reports a device model in high-entropy values and a
+    # non-zero maxTouchPoints; desktop reports "" / 0.
+    ua_model_js = _js_str(_android_model_from_ua(fp.user_agent)) if fp.is_mobile else '""'
+    max_touch_points = 5 if fp.is_mobile else 0
     # Per-fingerprint canvas noise offset: deterministic from the full coherent
     # identity so the same fingerprint always produces the same canvas hash,
     # but different fingerprints produce different (uncorrelated) noise. Derived
@@ -370,6 +531,9 @@ def build_stealth_js(fp: FingerprintProfile) -> str:
   Object.defineProperty(navigator, 'plugins', {{get: () => _plugins}});
   Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => {fp.hardware_concurrency}}});
   Object.defineProperty(navigator, 'deviceMemory', {{get: () => {fp.device_memory}}});
+  // maxTouchPoints: >0 on mobile so a touch-capability probe matches the
+  // Android UA / sec-ch-ua-mobile: ?1; 0 on desktop.
+  try {{ Object.defineProperty(navigator, 'maxTouchPoints', {{get: () => {max_touch_points}}}); }} catch (e) {{}}
   window.chrome = {{runtime: {{}}, app: {{}}, loadTimes: () => {{}}, csi: () => {{}}}};
 
   // navigator.userAgentData — JS-side client hints, kept consistent with the
@@ -379,11 +543,11 @@ def build_stealth_js(fp: FingerprintProfile) -> str:
     const _fullVersionList = {full_brands_js};
     const _highEntropy = {{
       architecture: {_js_str(ua_arch)},
-      bitness: "64",
+      bitness: {_js_str(ua_bitness)},
       brands: _brands,
       fullVersionList: _fullVersionList,
-      mobile: false,
-      model: "",
+      mobile: {ua_mobile_js},
+      model: {ua_model_js},
       platform: {_js_str(ch_platform)},
       platformVersion: {_js_str(ch_platform_version)},
       uaFullVersion: {_js_str(_CHROME_FULL_VERSION)},
@@ -391,10 +555,10 @@ def build_stealth_js(fp: FingerprintProfile) -> str:
     }};
     const _uaData = {{
       brands: _brands,
-      mobile: false,
+      mobile: {ua_mobile_js},
       platform: {_js_str(ch_platform)},
       getHighEntropyValues: (hints) => Promise.resolve(_highEntropy),
-      toJSON: () => ({{brands: _brands, mobile: false, platform: {_js_str(ch_platform)}}}),
+      toJSON: () => ({{brands: _brands, mobile: {ua_mobile_js}, platform: {_js_str(ch_platform)}}}),
     }};
     Object.defineProperty(navigator, 'userAgentData', {{get: () => _uaData}});
   }} catch (e) {{}}
@@ -469,6 +633,14 @@ def context_kwargs(
         # engine's defaults.
         "extra_http_headers": client_hint_headers(fp),
     }
+    # P1-4: a mobile fingerprint gets a touch-enabled, high-DPR context so the
+    # viewport, device_scale_factor, is_mobile, and touch capability all agree
+    # with the Android UA + sec-ch-ua-mobile: ?1 (a desktop-shaped context on a
+    # mobile UA is itself a contradiction).
+    if fp.is_mobile:
+        kwargs["is_mobile"] = True
+        kwargs["has_touch"] = True
+        kwargs["device_scale_factor"] = fp.device_scale_factor or 2.0
     if proxy:
         kwargs["proxy"] = proxy
     return kwargs

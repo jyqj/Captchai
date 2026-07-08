@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field, replace
@@ -22,6 +23,8 @@ from typing import Any, Optional
 
 from src.assets.model_pool import ModelPool, ModelUsage
 from src.parsing.image_grid import compose_grid
+
+log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are a strict CAPTCHA grid classifier. You are shown a challenge prompt "
@@ -80,6 +83,37 @@ _STITCHABLE_SHAPES = {"grid_select", "recaptcha_dynamic"}
 _VOTE_TEMPERATURE = 0.8
 
 _DEFAULT_CONFIDENCE = 0.5
+
+# Exception class names that indicate a *connection / availability* failure
+# (backend down, refused, timed out) rather than a bad request. Matched by
+# class name across the MRO so we stay dependency-light (no hard import of
+# openai / httpx) — covers openai.APIConnectionError / APITimeoutError, httpx
+# ConnectError / ConnectTimeout / ReadTimeout / PoolTimeout, and the builtin
+# ConnectionError / TimeoutError.
+_CONNECTION_ERROR_NAMES = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "InternalServerError",
+        "ConnectionError",
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "ReadError",
+        "PoolTimeout",
+        "TimeoutError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+    }
+)
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """True when ``exc`` (or any base) is a connection/availability failure."""
+    for klass in type(exc).__mro__:
+        if klass.__name__ in _CONNECTION_ERROR_NAMES:
+            return True
+    return False
 
 
 @dataclass
@@ -144,8 +178,15 @@ class VisionRouter:
         # cost estimate, the single call, and every vote sample all operate on
         # one image instead of N. Transparent to the index contract (tiles keep
         # their left-to-right / top-to-bottom order) and reversible via config.
-        req = self._maybe_stitch(req)
+        req = await self._maybe_stitch(req)
         model_name = self._route(req)
+
+        # Encode each image's base64 ONCE and reuse it across the initial call,
+        # every vote sample, and any inline cloud escalation — instead of
+        # re-encoding the same (potentially large) PNG on every _build_messages
+        # call. The data-url ``detail`` (which does vary by tier) is applied
+        # cheaply per call around this cached payload.
+        image_b64 = [base64.b64encode(img).decode() for img in req.images]
 
         # Budget gate — only paid (cloud) calls are checked. A denial with a
         # suggested downgrade falls back to the cheaper local model.
@@ -159,9 +200,9 @@ class VisionRouter:
                 if downgrade:
                     model_name = downgrade
 
-        client = self._pool.get(model_name)
-
-        content, usage = await self._call(client, req, temperature=0.0)
+        client, content, usage = await self._call_with_backend_fallback(
+            model_name, req, client_key, image_b64
+        )
         indices, confidence, raw = self._parse(content)
         total_usage = usage
 
@@ -196,7 +237,7 @@ class VisionRouter:
             # _build_messages ignore it.
             cloud_req = replace(req, task_tier=2)
             cloud_content, cloud_usage = await self._call(
-                cloud_client, cloud_req, temperature=0.0
+                cloud_client, cloud_req, temperature=0.0, image_b64=image_b64
             )
             total_usage = total_usage.add(cloud_usage)
             cloud_indices, cloud_conf, cloud_raw = self._parse(cloud_content)
@@ -212,7 +253,7 @@ class VisionRouter:
             # voting path on the cloud client (only when samples > 1).
             if cloud_conf < threshold and samples > 1:
                 voted_indices, voted_conf, vote_usage, votes = await self._vote(
-                    cloud_client, cloud_req, samples
+                    cloud_client, cloud_req, samples, image_b64
                 )
                 indices = voted_indices
                 confidence = voted_conf
@@ -227,7 +268,7 @@ class VisionRouter:
             and samples > 1
         ):
             voted_indices, voted_conf, vote_usage, votes = await self._vote(
-                client, req, samples
+                client, req, samples, image_b64
             )
             indices = voted_indices
             confidence = voted_conf
@@ -244,7 +285,7 @@ class VisionRouter:
             **shape_fields,
         )
 
-    def _maybe_stitch(self, req: VisionRequest) -> VisionRequest:
+    async def _maybe_stitch(self, req: VisionRequest) -> VisionRequest:
         """Return ``req`` with its tiles composed into one grid image, or as-is.
 
         Gated by ``VISION_STITCH_GRID`` (default on). Applies only to grid-shape
@@ -252,12 +293,17 @@ class VisionRouter:
         returns the original request so the per-tile path runs unchanged. The
         montage's row/column count is appended to the prompt so the model can
         reason about the exact layout, and ``grid_size`` is recorded.
+
+        ``compose_grid`` (Pillow decode + paste + PNG encode) is CPU-bound and
+        would block the event loop under concurrency, so it runs in a worker
+        thread via ``asyncio.to_thread`` — freeing the loop to service other
+        solves' I/O while the montage is built.
         """
         if not getattr(self._config, "vision_stitch_grid", True):
             return req
         if req.shape not in _STITCHABLE_SHAPES or len(req.images) < 2:
             return req
-        composed = compose_grid(list(req.images))
+        composed = await asyncio.to_thread(compose_grid, list(req.images))
         if composed is None:
             return req
         image_bytes, rows, cols = composed
@@ -288,9 +334,65 @@ class VisionRouter:
             return True
         return bool(getattr(decision, "allowed", True))
 
+    # -- backend fallback -------------------------------------------------
+
+    async def _call_with_backend_fallback(
+        self, model_name: str, req: VisionRequest, client_key, image_b64: list
+    ):
+        """Run the initial call, retrying the other backend on a connection error.
+
+        The routed backend (local for tier-1, cloud for tier-2) is tried first.
+        If it fails with a *connection* error (service down / refused / timeout)
+        — not a parse or bad-request error — the call retries once on the other
+        backend: ``local → cloud`` (gated by ``vision_cloud_enabled`` + budget,
+        since cloud is paid) or ``cloud → local`` (always, local is free). This
+        turns a dead local model service from an instant solve failure into a
+        transparent cloud solve. Returns ``(client, content, usage)``.
+        """
+        client = self._pool.get(model_name)
+        try:
+            content, usage = await self._call(
+                client, req, temperature=0.0, image_b64=image_b64
+            )
+            return client, content, usage
+        except Exception as exc:  # noqa: BLE001
+            fallback_enabled = bool(
+                getattr(self._config, "model_connection_fallback", True)
+            )
+            if not fallback_enabled or not _is_connection_error(exc):
+                raise
+            alt = await self._fallback_backend(model_name, req, client_key)
+            if alt is None:
+                raise
+            log.warning(
+                "vision backend %r failed (%s: %s); falling back to %r",
+                model_name,
+                type(exc).__name__,
+                exc,
+                alt,
+            )
+            alt_client = self._pool.get(alt)
+            content, usage = await self._call(
+                alt_client, req, temperature=0.0, image_b64=image_b64
+            )
+            return alt_client, content, usage
+
+    async def _fallback_backend(
+        self, model_name: str, req: VisionRequest, client_key
+    ) -> "str | None":
+        """Pick the alternate backend for a connection-error retry, or None."""
+        if model_name == "cloud":
+            return "local"  # local is free + self-hosted; always a valid fallback
+        # local → cloud only when cloud is enabled and the budget allows it.
+        if not getattr(self._config, "vision_cloud_enabled", False):
+            return None
+        if await self._budget_allows_cloud(req, client_key):
+            return "cloud"
+        return None
+
     # -- voting -----------------------------------------------------------
 
-    async def _vote(self, client, req: VisionRequest, samples: int):
+    async def _vote(self, client, req: VisionRequest, samples: int, image_b64: list):
         counts: Counter = Counter()
         usage_total = ModelUsage()
 
@@ -303,7 +405,9 @@ class VisionRouter:
         if concurrent:
             results = await asyncio.gather(
                 *(
-                    self._call(client, req, temperature=_VOTE_TEMPERATURE)
+                    self._call(
+                        client, req, temperature=_VOTE_TEMPERATURE, image_b64=image_b64
+                    )
                     for _ in range(samples)
                 )
             )
@@ -311,7 +415,7 @@ class VisionRouter:
             results = []
             for _ in range(samples):
                 content, usage = await self._call(
-                    client, req, temperature=_VOTE_TEMPERATURE
+                    client, req, temperature=_VOTE_TEMPERATURE, image_b64=image_b64
                 )
                 results.append((content, usage))
 
@@ -341,8 +445,10 @@ class VisionRouter:
 
     # -- model call -------------------------------------------------------
 
-    async def _call(self, client, req: VisionRequest, *, temperature: float):
-        messages = self._build_messages(req)
+    async def _call(
+        self, client, req: VisionRequest, *, temperature: float, image_b64: list
+    ):
+        messages = self._build_messages(req, image_b64)
         timeout = float(getattr(self._config, "captcha_timeout", 30))
         return await client.chat(
             messages=messages,
@@ -351,12 +457,17 @@ class VisionRouter:
             timeout=timeout,
         )
 
-    def _build_messages(self, req: VisionRequest) -> list:
+    def _build_messages(self, req: VisionRequest, image_b64: list) -> list:
+        """Build the chat messages, reusing pre-encoded base64 image payloads.
+
+        ``image_b64`` is the list of base64 strings encoded once in ``classify``
+        (aligned to ``req.images``); only the per-call ``detail`` is applied
+        here, so the same PNG isn't re-encoded on every vote sample.
+        """
         detail = self._detail_for(req)
         system_prompt = _SHAPE_PROMPTS.get(req.shape, SYSTEM_PROMPT)
         user_content: list = [{"type": "text", "text": req.prompt}]
-        for image in req.images:
-            b64 = base64.b64encode(image).decode()
+        for b64 in image_b64:
             user_content.append(
                 {
                     "type": "image_url",

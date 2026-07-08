@@ -75,6 +75,13 @@ class SolveRecord:
     output_tokens: int = 0
     proxy_bytes: int = 0
     wall_ms: int = 0
+    # Phase breakdown of ``wall_ms`` (all 0 when not instrumented). Lets an
+    # operator see whether a slow solve was dominated by page load, the
+    # challenge interaction loop, or model latency — the total ``wall_ms``
+    # alone can't localise where time went.
+    page_load_ms: int = 0
+    challenge_ms: int = 0
+    vision_ms: int = 0
     outcome: str = "failed"                  # "ready" | "failed" | "timeout"
     est_cost_usd: float = 0.0
     client_key: str | None = None
@@ -98,20 +105,47 @@ class CostLedger:
     def __init__(self, max_records: int = 100_000) -> None:
         self._records: Deque[SolveRecord] = deque(maxlen=max_records)
         self._lock = asyncio.Lock()
+        # Running totals so ``total_cost_usd`` (called on every getBalance poll)
+        # is O(1) instead of a full ledger scan. Kept consistent with the
+        # *retained* records: when the bounded deque evicts its oldest record on
+        # append, its cost is subtracted too (matching the pre-existing
+        # "evicted records no longer count" semantic). ``_total_by_client`` only
+        # holds non-None client keys; ``_total_global`` covers every record.
+        self._total_global: float = 0.0
+        self._total_by_client: Dict[str, float] = {}
 
     async def record(self, rec: SolveRecord) -> None:
         if rec.created_at == 0:
             rec.created_at = time.time()
         async with self._lock:
+            maxlen = self._records.maxlen
+            if maxlen is not None and len(self._records) == maxlen:
+                # This append will evict the oldest record — decrement its cost
+                # from the running totals first so they track retained records.
+                evicted = self._records[0]
+                self._total_global -= evicted.est_cost_usd
+                if evicted.client_key is not None:
+                    remaining = (
+                        self._total_by_client.get(evicted.client_key, 0.0)
+                        - evicted.est_cost_usd
+                    )
+                    if abs(remaining) < 1e-12:
+                        self._total_by_client.pop(evicted.client_key, None)
+                    else:
+                        self._total_by_client[evicted.client_key] = remaining
             self._records.append(rec)
+            self._total_global += rec.est_cost_usd
+            if rec.client_key is not None:
+                self._total_by_client[rec.client_key] = (
+                    self._total_by_client.get(rec.client_key, 0.0)
+                    + rec.est_cost_usd
+                )
 
     async def total_cost_usd(self, client_key: str | None = None) -> float:
         async with self._lock:
-            return sum(
-                r.est_cost_usd
-                for r in self._records
-                if client_key is None or r.client_key == client_key
-            )
+            if client_key is None:
+                return self._total_global
+            return self._total_by_client.get(client_key, 0.0)
 
     async def records(
         self,
@@ -228,6 +262,9 @@ def _serialize_record(rec: SolveRecord) -> dict[str, Any]:
         "output_tokens": rec.output_tokens,
         "proxy_bytes": rec.proxy_bytes,
         "wall_ms": rec.wall_ms,
+        "page_load_ms": rec.page_load_ms,
+        "challenge_ms": rec.challenge_ms,
+        "vision_ms": rec.vision_ms,
         "outcome": rec.outcome,
         "est_cost_usd": rec.est_cost_usd,
         "client_key": rec.client_key,
@@ -252,6 +289,9 @@ def _deserialize_record(data: dict[str, Any]) -> SolveRecord:
         output_tokens=data.get("output_tokens", 0),
         proxy_bytes=data.get("proxy_bytes", 0),
         wall_ms=data.get("wall_ms", 0),
+        page_load_ms=data.get("page_load_ms", 0),
+        challenge_ms=data.get("challenge_ms", 0),
+        vision_ms=data.get("vision_ms", 0),
         outcome=data.get("outcome", "failed"),
         est_cost_usd=data.get("est_cost_usd", 0.0),
         client_key=data.get("client_key"),
