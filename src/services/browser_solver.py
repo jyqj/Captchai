@@ -7,6 +7,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
 from playwright.async_api import Browser
@@ -15,13 +16,14 @@ from ..assets.proxy_pool import proxy_from_params
 from ..assets.session_pool import PROXYLESS_KEY
 from ..core.config import Config
 from .browser import BrowserManager
-from .captcha_errors import CaptchaError
+from .captcha_errors import CaptchaError, TokenRejectedError
 
 # Egress helpers live in ``egress.py`` (pure, no Playwright dependency) and are
 # re-exported here so existing ``from .browser_solver import egress_from_params``
 # imports keep working.
 from .egress import (  # noqa: F401
     ProxyKind,
+    SolveIdentity,
     egress_from_params,
     fingerprint_geo_from_params,
     has_task_proxy,
@@ -30,6 +32,26 @@ from .egress import (  # noqa: F401
 )
 
 log = logging.getLogger(__name__)
+
+
+class SolveStage(str, Enum):
+    """The stage a browser solve has reached, tracked on ``params["_phase"]``.
+
+    Makes the previously-implicit staging first-class: an attempt stamps the
+    stage it reaches as it progresses (acquire → page load → passive poll →
+    interaction → visual challenge), so the retry loop can report *where* a
+    solve failed and drive stage-aware escalation — e.g. only escalate the
+    expensive vision tier when the failure actually reached the visual
+    challenge, rather than burning a cloud-model retry on a page that never
+    loaded.
+    """
+
+    ACQUIRE = "acquire"
+    PAGE_LOAD = "page_load"
+    PASSIVE = "passive"
+    INTERACTION = "interaction"
+    CHALLENGE = "challenge"
+    VERIFY = "verify"
 
 
 @dataclass
@@ -386,7 +408,8 @@ class BaseBrowserSolver:
         provider: str,
         default_task_type: str,
         default_challenge_shape: str = "widget",
-        on_error: "Optional[Callable[[int, Exception], None]]" = None,
+        on_error: "Optional[Callable[[int, Exception, str], None]]" = None,
+        verify_provider: Optional[str] = None,
     ) -> dict[str, Any]:
         """Shared attempt loop for every browser solver (WP-pipeline).
 
@@ -401,13 +424,18 @@ class BaseBrowserSolver:
         * ``attempt_fn`` runs one solve attempt → ``(token, user_agent)``.
         * ``build_solution`` maps ``(token, user_agent)`` to the provider's
           solution dict (e.g. ``gRecaptchaResponse`` vs ``token``).
-        * ``on_error`` is an optional hook (attempt index, exc) for
-          per-provider escalation (hCaptcha bumps its vision tier).
+        * ``on_error`` is an optional hook (attempt index, exc, reached stage)
+          for per-provider stage-aware escalation (hCaptcha bumps its vision
+          tier only when the failure reached the visual challenge).
         """
         last_error: Exception | None = None
         retries = int(self._config.captcha_retries)
         for attempt in range(retries):
             started = time.monotonic()
+            # Reset the stage tracker for this attempt; the attempt stamps
+            # ``params["_phase"]`` as it advances so a failure knows where it
+            # stopped (see SolveStage / stage-aware on_error below).
+            params["_phase"] = SolveStage.ACQUIRE.value
             try:
                 token, user_agent = await attempt_fn()
                 await self._record(
@@ -419,12 +447,35 @@ class BaseBrowserSolver:
                     task_type=default_task_type,
                     challenge_shape=default_challenge_shape,
                 )
-                tz, accept = fingerprint_geo_from_params(params)
+                # WP6 token-trust closure: when siteverify is configured for
+                # this sitekey, verify the token now and feed the verdict into
+                # the real-outcome accounting (same buckets /reportIncorrect
+                # writes). A definitive rejection retries on a fresh egress
+                # rather than returning a token the provider already refused.
+                verdict = await self._verify_and_close(
+                    params, sitekey, client_key, token, verify_provider
+                )
+                if verdict is False:
+                    last_error = TokenRejectedError(
+                        f"{provider} token rejected by siteverify"
+                    )
+                    log.warning(
+                        "%s attempt %d/%d: token rejected by siteverify",
+                        provider,
+                        attempt + 1,
+                        retries,
+                    )
+                    if attempt < retries - 1:
+                        await self._sleep_backoff(attempt)
+                    continue
+                # The solve's resolved identity (egress + fingerprint geo) as one
+                # immutable object rather than four loose params reads. Surfaced
+                # in the solution so the caller can align their downstream submit
+                # egress + browser context with the context that minted the token.
+                identity = SolveIdentity.from_params(params)
                 solution = build_solution(token, user_agent)
                 solution.setdefault("userAgent", user_agent)
-                solution["timezoneId"] = tz
-                solution["acceptLanguage"] = accept
-                solution.update(egress_from_params(params))
+                solution.update(identity.solution_fields())
                 return solution
             except CaptchaError as exc:
                 last_error = exc
@@ -437,18 +488,20 @@ class BaseBrowserSolver:
                     task_type=default_task_type,
                     challenge_shape=default_challenge_shape,
                 )
+                stage = params.get("_phase", SolveStage.ACQUIRE.value)
                 log.warning(
-                    "%s attempt %d/%d: %s (retryable=%s)",
+                    "%s attempt %d/%d: %s (retryable=%s, stage=%s)",
                     provider,
                     attempt + 1,
                     retries,
                     exc,
                     exc.retryable,
+                    stage,
                 )
                 if not exc.retryable:
                     raise
                 if on_error is not None:
-                    on_error(attempt, exc)
+                    on_error(attempt, exc, stage)
                 if attempt < retries - 1:
                     await self._sleep_backoff(attempt)
             except Exception as exc:
@@ -462,15 +515,17 @@ class BaseBrowserSolver:
                     task_type=default_task_type,
                     challenge_shape=default_challenge_shape,
                 )
+                stage = params.get("_phase", SolveStage.ACQUIRE.value)
                 log.warning(
-                    "%s attempt %d/%d failed: %s",
+                    "%s attempt %d/%d failed at stage=%s: %s",
                     provider,
                     attempt + 1,
                     retries,
+                    stage,
                     exc,
                 )
                 if on_error is not None:
-                    on_error(attempt, exc)
+                    on_error(attempt, exc, stage)
                 if attempt < retries - 1:
                     await self._sleep_backoff(attempt)
 
@@ -522,6 +577,9 @@ class BaseBrowserSolver:
         calls = getattr(vision, "total_vision_calls", 0) or 0
         vision_ms = int(getattr(vision, "total_vision_ms", 0) or 0)
         cost = estimate_cost(model or "local", in_tok, out_tok)
+        # One typed read of the solve's egress/session identity instead of
+        # three separate ``params.get("_...")`` lookups spread across the record.
+        identity = SolveIdentity.from_params(params)
 
         try:
             await self._services.ledger.record(
@@ -529,9 +587,9 @@ class BaseBrowserSolver:
                     task_id=str(params.get("_taskId") or ""),
                     sitekey=sitekey,
                     task_type=task_type or params.get("type", "unknown"),
-                    proxy_id=params.get("_pool_proxy_id"),
-                    session_id=params.get("_sessionId"),
-                    proxy_kind=params.get("_proxyKind"),
+                    proxy_id=identity.proxy_id,
+                    session_id=identity.session_id,
+                    proxy_kind=identity.proxy_kind,
                     model=model,
                     # hCaptcha stashes the detected shape; fall back to the
                     # provider default (e.g. "widget" / "audio").
@@ -552,11 +610,95 @@ class BaseBrowserSolver:
             await self._services.accounting.record(
                 sitekey,
                 outcome,
-                proxy_kind=params.get("_proxyKind"),
+                proxy_kind=identity.proxy_kind,
                 model=model,
             )
         except Exception as exc:
             log.debug("ledger record failed: %s", exc)
+
+    async def _verify_and_close(
+        self,
+        params: dict[str, Any],
+        sitekey: str,
+        client_key: Optional[str],
+        token: str,
+        provider_key: Optional[str],
+    ) -> Optional[bool]:
+        """Verify the token via siteverify and close the real-outcome loop.
+
+        Returns the tri-state verdict: ``True`` accepted, ``False`` rejected,
+        ``None`` unknown (no verifier wired, no secret for the sitekey, or a
+        transient verify error). A definitive verdict is fed into the same
+        real-outcome path ``/reportCorrect`` uses so proxy health / routing
+        learn from ground truth automatically. ``None`` leaves the loop
+        caller-driven (pre-WP6 behaviour).
+        """
+        if self._services is None or not provider_key:
+            return None
+        verifier = getattr(self._services, "token_verifier", None)
+        if verifier is None:
+            return None
+        try:
+            verdict = await verifier.verify(
+                token,
+                provider=provider_key,
+                sitekey=sitekey,
+                remote_ip=self._proxy_ip(params),
+            )
+        except Exception as exc:  # noqa: BLE001 - verify never fails a solve
+            log.debug("token verification raised: %s", exc)
+            return None
+        if verdict is None:
+            return None
+        await self._close_real_outcome(params, sitekey, success=verdict)
+        return verdict
+
+    async def _close_real_outcome(
+        self, params: dict[str, Any], sitekey: str, *, success: bool
+    ) -> None:
+        """Feed a real (siteverify) outcome into accounting + proxy + session.
+
+        Mirrors the ``/reportCorrect`` // ``/reportIncorrect`` side effects but
+        driven from the live solve's :class:`SolveIdentity` instead of a stored
+        ledger record. Every downstream call is guarded so verification can
+        never fail a solve.
+        """
+        if self._services is None:
+            return
+        identity = SolveIdentity.from_params(params)
+        model = getattr(params.get("_vision"), "last_model", None)
+        acc = getattr(self._services, "accounting", None)
+        if acc is not None:
+            try:
+                await acc.record_real_outcome(
+                    sitekey,
+                    success=success,
+                    proxy_kind=identity.proxy_kind,
+                    model=model,
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("record_real_outcome (verify) failed", exc_info=True)
+        proxy_pool = getattr(self._services, "proxy_pool", None)
+        if identity.proxy_id and proxy_pool is not None:
+            try:
+                await proxy_pool.report(identity.proxy_id, success=success)
+            except Exception:  # noqa: BLE001
+                log.debug("proxy report (verify) failed", exc_info=True)
+            if sitekey:
+                try:
+                    await proxy_pool.report_sitekey_real(
+                        identity.proxy_id, sitekey, success=success
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("report_sitekey_real (verify) failed", exc_info=True)
+        session_pool = getattr(self._services, "session_pool", None)
+        if identity.session_id and session_pool is not None:
+            report_outcome = getattr(session_pool, "report_outcome", None)
+            if report_outcome is not None:
+                try:
+                    await report_outcome(identity.session_id, success=success)
+                except Exception:  # noqa: BLE001
+                    log.debug("session report_outcome (verify) failed", exc_info=True)
 
     def _proxy_ip(self, params: dict[str, Any]) -> Optional[str]:
         return proxy_ip_from_params(params)

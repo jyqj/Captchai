@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
 
@@ -211,9 +211,28 @@ class ChallengeDispatcher:
     def register(self, shape: ChallengeShape, solver: ShapeSolver) -> None:
         self._registry[shape] = solver
 
-    async def solve(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:
+    async def solve(
+        self,
+        frame: Any,
+        ctx: ChallengeContext,
+        *,
+        on_detected: "Optional[Callable[[ChallengeShape], None]]" = None,
+    ) -> Optional[str]:
+        """Detect the challenge shape once, then run its solver.
+
+        ``on_detected`` is a synchronous observer invoked with the detected
+        shape *before* dispatch — the hCaptcha solver uses it to record the
+        shape on the ledger without re-running :meth:`ChallengeClassifier.detect`
+        (calling ``detect`` and then ``solve`` separately previously classified
+        the same challenge twice, doubling the cost on the vision-fallback path).
+        """
         shape = await self._classifier.detect(frame, ctx)
         log.info("Challenge classified as %s (task_id=%s)", shape.value, ctx.task_id)
+        if on_detected is not None:
+            try:
+                on_detected(shape)
+            except Exception:  # noqa: BLE001 - an observer must never break dispatch
+                log.debug("on_detected observer raised", exc_info=True)
 
         solver = self._registry.get(shape)
         if solver is None:

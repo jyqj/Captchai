@@ -7,6 +7,7 @@ import logging
 from fastapi import APIRouter
 
 from ..core.config import config
+from ..core.task_types import ValidationKind, names_for_validation
 from ..models.task import (
     CreateTaskRequest,
     CreateTaskResponse,
@@ -25,33 +26,12 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_BROWSER_TASK_TYPES = {
-    "RecaptchaV3TaskProxyless",
-    "RecaptchaV3TaskProxylessM1",
-    "RecaptchaV3TaskProxylessM1S7",
-    "RecaptchaV3TaskProxylessM1S9",
-    "RecaptchaV3EnterpriseTask",
-    "RecaptchaV3EnterpriseTaskM1",
-    "NoCaptchaTaskProxyless",
-    "RecaptchaV2TaskProxyless",
-    "RecaptchaV2EnterpriseTaskProxyless",
-    "HCaptchaTaskProxyless",
-    "TurnstileTaskProxyless",
-    "TurnstileTaskProxylessM1",
-}
-
-_IMAGE_TASK_TYPES = {
-    "ImageToTextTask",
-    "ImageToTextTaskMuggle",
-    "ImageToTextTaskM1",
-}
-
-_CLASSIFICATION_TASK_TYPES = {
-    "HCaptchaClassification",
-    "ReCaptchaV2Classification",
-    "FunCaptchaClassification",
-    "AwsClassification",
-}
+# Required-field validation buckets derive from the single ``core.task_types``
+# registry so a newly registered task type can't silently skip validation by
+# being absent from a hand-maintained set here.
+_BROWSER_TASK_TYPES = names_for_validation(ValidationKind.BROWSER)
+_IMAGE_TASK_TYPES = names_for_validation(ValidationKind.IMAGE)
+_CLASSIFICATION_TASK_TYPES = names_for_validation(ValidationKind.CLASSIFICATION)
 
 
 def _check_client_key(client_key: str) -> CreateTaskResponse | None:

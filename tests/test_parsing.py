@@ -22,8 +22,11 @@ from src.parsing.dispatcher import (
     ChallengeDispatcher,
     ChallengeShape,
 )
+from src.parsing.shapes.area_bbox import AreaBBoxSolver
+from src.parsing.shapes.drag_drop import DragDropSolver
 from src.parsing.shapes.dynamic_grid import DynamicGridSolver
 from src.parsing.shapes.grid_select import GridSelectSolver
+from src.parsing.shapes.slide import CanvasSlideSolver
 
 
 # ---------------------------------------------------------------------------
@@ -322,5 +325,166 @@ def test_dynamic_grid_settles_when_no_matches() -> None:
         assert len(vision.calls) == 1
         # Submitted to finish the settled grid.
         assert any(c[0] == ".button-submit, .submit" for c in frame.clicks)
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher: single detect() + shape observer (no double classify)
+# ---------------------------------------------------------------------------
+
+
+def test_dispatcher_detects_once_and_reports_shape() -> None:
+    """solve() classifies exactly once and hands the shape to on_detected."""
+    async def run() -> None:
+        class CountingClassifier(ChallengeClassifier):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            async def detect(self, frame: Any, ctx: ChallengeContext):
+                self.calls += 1
+                return ChallengeShape.GRID_SELECT
+
+        class Stub:
+            async def run(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:
+                return "TOK"
+
+        clf = CountingClassifier()
+        dispatcher = ChallengeDispatcher(clf, {})
+        dispatcher.register(ChallengeShape.GRID_SELECT, Stub())
+
+        seen: List[ChallengeShape] = []
+        token = await dispatcher.solve(
+            FakeFrame(), ChallengeContext(), on_detected=seen.append
+        )
+        assert token == "TOK"
+        # Exactly one classify pass (the old detect()+solve() ran it twice).
+        assert clf.calls == 1
+        assert seen == [ChallengeShape.GRID_SELECT]
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Humanised pointer motion for slide / drag / area-bbox (P1-5 parity with grid)
+# ---------------------------------------------------------------------------
+
+
+class RecordingMouse:
+    def __init__(self) -> None:
+        self.moves: List[Any] = []
+        self.downs = 0
+        self.ups = 0
+
+    async def move(self, x: float, y: float) -> None:
+        self.moves.append((x, y))
+
+    async def down(self) -> None:
+        self.downs += 1
+
+    async def up(self) -> None:
+        self.ups += 1
+
+
+class RecordingPage:
+    def __init__(self) -> None:
+        self.mouse = RecordingMouse()
+
+
+def test_slide_uses_humanised_drag_when_page_present() -> None:
+    """The slider drag presses, traces a multi-step path, and releases once."""
+    async def run() -> None:
+        frame = FakeFrame(counts={}, texts={})
+        poll, _state = make_token_poll([None, "SLID"])
+        solver = CanvasSlideSolver(vision=None, token_poll=poll)
+        page = RecordingPage()
+        ctx = ChallengeContext(
+            extra={
+                "page": page,
+                "distance": 120.0,
+                "handle_origin": (20.0, 200.0),
+                "humanize": True,
+                "humanize_jitter_ms": 0,
+            }
+        )
+        token = await solver.run(frame, ctx)
+        assert token == "SLID"
+        # A real press-drag-release with travel (not one linear teleport).
+        assert page.mouse.downs == 1 and page.mouse.ups == 1
+        assert len(page.mouse.moves) > 5
+        # The drag ends at the computed target (origin.x + distance).
+        assert page.mouse.moves[-1] == (140.0, 200.0)
+
+    asyncio.run(run())
+
+
+def test_drag_drop_uses_humanised_drag_when_page_present() -> None:
+    async def run() -> None:
+        frame = FakeFrame(counts={}, texts={})
+        poll, _state = make_token_poll([None, "DRAGGED"])
+        solver = DragDropSolver(vision=None, token_poll=poll)
+        page = RecordingPage()
+        ctx = ChallengeContext(
+            extra={
+                "page": page,
+                "source": (10.0, 10.0),
+                "target": (100.0, 80.0),
+                "humanize": True,
+                "humanize_jitter_ms": 0,
+            }
+        )
+        token = await solver.run(frame, ctx)
+        assert token == "DRAGGED"
+        assert page.mouse.downs >= 1 and page.mouse.ups >= 1
+        assert len(page.mouse.moves) > 5
+
+    asyncio.run(run())
+
+
+def test_area_bbox_uses_human_pointer_click_when_page_present() -> None:
+    async def run() -> None:
+        frame = FakeFrame(counts={}, texts={})
+        poll, _state = make_token_poll([None, "CLICKED"])
+        solver = AreaBBoxSolver(vision=None, token_poll=poll)
+        page = RecordingPage()
+        ctx = ChallengeContext(
+            extra={
+                "page": page,
+                "point": (55.0, 66.0),
+                "humanize": True,
+                "humanize_jitter_ms": 0,
+            }
+        )
+        token = await solver.run(frame, ctx)
+        assert token == "CLICKED"
+        # Human path pressed the mouse (no teleport positional locator click).
+        assert page.mouse.downs >= 1 and page.mouse.ups >= 1
+        assert not any(
+            c[0] == AreaBBoxSolver.IMAGE_SELECTOR for c in frame.clicks
+        )
+
+    asyncio.run(run())
+
+
+def test_slide_falls_back_to_raw_move_without_page() -> None:
+    """With no page (fake frame carries the mouse), the raw stepped path runs."""
+    async def run() -> None:
+        frame = FakeFrame(counts={}, texts={})
+        frame.mouse = RecordingMouse()  # type: ignore[attr-defined]
+        poll, _state = make_token_poll([None, "SLID"])
+        solver = CanvasSlideSolver(vision=None, token_poll=poll)
+        ctx = ChallengeContext(
+            extra={
+                "distance": 90.0,
+                "handle_origin": (5.0, 100.0),
+                "humanize": False,
+            }
+        )
+        token = await solver.run(frame, ctx)
+        assert token == "SLID"
+        # Raw stepped path still presses + moves via the frame's mouse.
+        assert frame.mouse.downs == 1 and frame.mouse.ups == 1
+        assert len(frame.mouse.moves) > 5
 
     asyncio.run(run())

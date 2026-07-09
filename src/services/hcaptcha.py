@@ -30,16 +30,13 @@ because the token is bound to the generating egress IP.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from playwright.async_api import FrameLocator, Route
+from playwright.async_api import FrameLocator
 
-from .browser import set_context_resource_blocking
+from ..assets.proxy_pool import proxy_from_params
 from ..parsing.dispatcher import (
     ChallengeClassifier,
     ChallengeContext,
@@ -53,9 +50,10 @@ from ..parsing.shapes.grid_select import GridSelectSolver
 from ..parsing.shapes.slide import CanvasSlideSolver
 from ..parsing.vision_adapter import VisionAdapter
 from .captcha_errors import classify_widget_error
+from .injected_widget import InjectedWidgetSolver
 from .browser_solver import (
-    BaseBrowserSolver,
     ProxyKind,
+    SolveStage,
     has_task_proxy,
 )
 
@@ -82,75 +80,11 @@ _EXTRACT_HCAPTCHA_TOKEN_JS = """
 }
 """
 
-def _build_real_page_init_script(options: dict[str, Any]) -> str:
-    """Hook real-page hcaptcha.render and merge task-level enterprise options."""
-
-    opts_json = json.dumps(options)
-    return f"""
-(function() {{
-    window.__omcToken = null;
-    window.__omcError = null;
-    const __omcRenderOptions = {opts_json};
-    function hookHcaptcha() {{
-        if (window.hcaptcha && window.hcaptcha.render) {{
-            const origRender = window.hcaptcha.render.bind(window.hcaptcha);
-            window.hcaptcha.render = function(container, opts) {{
-                opts = Object.assign({{}}, opts || {{}}, __omcRenderOptions);
-                const origCb = opts.callback;
-                opts.callback = function(token) {{
-                    window.__omcToken = token;
-                    if (origCb) origCb(token);
-                }};
-                const origErr = opts['error-callback'];
-                opts['error-callback'] = function(e) {{
-                    window.__omcError = String(e);
-                    if (origErr) origErr(e);
-                }};
-                return origRender(container, opts);
-            }};
-        }} else {{
-            setTimeout(hookHcaptcha, 50);
-        }}
-    }}
-    hookHcaptcha();
-}})();
-"""
-
 # Localization-independent iframe matchers. The challenge iframe title is
 # localized ("Main content of the hCaptcha challenge" in English only), so match
 # on the src host as the robust primary signal.
 _CHECKBOX_IFRAME = 'iframe[src*="hcaptcha.com"][src*="checkbox"], iframe[title*="checkbox"]'
 _CHALLENGE_IFRAME = 'iframe[src*="hcaptcha.com"][src*="challenge"], iframe[title*="challenge"]'
-
-
-def _build_injected_page(website_key: str, options: dict[str, Any]) -> str:
-    render_opts = {"sitekey": website_key, **options}
-    opts_json = json.dumps(render_opts)
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><title>verify</title>
-<script src="https://js.hcaptcha.com/1/api.js?render=explicit" async defer></script>
-</head>
-<body>
-<div id="omc-hcaptcha"></div>
-<script>
-    window.__omcToken = null;
-    function omcRender() {{
-        if (!window.hcaptcha) {{ setTimeout(omcRender, 50); return; }}
-        const opts = {opts_json};
-        opts.callback = function (token) {{ window.__omcToken = token; }};
-        opts['error-callback'] = function (e) {{ window.__omcError = String(e); }};
-        try {{
-            window.__omcWidgetId = window.hcaptcha.render('omc-hcaptcha', opts);
-            if (opts.size === 'invisible') {{
-                window.hcaptcha.execute(window.__omcWidgetId);
-            }}
-        }} catch (e) {{ window.__omcError = String(e); }}
-    }}
-    omcRender();
-</script>
-</body>
-</html>"""
 
 
 @dataclass(frozen=True)
@@ -164,8 +98,25 @@ class HCaptchaProfile:
     vision_tier: int
 
 
-class HCaptchaSolver(BaseBrowserSolver):
+class HCaptchaSolver(InjectedWidgetSolver):
     """Solves HCaptchaTaskProxyless via the shared browser + vision/parsing layers."""
+
+    PROVIDER = "hCaptcha"
+    WIDGET_GLOBAL = "hcaptcha"
+    WIDGET_API_JS = "https://js.hcaptcha.com/1/api.js?render=explicit"
+    WIDGET_CONTAINER_ID = "omc-hcaptcha"
+    WIDGET_ERROR_CALLBACK_VALUE = "String(e)"
+    WIDGET_TOKEN_EXTRACTOR_JS = _EXTRACT_HCAPTCHA_TOKEN_JS
+
+    def _widget_render_body(self) -> str:
+        # hCaptcha renders by container *id* (not a CSS selector), stores the
+        # widget id, and drives invisible widgets with an explicit execute().
+        return (
+            "window.__omcWidgetId = window.hcaptcha.render('omc-hcaptcha', opts);\n"
+            "            if (opts.size === 'invisible') {\n"
+            "                window.hcaptcha.execute(window.__omcWidgetId);\n"
+            "            }"
+        )
 
     # ── public solve ───────────────────────────────────────────
 
@@ -199,12 +150,15 @@ class HCaptchaSolver(BaseBrowserSolver):
                 client_key,
             )
 
-        def _escalate_tier(attempt: int, exc: Exception) -> None:
-            # Escalate the vision tier for the next attempt: attempt 1 uses the
-            # cheaper local model (tier=1); a failure suggests a hard challenge,
-            # so bump to tier=2 to engage VisionRouter's cloud + self-consistency
-            # voting path.
-            params["_hcaptcha_vision_tier"] = 2
+        def _escalate_tier(attempt: int, exc: Exception, stage: str) -> None:
+            # Stage-aware escalation: only bump the vision tier when the failure
+            # actually reached the visual challenge. A failure at an earlier
+            # stage (context acquire / page load / passive poll) is not a "hard
+            # challenge" signal — engaging the expensive cloud + self-consistency
+            # tier on the retry would waste it, so those retries stay at tier 1
+            # and simply re-attempt. attempt 1 uses the cheaper local model.
+            if stage == SolveStage.CHALLENGE.value:
+                params["_hcaptcha_vision_tier"] = 2
 
         return await self._solve_with_retries(
             params,
@@ -219,6 +173,7 @@ class HCaptchaSolver(BaseBrowserSolver):
             default_task_type=params.get("type", "HCaptchaTaskProxyless"),
             default_challenge_shape="grid_select",
             on_error=_escalate_tier,
+            verify_provider="hcaptcha",
         )
 
     def _profile(self, params: dict[str, Any]) -> HCaptchaProfile:
@@ -257,7 +212,8 @@ class HCaptchaSolver(BaseBrowserSolver):
         * ``egress="proxyless"`` → raise (enterprise can't use server IP).
         * ``egress="task"`` + task proxy → allowed (warn: caller's
           responsibility; residential requirement is NOT enforced on task
-          proxies).
+          proxies unless ``ENTERPRISE_REQUIRE_RESIDENTIAL_ON_TASK`` is on, in
+          which case a non-residential/mobile task proxy is refused).
         * ``egress="task"`` + no task proxy → raise.
         * ``egress="pool"`` → fine; when ``ENTERPRISE_REQUIRE_RESIDENTIAL``
           is true, set ``_required_proxy_kinds=("residential","mobile")`` so
@@ -293,6 +249,25 @@ class HCaptchaSolver(BaseBrowserSolver):
                     "Enterprise hCaptcha with egress=task requires a "
                     "caller-supplied proxy"
                 )
+            # WP6: optionally *enforce* the residential requirement on the
+            # caller's task proxy too. A caller task proxy is normally the
+            # caller's responsibility (we only warn) — but enterprise tokens
+            # minted through an unannotated datacenter task proxy are exactly
+            # what enterprise detectors reject, so an operator can flip
+            # ENTERPRISE_REQUIRE_RESIDENTIAL_ON_TASK on to refuse them. The
+            # proxy declares its kind via a ``|kind=residential`` annotation;
+            # an unannotated proxy defaults to "datacenter" and is refused.
+            if getattr(self._config, "enterprise_require_residential_on_task", False):
+                task_asset = proxy_from_params(params)
+                kind = getattr(task_asset, "kind", None)
+                if kind not in ("residential", "mobile"):
+                    raise RuntimeError(
+                        "Enterprise hCaptcha with egress=task requires a "
+                        "residential or mobile task proxy (annotate it "
+                        "'|kind=residential'); got "
+                        f"{kind or 'datacenter'}"
+                    )
+                return
             log.warning(
                 "Enterprise hCaptcha with egress=task — caller proxy is the "
                 "caller's responsibility; residential requirement not enforced"
@@ -325,97 +300,17 @@ class HCaptchaSolver(BaseBrowserSolver):
         params: dict[str, Any],
         client_key: Optional[str],
     ) -> tuple[str, str]:
-        solve_context = await self._acquire_context(params)
-        self._stash_fingerprint_geo(solve_context, params)
-        context = solve_context.context
-        user_agent = solve_context.user_agent
-        # Synthetic injected page: resource interception is a safe bandwidth
-        # win here (no real page to make look human). Re-assert ON in case a
-        # reused warm session had it turned off by a prior real-page solve.
-        set_context_resource_blocking(context, True)
-        html = _build_injected_page(website_key, render_options)
-
-        async def _fulfill_document(route: Route) -> None:
-            if route.request.resource_type == "document":
-                await route.fulfill(status=200, content_type="text/html", body=html)
-            else:
-                await route.continue_()
-
-        solved = False
-        # Initialised before the try so the finally's challenge-phase timing is
-        # always defined even if context setup / goto raises early.
-        _challenge_started = time.monotonic()
-        try:
-            # WP5: defensive guard — with ``_enforce_enterprise_egress`` run
-            # in ``solve()``, an enterprise task should never reach a
-            # proxyless context (egress is forced to pool/task, which raises
-            # before returning PROXYLESS). Kept as a backstop for the mocked
-            # path and any future code that bypasses the enforcement helper.
-            if (
-                params.get("_hcaptcha_variant") == "enterprise"
-                and solve_context.proxy_kind == ProxyKind.PROXYLESS
-                and not has_task_proxy(params)
-            ):
-                raise RuntimeError(
-                    "Enterprise hCaptcha requires a residential pool proxy; "
-                    "server egress IP would not match the submission IP"
-                )
-            page = await context.new_page()
-            await context.route(website_url, _fulfill_document)
-            timeout_ms = self._config.browser_timeout * 1000
-            _page_started = time.monotonic()
-            await page.goto(website_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            params["_phase_page_load_ms"] = int(
-                (time.monotonic() - _page_started) * 1000
-            )
-            _challenge_started = time.monotonic()
-
-            if not params.get("isInvisible") and render_options.get("size") != "invisible":
-                await self._human_mouse(page)
-
-            passive_budget = getattr(self._config, "poll_budget_passive", 2.0)
-
-            # Passive / invisible widgets may resolve without interaction. Kept
-            # short: the event-driven wait returns the instant a passive token
-            # fires, so a small budget only bounds the "challenge is coming" case
-            # rather than adding fixed dead time before dispatch.
-            token = await self._poll_token(page, budget=passive_budget)
-            if token:
-                solved = True
-                return token, user_agent
-
-            # Click the checkbox to trigger the challenge with a human-like
-            # pointer path (P1-5): hCaptcha scores checkbox click dynamics as
-            # part of motionData, so a raw teleport-click is a bot tell — reuse
-            # the same humanised path the tile clicks use. A failure here is a
-            # signal (managed widget / detached frame), logged not swallowed.
-            try:
-                checkbox_frame = page.frame_locator(_CHECKBOX_IFRAME)
-                await self._human_click_in_frame(page, checkbox_frame, "#checkbox")
-            except Exception as exc:
-                log.info("hCaptcha checkbox click skipped: %s", exc)
-
-            token = await self._poll_token(page, budget=passive_budget)
-            if token:
-                solved = True
-                return token, user_agent
-
-            # Escalated to a visual challenge — dispatch by shape.
-            token = await self._solve_challenge(
-                page, website_key, params, client_key
-            )
-            if token:
-                solved = True
-                return token, user_agent
-
-            raise RuntimeError("hCaptcha token not obtained within budget")
-        finally:
-            params["_phase_challenge_ms"] = int(
-                (time.monotonic() - _challenge_started) * 1000
-            )
-            await self._release_context(solve_context, solved, params)
-
-    # ── real-page mode ─────────────────────────────────────────
+        """Solve on the synthetic injected page (regular hCaptcha)."""
+        return await self._run_page_solve(
+            website_url,
+            website_key,
+            render_options,
+            params,
+            client_key,
+            strategy=self._injected_page_strategy(
+                website_url, website_key, render_options
+            ),
+        )
 
     async def _solve_once_real_page(
         self,
@@ -425,74 +320,78 @@ class HCaptchaSolver(BaseBrowserSolver):
         params: dict[str, Any],
         client_key: Optional[str],
     ) -> tuple[str, str]:
-        """Navigate to the real target page and hook hcaptcha callbacks."""
-        solve_context = await self._acquire_context(params)
-        self._stash_fingerprint_geo(solve_context, params)
-        context = solve_context.context
-        user_agent = solve_context.user_agent
-        # P0-1: real-page solves navigate to the *real* merchant/Stripe page,
-        # so resource interception must be OFF — a browser that aborts every
-        # CSS/font/image on a real page is one of the easiest enterprise-bot
-        # signals. Interception stays on for the synthetic injected page
-        # (_solve_once) where it's a harmless bandwidth win.
-        set_context_resource_blocking(context, False)
-        solved = False
-        _challenge_started = time.monotonic()
+        """Solve by navigating to the real target page and hooking render."""
+        return await self._run_page_solve(
+            website_url,
+            website_key,
+            render_options,
+            params,
+            client_key,
+            strategy=self._real_page_strategy(render_options),
+        )
+
+    def _guard(self, solve_context: Any, params: dict[str, Any]) -> None:
+        """WP5 defensive backstop: refuse an enterprise solve on server egress.
+
+        With ``_enforce_enterprise_egress`` run in ``solve()`` an enterprise
+        task should never reach a proxyless context (egress is forced to
+        pool/task, which raises before returning PROXYLESS). Kept for the mocked
+        path and any future code that bypasses the enforcement helper. Runs from
+        the shared :meth:`InjectedWidgetSolver._run_page_solve` guard hook.
+        """
+        if (
+            params.get("_hcaptcha_variant") == "enterprise"
+            and solve_context.proxy_kind == ProxyKind.PROXYLESS
+            and not has_task_proxy(params)
+        ):
+            raise RuntimeError(
+                "Enterprise hCaptcha requires a residential pool proxy; "
+                "server egress IP would not match the submission IP"
+            )
+
+    async def _interact(
+        self,
+        page: Any,
+        website_url: str,
+        website_key: str,
+        render_options: dict[str, Any],
+        params: dict[str, Any],
+        client_key: Optional[str],
+    ) -> Optional[str]:
+        """Warmup → passive poll → checkbox → passive poll → challenge dispatch."""
+        params["_phase"] = SolveStage.PASSIVE.value
+        if not params.get("isInvisible") and render_options.get("size") != "invisible":
+            await self._human_mouse(page)
+
+        passive_budget = getattr(self._config, "poll_budget_passive", 2.0)
+
+        # Passive / invisible widgets may resolve without interaction. Kept
+        # short: the event-driven wait returns the instant a passive token
+        # fires, so a small budget only bounds the "challenge is coming" case
+        # rather than adding fixed dead time before dispatch.
+        token = await self._poll_token(page, budget=passive_budget)
+        if token:
+            return token
+
+        # Click the checkbox to trigger the challenge with a human-like pointer
+        # path (P1-5): hCaptcha scores checkbox click dynamics as part of
+        # motionData, so a raw teleport-click is a bot tell — reuse the same
+        # humanised path the tile clicks use. A failure here is a signal
+        # (managed widget / detached frame), logged not swallowed.
+        params["_phase"] = SolveStage.INTERACTION.value
         try:
-            # WP5: defensive guard — see _solve_once for rationale.
-            if (
-                params.get("_hcaptcha_variant") == "enterprise"
-                and solve_context.proxy_kind == ProxyKind.PROXYLESS
-                and not has_task_proxy(params)
-            ):
-                raise RuntimeError(
-                    "Enterprise hCaptcha requires a residential pool proxy; "
-                    "server egress IP would not match the submission IP"
-                )
-            await context.add_init_script(_build_real_page_init_script(render_options))
-            page = await context.new_page()
-            timeout_ms = self._config.browser_timeout * 1000
-            _page_started = time.monotonic()
-            await page.goto(website_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            params["_phase_page_load_ms"] = int(
-                (time.monotonic() - _page_started) * 1000
-            )
-            _challenge_started = time.monotonic()
+            checkbox_frame = page.frame_locator(_CHECKBOX_IFRAME)
+            await self._human_click_in_frame(page, checkbox_frame, "#checkbox")
+        except Exception as exc:
+            log.info("hCaptcha checkbox click skipped: %s", exc)
 
-            if not params.get("isInvisible") and render_options.get("size") != "invisible":
-                await self._human_mouse(page)
+        token = await self._poll_token(page, budget=passive_budget)
+        if token:
+            return token
 
-            passive_budget = getattr(self._config, "poll_budget_passive", 2.0)
-
-            token = await self._poll_token(page, budget=passive_budget)
-            if token:
-                solved = True
-                return token, user_agent
-
-            try:
-                checkbox_frame = page.frame_locator(_CHECKBOX_IFRAME)
-                await self._human_click_in_frame(page, checkbox_frame, "#checkbox")
-            except Exception as exc:
-                log.info("hCaptcha checkbox click skipped (real page): %s", exc)
-
-            token = await self._poll_token(page, budget=passive_budget)
-            if token:
-                solved = True
-                return token, user_agent
-
-            token = await self._solve_challenge(
-                page, website_key, params, client_key
-            )
-            if token:
-                solved = True
-                return token, user_agent
-
-            raise RuntimeError("hCaptcha token not obtained (real page mode)")
-        finally:
-            params["_phase_challenge_ms"] = int(
-                (time.monotonic() - _challenge_started) * 1000
-            )
-            await self._release_context(solve_context, solved, params)
+        # Escalated to a visual challenge — dispatch by shape.
+        params["_phase"] = SolveStage.CHALLENGE.value
+        return await self._solve_challenge(page, website_key, params, client_key)
 
     # ── challenge dispatch ─────────────────────────────────────
 
@@ -536,14 +435,16 @@ class HCaptchaSolver(BaseBrowserSolver):
             },
         )
 
-        original_solve = dispatcher.solve
-
-        async def _solve_and_record_shape(frame, solve_ctx):
-            shape = await dispatcher._classifier.detect(frame, solve_ctx)
+        def _record_shape(shape: ChallengeShape) -> None:
+            # Stash the detected shape for the ledger. Uses the dispatcher's
+            # single detect() (via on_detected) rather than a second
+            # classify pass — a duplicate detect() doubled the vision cost on
+            # the UNKNOWN → vision-fallback path.
             params["_challenge_shape"] = shape.value
-            return await original_solve(frame, solve_ctx)
 
-        token = await _solve_and_record_shape(challenge_frame, ctx)
+        token = await dispatcher.solve(
+            challenge_frame, ctx, on_detected=_record_shape
+        )
         params["_vision"] = vision
         return token
 
@@ -585,36 +486,4 @@ class HCaptchaSolver(BaseBrowserSolver):
             DragDropSolver(vision=vision, token_poll=token_poll),
         )
         return dispatcher
-
-    # ── token polling (unified, event-driven) ──────────────────
-
-    async def _poll_token(self, page: Any, budget: float | None = None) -> Optional[str]:
-        """Check-first token wait bounded by the unified poll budget.
-
-        Uses ``page.wait_for_function`` so we return the instant the widget
-        callback fires, and surfaces a widget ``error-callback`` as an error.
-        """
-        total = budget if budget is not None else float(self._config.poll_budget)
-        deadline = asyncio.get_event_loop().time() + total
-        interval_ms = max(50, int(self._config.poll_interval * 1000))
-        while asyncio.get_event_loop().time() < deadline:
-            result = await page.evaluate(_EXTRACT_HCAPTCHA_TOKEN_JS)
-            token = result.get("token") if isinstance(result, dict) else None
-            err = result.get("error") if isinstance(result, dict) else None
-            if isinstance(token, str) and len(token) > 20:
-                log.info("Got hCaptcha token (len=%d)", len(token))
-                return token
-            if err:
-                raise classify_widget_error(err, provider="hCaptcha")
-            remaining_ms = int((deadline - asyncio.get_event_loop().time()) * 1000)
-            if remaining_ms <= 0:
-                break
-            try:
-                await page.wait_for_function(
-                    "() => window.__omcToken || window.__omcError",
-                    timeout=min(interval_ms * 4, remaining_ms),
-                )
-            except Exception:
-                pass
-        return None
 

@@ -95,6 +95,7 @@ class RecaptchaV2Solver(BaseBrowserSolver):
             provider="reCAPTCHA v2",
             default_task_type=params.get("type", "RecaptchaV2TaskProxyless"),
             default_challenge_shape="audio",
+            verify_provider="recaptcha",
         )
 
     async def _solve_once(

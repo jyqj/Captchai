@@ -176,8 +176,28 @@ class Config:
     # reuse is faster); turn on for the hardest enterprise targets.
     enterprise_fresh_context: bool
 
+    # WP6: enforce the residential requirement even for a caller-supplied task
+    # proxy on enterprise hCaptcha. Off by default — a caller task proxy is
+    # normally the caller's responsibility (we only warn). When on, an
+    # enterprise egress=task solve is refused unless the task proxy is annotated
+    # residential/mobile (``|kind=residential``), closing the "enterprise token
+    # minted through an unverified datacenter task proxy" gap.
+    enterprise_require_residential_on_task: bool
+
+    # ── Token-trust verification (opt-in siteverify closure) ──
+    # When enabled AND a sitekey:secret pair is configured, a minted token is
+    # verified against the provider's siteverify endpoint and the real-outcome
+    # loop (proxy health / accounting) is closed automatically. Off by default.
+    token_verify_enabled: bool
+    token_verify_secrets: str  # "sitekey1:secret1,sitekey2:secret2"
+    token_verify_timeout: float
+
     # ── Human behavior / real-page mode ──
     hcaptcha_real_page: bool
+    # Turnstile real-page mode (parity with hCaptcha): navigate the real target
+    # and hook turnstile.render instead of serving the synthetic injected page.
+    # Off by default (injected page sidesteps the Cloudflare interstitial).
+    turnstile_real_page: bool
     human_mouse_enabled: bool
     human_mouse_jitter_ms: int
 
@@ -366,8 +386,25 @@ def load_config() -> Config:
         .strip()
         .lower()
         in {"1", "true", "yes"},
+        enterprise_require_residential_on_task=os.environ.get(
+            "ENTERPRISE_REQUIRE_RESIDENTIAL_ON_TASK", "false"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        # Token-trust verification (opt-in)
+        token_verify_enabled=os.environ.get("TOKEN_VERIFY_ENABLED", "false")
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        token_verify_secrets=os.environ.get("TOKEN_VERIFY_SECRETS", ""),
+        token_verify_timeout=float(os.environ.get("TOKEN_VERIFY_TIMEOUT", "10.0")),
         # Human behavior / real-page mode
         hcaptcha_real_page=os.environ.get("HCAPTCHA_REAL_PAGE", "false").strip().lower()
+        in {"1", "true", "yes"},
+        turnstile_real_page=os.environ.get("TURNSTILE_REAL_PAGE", "false")
+        .strip()
+        .lower()
         in {"1", "true", "yes"},
         human_mouse_enabled=os.environ.get("HUMAN_MOUSE_ENABLED", "true").strip().lower()
         in {"1", "true", "yes"},

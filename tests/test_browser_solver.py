@@ -12,7 +12,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.assets.proxy_pool import ProxyAsset, ProxyPool  # noqa: E402
-from src.services.browser_solver import BaseBrowserSolver, ProxyKind  # noqa: E402
+from src.services.browser_solver import (  # noqa: E402
+    BaseBrowserSolver,
+    ProxyKind,
+    SolveIdentity,
+)
 
 
 class FakeContext:
@@ -40,6 +44,51 @@ def _config():
         human_mouse_enabled=False,
         human_mouse_jitter_ms=0,
     )
+
+
+def test_solve_identity_from_params_collects_resolved_fields() -> None:
+    """SolveIdentity.from_params reads the resolved egress/session/geo keys."""
+    params = {
+        "_proxyKind": "pool_proxy",
+        "_egress_server": "http://gw:8080",
+        "_pool_proxy_id": "px-1",
+        "_sessionId": "sess-9",
+        "_used_timezone": "Europe/Berlin",
+        "_used_languages": ["de-DE", "en-US"],
+    }
+    ident = SolveIdentity.from_params(params)
+    assert ident.proxy_kind == "pool_proxy"
+    assert ident.egress_server == "http://gw:8080"
+    assert ident.proxy_id == "px-1"
+    assert ident.session_id == "sess-9"
+    assert ident.timezone_id == "Europe/Berlin"
+    assert ident.languages == ("de-DE", "en-US")
+    assert ident.accept_language == "de-DE, en-US"
+    # The solution echo carries exactly the four IP/UA-binding fields.
+    assert ident.solution_fields() == {
+        "proxyKind": "pool_proxy",
+        "egressServer": "http://gw:8080",
+        "timezoneId": "Europe/Berlin",
+        "acceptLanguage": "de-DE, en-US",
+    }
+
+
+def test_solve_identity_defaults_when_params_empty() -> None:
+    """A proxyless / mocked solve yields an all-None identity (no KeyErrors)."""
+    ident = SolveIdentity.from_params({})
+    assert ident.proxy_kind is None
+    assert ident.egress_server is None
+    assert ident.proxy_id is None
+    assert ident.session_id is None
+    assert ident.timezone_id is None
+    assert ident.languages == ()
+    assert ident.accept_language is None
+    assert ident.solution_fields() == {
+        "proxyKind": None,
+        "egressServer": None,
+        "timezoneId": None,
+        "acceptLanguage": None,
+    }
 
 
 def test_task_proxy_is_explicit_category() -> None:

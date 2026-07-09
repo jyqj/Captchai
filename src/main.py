@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from .api.routes import router
 from .core.config import config
 from .core.services import SolverServices, set_services
+from .core.task_types import Provider, types_for_provider
 from .services.browser import BrowserManager
 from .services.classification import ClassificationSolver
 from .services.hcaptcha import HCaptchaSolver
@@ -26,42 +27,15 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-_RECAPTCHA_V3_TYPES = [
-    "RecaptchaV3TaskProxyless",
-    "RecaptchaV3TaskProxylessM1",
-    "RecaptchaV3TaskProxylessM1S7",
-    "RecaptchaV3TaskProxylessM1S9",
-    "RecaptchaV3EnterpriseTask",
-    "RecaptchaV3EnterpriseTaskM1",
-]
-
-_RECAPTCHA_V2_TYPES = [
-    "NoCaptchaTaskProxyless",
-    "RecaptchaV2TaskProxyless",
-    "RecaptchaV2EnterpriseTaskProxyless",
-]
-
-_HCAPTCHA_TYPES = [
-    "HCaptchaTaskProxyless",
-]
-
-_TURNSTILE_TYPES = [
-    "TurnstileTaskProxyless",
-    "TurnstileTaskProxylessM1",
-]
-
-_CLASSIFICATION_TYPES = [
-    "HCaptchaClassification",
-    "ReCaptchaV2Classification",
-    "FunCaptchaClassification",
-    "AwsClassification",
-]
-
-_IMAGE_TEXT_TYPES = [
-    "ImageToTextTask",
-    "ImageToTextTaskMuggle",
-    "ImageToTextTaskM1",
-]
+# Type lists derive from the single registry in ``core.task_types`` so solver
+# registration here, request validation in ``api/routes.py``, and the test
+# roster can't drift apart.
+_RECAPTCHA_V3_TYPES = types_for_provider(Provider.RECAPTCHA_V3)
+_RECAPTCHA_V2_TYPES = types_for_provider(Provider.RECAPTCHA_V2)
+_HCAPTCHA_TYPES = types_for_provider(Provider.HCAPTCHA)
+_TURNSTILE_TYPES = types_for_provider(Provider.TURNSTILE)
+_CLASSIFICATION_TYPES = types_for_provider(Provider.CLASSIFICATION)
+_IMAGE_TEXT_TYPES = types_for_provider(Provider.IMAGE_TO_TEXT)
 
 
 @asynccontextmanager

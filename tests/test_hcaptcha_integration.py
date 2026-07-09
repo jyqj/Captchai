@@ -161,8 +161,8 @@ class FakeManager:
         return self._context, "UA-FAKE"
 
 
-def _config():
-    return SimpleNamespace(
+def _config(**over):
+    base = dict(
         captcha_retries=1,
         browser_timeout=5,
         poll_budget=2,
@@ -174,9 +174,13 @@ def _config():
         captcha_timeout=10,
         # WP5: enterprise residential-proxy enforcement (default on).
         enterprise_require_residential=True,
+        # WP6: enforce residential even for a caller task proxy (default off).
+        enterprise_require_residential_on_task=False,
         human_mouse_enabled=False,
         human_mouse_jitter_ms=0,
     )
+    base.update(over)
+    return SimpleNamespace(**base)
 
 
 def _services(vision_router):
@@ -760,6 +764,109 @@ def test_enterprise_with_task_proxy_allowed_without_pool() -> None:
     asyncio.run(run())
 
 
+def test_vision_tier_escalates_only_after_challenge_stage() -> None:
+    """Stage-aware escalation: a page-load failure keeps tier 1; a challenge
+    failure bumps to tier 2 for the retry."""
+    async def run() -> None:
+        # Case A: fail at PAGE_LOAD (goto raises) — tier must stay 1.
+        class GotoBoomPage(FakePage):
+            async def goto(self, url, wait_until=None, timeout=None):
+                raise RuntimeError("network down")
+
+        page = GotoBoomPage(tile_count=0)
+        context = FakeContext(page)
+        solver = HCaptchaSolver(
+            _config(captcha_retries=2), manager=FakeManager(context), services=None
+        )
+        params = {
+            "websiteURL": "https://example.com",
+            "websiteKey": "sk-early",
+            "type": "HCaptchaTaskProxyless",
+        }
+        try:
+            await solver.solve(params)
+        except RuntimeError:
+            pass
+        # A pre-challenge failure never escalates the expensive vision tier.
+        assert params.get("_hcaptcha_vision_tier") == 1
+
+    asyncio.run(run())
+
+
+def test_enterprise_task_proxy_refused_when_residential_enforced_on_task() -> None:
+    """WP6: ENTERPRISE_REQUIRE_RESIDENTIAL_ON_TASK refuses a datacenter task proxy.
+
+    With the flag on, an enterprise egress=task solve whose caller proxy is not
+    annotated residential/mobile is refused (a bare datacenter task proxy is the
+    'enterprise token minted through an unverified datacenter IP' gap).
+    """
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(
+            _config(enterprise_require_residential_on_task=True),
+            manager=manager,
+            services=None,
+        )
+        try:
+            await solver.solve(
+                {
+                    "websiteURL": "https://example.com",
+                    "websiteKey": "sitekey-ent",
+                    "type": "HCaptchaTaskProxyless",
+                    "rqdata": "RQ-DATA-XYZ",
+                    "enterprisePayload": {"sentry": "value"},
+                    # Datacenter (unannotated) caller proxy.
+                    "proxy": "http://user:pass@proxy.example.com:8080",
+                }
+            )
+            assert False, "expected a datacenter task proxy to be refused"
+        except RuntimeError as exc:
+            assert "residential or mobile task proxy" in str(exc)
+
+    asyncio.run(run())
+
+
+def test_enterprise_residential_task_proxy_allowed_when_enforced_on_task() -> None:
+    """WP6: an annotated residential task proxy passes the on-task enforcement."""
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+
+        async def eval_token(script, *args):
+            has_token = "__omcToken" in script
+            has_error = "__omcError" in script
+            if has_error and not has_token:
+                return None
+            token = "P1_" + "y" * 40
+            if has_error:
+                return {"token": token, "error": None}
+            return token
+
+        page.evaluate = eval_token  # type: ignore[assignment]
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(
+            _config(enterprise_require_residential_on_task=True),
+            manager=manager,
+            services=None,
+        )
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-ent",
+                "type": "HCaptchaTaskProxyless",
+                "rqdata": "RQ-DATA-XYZ",
+                "enterprisePayload": {"sentry": "value"},
+                # Residential-annotated caller proxy passes enforcement.
+                "proxy": "http://user:pass@proxy.example.com:8080|kind=residential",
+            }
+        )
+        assert result["gRecaptchaResponse"].startswith("P1_")
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_grid_challenge_solved_via_vision_and_recorded()
     test_solve_records_phase_timing()
@@ -774,4 +881,7 @@ if __name__ == "__main__":
     test_enterprise_with_task_proxy_allowed_without_pool()
     test_enterprise_with_mobile_proxy_succeeds()
     test_enterprise_with_only_datacenter_proxy_raises_mentions_kinds()
+    test_enterprise_task_proxy_refused_when_residential_enforced_on_task()
+    test_enterprise_residential_task_proxy_allowed_when_enforced_on_task()
+    test_vision_tier_escalates_only_after_challenge_stage()
     print("ok")

@@ -13,6 +13,7 @@ from typing import Any, List, Optional, Tuple
 
 from ..dispatcher import ChallengeContext, ChallengeShape
 from .base import BaseShapeSolver, ClassifyRequest
+from .human_cursor import human_drag
 
 log = logging.getLogger(__name__)
 
@@ -46,9 +47,8 @@ class DragDropSolver(BaseShapeSolver):
             return await self.poll_token()
 
         (sx, sy), (tx, ty) = endpoints
-        page = ctx.extra.get("page")
-        await self._drag(frame, sx, sy, tx, ty, page=page)
-        await self.click_submit(frame)
+        await self._drag(frame, sx, sy, tx, ty, ctx)
+        await self.human_click_submit(frame, ctx)
         return await self.poll_token()
 
     def _extract_endpoints(
@@ -90,9 +90,19 @@ class DragDropSolver(BaseShapeSolver):
         return points
 
     async def _drag(
-        self, frame: Any, sx: float, sy: float, tx: float, ty: float, *, page: Any = None
+        self, frame: Any, sx: float, sy: float, tx: float, ty: float, ctx: ChallengeContext
     ) -> bool:
-        mouse = getattr(page, "mouse", None) or getattr(frame, "mouse", None)
+        page = ctx.extra.get("page")
+        humanize = ctx.extra.get("humanize", True)
+        jitter_ms = float(ctx.extra.get("humanize_jitter_ms", 90.0))
+        # Humanised press-drag-release (grab dwell + arced/jittered path +
+        # settle) so the drag's scored pointer dynamics look human. Falls back
+        # to the raw arced stepped move when humanisation is off or the mouse
+        # can't press (tests / odd frames).
+        owner = page if getattr(page, "mouse", None) is not None else frame
+        if humanize and await human_drag(owner, (sx, sy), (tx, ty), jitter_ms=jitter_ms):
+            return True
+        mouse = getattr(owner, "mouse", None)
         if mouse is None:
             log.debug("drag_drop: no mouse available on page or frame")
             return False

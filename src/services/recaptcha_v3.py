@@ -68,6 +68,7 @@ class RecaptchaV3Solver(BaseBrowserSolver):
             provider="reCAPTCHA v3",
             default_task_type=params.get("type", "RecaptchaV3TaskProxyless"),
             default_challenge_shape="widget",
+            verify_provider="recaptcha",
         )
 
     async def _solve_once(

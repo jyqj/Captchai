@@ -41,27 +41,50 @@ def _load_app(*, client_key: str | None = None) -> TestClient:
     return TestClient(getattr(main_mod, "app"))
 
 
-ALL_TASK_TYPES = [
-    "RecaptchaV3TaskProxyless",
-    "RecaptchaV3TaskProxylessM1",
-    "RecaptchaV3TaskProxylessM1S7",
-    "RecaptchaV3TaskProxylessM1S9",
-    "RecaptchaV3EnterpriseTask",
-    "RecaptchaV3EnterpriseTaskM1",
-    "NoCaptchaTaskProxyless",
-    "RecaptchaV2TaskProxyless",
-    "RecaptchaV2EnterpriseTaskProxyless",
-    "HCaptchaTaskProxyless",
-    "TurnstileTaskProxyless",
-    "TurnstileTaskProxylessM1",
-    "ImageToTextTask",
-    "ImageToTextTaskMuggle",
-    "ImageToTextTaskM1",
-    "HCaptchaClassification",
-    "ReCaptchaV2Classification",
-    "FunCaptchaClassification",
-    "AwsClassification",
-]
+from src.core.task_types import all_task_type_names  # noqa: E402
+
+# The task roster derives from the single registry, so this list can't drift
+# from the solvers main.py registers or the validation sets routes.py uses.
+ALL_TASK_TYPES = all_task_type_names()
+
+
+def test_task_type_registry_is_internally_consistent() -> None:
+    """Every registered task type has exactly one validation bucket.
+
+    Guards the drift the single registry was introduced to prevent: routes.py
+    keys required-field validation off set membership, so a type present in the
+    roster but missing from every validation bucket would silently skip its
+    ``websiteURL`` / image / classification checks.
+    """
+    from src.api import routes
+    from src.core.task_types import (
+        Provider,
+        all_task_type_names,
+        types_for_provider,
+    )
+
+    names = all_task_type_names()
+    # No duplicate task-type strings.
+    assert len(names) == len(set(names))
+
+    # The three validation buckets partition the full roster (union == all,
+    # pairwise disjoint) so each type gets one and only one field check.
+    buckets = [
+        routes._BROWSER_TASK_TYPES,
+        routes._IMAGE_TASK_TYPES,
+        routes._CLASSIFICATION_TASK_TYPES,
+    ]
+    union: set[str] = set()
+    for bucket in buckets:
+        assert union.isdisjoint(bucket)
+        union |= bucket
+    assert union == set(names)
+
+    # Every type maps to exactly one provider (the main.py wiring).
+    provider_union: set[str] = set()
+    for provider in Provider:
+        provider_union |= set(types_for_provider(provider))
+    assert provider_union == set(names)
 
 
 def test_health_endpoint() -> None:

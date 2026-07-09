@@ -18,6 +18,7 @@ from ..assets.session_pool import SessionPool
 from ..consumption.accounting import build_accounting
 from ..consumption.budget import BudgetGuard
 from ..consumption.ledger import build_ledger
+from ..consumption.token_verify import build_token_verifier
 from ..parsing.vision import VisionRouter
 from .config import Config
 
@@ -41,6 +42,12 @@ class SolverServices:
             per_client_cap_usd=config.budget_per_client_cap_usd,
         )
         self.accounting = build_accounting(config)
+        # Optional token-trust verification (off unless TOKEN_VERIFY_ENABLED +
+        # secrets are configured). When present, the browser solvers verify a
+        # minted token against the provider's siteverify endpoint and close the
+        # real-outcome loop automatically instead of waiting on the caller's
+        # /reportCorrect. ``None`` = the pre-existing caller-driven behaviour.
+        self.token_verifier = build_token_verifier(config)
 
         # Parsing / model plane.
         self.model_pool = ModelPool(config)

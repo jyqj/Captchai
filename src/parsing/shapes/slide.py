@@ -11,6 +11,7 @@ from typing import Any, List, Optional, Tuple
 
 from ..dispatcher import ChallengeContext, ChallengeShape
 from .base import BaseShapeSolver, ClassifyRequest
+from .human_cursor import human_drag
 
 log = logging.getLogger(__name__)
 
@@ -46,8 +47,7 @@ class CanvasSlideSolver(BaseShapeSolver):
             return await self.poll_token()
 
         sx, sy = start
-        page = ctx.extra.get("page")
-        await self._slide(frame, sx, sy, distance, page=page)
+        await self._slide(frame, sx, sy, distance, ctx)
         return await self.poll_token()
 
     async def _handle_origin(
@@ -91,8 +91,22 @@ class CanvasSlideSolver(BaseShapeSolver):
             prev = cur
         return offsets
 
-    async def _slide(self, frame: Any, sx: float, sy: float, distance: float, *, page: Any = None) -> bool:
-        mouse = getattr(page, "mouse", None) or getattr(frame, "mouse", None)
+    async def _slide(
+        self, frame: Any, sx: float, sy: float, distance: float, ctx: ChallengeContext
+    ) -> bool:
+        page = ctx.extra.get("page")
+        humanize = ctx.extra.get("humanize", True)
+        jitter_ms = float(ctx.extra.get("humanize_jitter_ms", 90.0))
+        end = (sx + distance, sy)
+        # Prefer the humanised drag (grab dwell + eased/jittered path + settle
+        # before release) so the slider's scored pointer dynamics look human,
+        # exactly like the tile clicks already do. Falls back to the raw stepped
+        # move when humanisation is disabled or the page has no press-capable
+        # mouse (tests / odd frames).
+        owner = page if getattr(page, "mouse", None) is not None else frame
+        if humanize and await human_drag(owner, (sx, sy), end, jitter_ms=jitter_ms):
+            return True
+        mouse = getattr(owner, "mouse", None)
         if mouse is None:
             log.debug("canvas_slide: no mouse available on page or frame")
             return False

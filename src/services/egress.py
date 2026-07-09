@@ -10,6 +10,7 @@ re-exports them for backward compatibility, so existing
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
@@ -48,6 +49,72 @@ def proxy_ip_from_params(params: dict[str, Any]) -> Optional[str]:
         hostport = rest.rsplit("@", 1)[-1]
         return hostport.split(":", 1)[0]
     return None
+
+
+@dataclass(frozen=True)
+class SolveIdentity:
+    """The resolved, immutable identity of a single solve.
+
+    One solve mints a token bound to a *coherent* identity: an egress (proxy
+    kind + gateway server), a warm session (or fresh context), and a browser
+    fingerprint geo (timezone + languages). Those facts were previously carried
+    as a handful of loose ``_``-prefixed keys on the mutable ``params`` dict —
+    ``_proxyKind`` / ``_egress_server`` / ``_pool_proxy_id`` / ``_sessionId`` /
+    ``_used_timezone`` / ``_used_languages`` — an untyped "identity bus" shared
+    across the acquire → solve → record → echo seams with no invariants, easy to
+    read with the wrong key or forget to surface.
+
+    :class:`SolveIdentity` freezes those into one value object with a single
+    construction point (:meth:`from_params`), so downstream code (the ledger
+    record, the solution echo) reads typed fields instead of fishing individual
+    strings out of the dict. The dict keys remain the transport (the fingerprint
+    build in ``browser.py`` and several tests read them directly), but the
+    *meaning* — "this is the solve's identity" — now lives in one typed place.
+    """
+
+    proxy_kind: Optional[str] = None
+    egress_server: Optional[str] = None
+    proxy_id: Optional[str] = None
+    session_id: Optional[str] = None
+    timezone_id: Optional[str] = None
+    languages: tuple[str, ...] = ()
+
+    @property
+    def accept_language(self) -> Optional[str]:
+        """The ``Accept-Language`` header the solve's fingerprint presented."""
+        return ", ".join(self.languages) if self.languages else None
+
+    @classmethod
+    def from_params(cls, params: dict[str, Any]) -> "SolveIdentity":
+        """Collect the resolved identity keys off ``params`` into one object.
+
+        Missing keys (e.g. a mocked ``_acquire_context`` in tests, or a
+        proxyless solve with no server geo) resolve to ``None`` / empty so the
+        object is always constructible.
+        """
+        langs = params.get("_used_languages") or []
+        return cls(
+            proxy_kind=params.get("_proxyKind"),
+            egress_server=params.get("_egress_server"),
+            proxy_id=params.get("_pool_proxy_id"),
+            session_id=params.get("_sessionId"),
+            timezone_id=params.get("_used_timezone"),
+            languages=tuple(langs),
+        )
+
+    def solution_fields(self) -> dict[str, Any]:
+        """The egress + geo fields surfaced in the solution for IP/UA binding.
+
+        Matches the union of :func:`egress_from_params` and
+        :func:`fingerprint_geo_from_params` so callers can align their
+        downstream submit egress + browser context with the solve's.
+        """
+        return {
+            "proxyKind": self.proxy_kind,
+            "egressServer": self.egress_server,
+            "timezoneId": self.timezone_id,
+            "acceptLanguage": self.accept_language,
+        }
 
 
 def egress_from_params(params: dict[str, Any]) -> dict[str, Any]:

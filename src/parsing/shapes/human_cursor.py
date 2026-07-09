@@ -94,6 +94,57 @@ async def _sleep(seconds: float) -> None:
         await asyncio.sleep(seconds)
 
 
+async def human_point_click(
+    page: Any,
+    target: Point,
+    *,
+    cursor: "Point | None" = None,
+    jitter_ms: float = 90.0,
+    rng: "random.Random | None" = None,
+) -> Optional[Point]:
+    """Move to an exact ``target`` point along an eased path and press.
+
+    The click primitive shared by :func:`human_click` (which first picks a
+    point inside a box) and coordinate solvers (area/bbox) that already know the
+    exact pixel to click. Returns the final cursor point, or ``None`` when the
+    page has no usable mouse (so the caller can fall back to ``locator.click``).
+    Never raises.
+    """
+    r = rng if rng is not None else random.Random()
+    mouse = getattr(page, "mouse", None)
+    move = getattr(mouse, "move", None) if mouse is not None else None
+    if move is None:
+        return None
+
+    tx, ty = float(target[0]), float(target[1])
+    if cursor is None:
+        # Approach from a plausible off-target origin rather than teleporting
+        # the first move to the element.
+        cursor = (tx - r.uniform(60.0, 160.0), ty - r.uniform(40.0, 120.0))
+
+    step_max = max(0.004, jitter_ms / 1000.0)
+    try:
+        for x, y in ease_path(cursor, (tx, ty), rng=r):
+            await move(x, y)
+            await _sleep(r.uniform(0.004, step_max))
+        await _sleep(r.uniform(0.05, 0.16))  # pre-click dwell
+
+        down = getattr(mouse, "down", None)
+        up = getattr(mouse, "up", None)
+        click = getattr(mouse, "click", None)
+        if down is not None and up is not None:
+            await down()
+            await _sleep(r.uniform(0.03, 0.09))  # button press duration
+            await up()
+        elif click is not None:
+            await click(tx, ty)
+        else:
+            return None
+    except Exception:  # noqa: BLE001 - degrade to the locator.click() fallback
+        return None
+    return (tx, ty)
+
+
 async def human_click(
     page: Any,
     box: dict,
@@ -110,38 +161,56 @@ async def human_click(
     ``None``.
     """
     r = rng if rng is not None else random.Random()
+    target = point_in_box(box, rng=r)
+    return await human_point_click(
+        page, target, cursor=cursor, jitter_ms=jitter_ms, rng=r
+    )
+
+
+async def human_drag(
+    page: Any,
+    start: Point,
+    end: Point,
+    *,
+    steps: int = 28,
+    jitter: float = 1.4,
+    arc: float = 8.0,
+    jitter_ms: float = 60.0,
+    rng: "random.Random | None" = None,
+) -> bool:
+    """Press at ``start``, drag along an eased/jittered path, release at ``end``.
+
+    The drag counterpart of :func:`human_click`: slider-puzzle and
+    drag-and-drop challenges score the *pointer dynamics* of the drag itself
+    (grab dwell, per-step velocity, a small arc, a settle-then-release), so a
+    raw ``move → down → linear moves → up`` loop with zero dwell is a bot tell
+    exactly like a teleport click is. Returns ``True`` on success, ``False``
+    when the page has no usable press-capable mouse (so the caller can fall
+    back to its raw stepped move). Never raises.
+    """
+    r = rng if rng is not None else random.Random()
     mouse = getattr(page, "mouse", None)
     move = getattr(mouse, "move", None) if mouse is not None else None
-    if move is None:
-        return None
+    down = getattr(mouse, "down", None) if mouse is not None else None
+    up = getattr(mouse, "up", None) if mouse is not None else None
+    if move is None or down is None or up is None:
+        return False
 
-    target = point_in_box(box, rng=r)
-    if cursor is None:
-        # Approach from a plausible off-target origin rather than teleporting
-        # the first move to the element.
-        cursor = (
-            target[0] - r.uniform(60.0, 160.0),
-            target[1] - r.uniform(40.0, 120.0),
-        )
-
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
     step_max = max(0.004, jitter_ms / 1000.0)
     try:
-        for x, y in ease_path(cursor, target, rng=r):
+        await move(sx, sy)
+        await _sleep(r.uniform(0.05, 0.15))  # settle before grabbing the handle
+        await down()
+        await _sleep(r.uniform(0.05, 0.12))  # grab dwell before the drag starts
+        for x, y in ease_path(
+            (sx, sy), (ex, ey), steps=steps, jitter=jitter, arc=arc, rng=r
+        ):
             await move(x, y)
             await _sleep(r.uniform(0.004, step_max))
-        await _sleep(r.uniform(0.05, 0.16))  # pre-click dwell
-
-        down = getattr(mouse, "down", None)
-        up = getattr(mouse, "up", None)
-        click = getattr(mouse, "click", None)
-        if down is not None and up is not None:
-            await down()
-            await _sleep(r.uniform(0.03, 0.09))  # button press duration
-            await up()
-        elif click is not None:
-            await click(target[0], target[1])
-        else:
-            return None
-    except Exception:  # noqa: BLE001 - degrade to the locator.click() fallback
-        return None
-    return target
+        await _sleep(r.uniform(0.04, 0.10))  # settle at the target before release
+        await up()
+        return True
+    except Exception:  # noqa: BLE001 - degrade to the caller's raw drag fallback
+        return False

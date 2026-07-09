@@ -46,6 +46,20 @@ class RateLimitedError(CaptchaError):
     outcome = "rate_limited"
 
 
+class TokenRejectedError(CaptchaError):
+    """A minted token was rejected by the provider's ``siteverify`` endpoint.
+
+    Raised only when token-trust verification is configured (opt-in) and the
+    provider definitively rejects the token. Retryable: the token was
+    structurally valid but not accepted (often an egress/fingerprint mismatch),
+    so a retry on a fresh egress can succeed. The real-outcome loop is closed
+    (proxy health / accounting updated) before this is raised.
+    """
+
+    retryable = True
+    outcome = "token_rejected"
+
+
 # Substring signals (matched case-insensitively) grouped by reaction. Order
 # matters: rate-limit is checked first because a "rate-limited" string also
 # contains no other keyword, and non-retryable is checked before the retryable
