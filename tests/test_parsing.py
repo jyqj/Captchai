@@ -23,10 +23,28 @@ from src.parsing.dispatcher import (
     ChallengeShape,
 )
 from src.parsing.shapes.area_bbox import AreaBBoxSolver
+from src.parsing.shapes.base import BaseShapeSolver
 from src.parsing.shapes.drag_drop import DragDropSolver
 from src.parsing.shapes.dynamic_grid import DynamicGridSolver
 from src.parsing.shapes.grid_select import GridSelectSolver
 from src.parsing.shapes.slide import CanvasSlideSolver
+
+
+def _png_bytes(width: int, height: int) -> bytes:
+    """A minimal PNG header (signature + IHDR) with the given pixel dimensions.
+
+    ``png_pixel_size`` reads the IHDR width/height at bytes 16:24, so a real
+    encoder isn't needed — this is enough to exercise the screenshot→CSS scale
+    without pulling in Pillow.
+    """
+    import struct
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr_len = struct.pack(">I", 13)
+    ihdr_type = b"IHDR"
+    dims = struct.pack(">II", width, height)
+    rest = b"\x08\x06\x00\x00\x00"  # bit depth / colour type / etc.
+    return sig + ihdr_len + ihdr_type + dims + rest
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +78,9 @@ class FakeLocator:
 
     async def screenshot(self) -> bytes:
         self._frame.screenshots.append((self._selector, self._index))
+        shot = self._frame.shots.get(self._selector)
+        if shot is not None:
+            return shot
         return f"shot:{self._selector}:{self._index}".encode()
 
     async def click(self, **kwargs: Any) -> None:
@@ -74,10 +95,11 @@ class FakeLocator:
 class FakeFrame:
     """Duck-typed FrameLocator/Page that returns canned data and records calls."""
 
-    def __init__(self, counts=None, texts=None, boxes=None):
+    def __init__(self, counts=None, texts=None, boxes=None, shots=None):
         self.counts = counts or {}
         self.texts = texts or {}
         self.boxes = boxes or {}
+        self.shots = shots or {}
         self.clicks: List[Any] = []
         self.screenshots: List[Any] = []
 
@@ -133,6 +155,54 @@ def test_classifier_detects_dynamic_grid() -> None:
         clf = ChallengeClassifier()
         shape = await clf.detect(frame, ChallengeContext())
         assert shape is ChallengeShape.RECAPTCHA_DYNAMIC
+
+    asyncio.run(run())
+
+
+def test_classifier_single_task_image_is_area_bbox() -> None:
+    """A single .task-image is hCaptcha area-select ("click the X"), not a grid.
+
+    hCaptcha renders the coordinate ("click on the largest animal") challenge
+    with the same .task-image class as a grid, so tile count disambiguates:
+    exactly one tile is a single-image coordinate task, not a multi-tile grid.
+    """
+    async def run() -> None:
+        frame = FakeFrame(counts={".task-image": 1})
+        clf = ChallengeClassifier()
+        shape = await clf.detect(frame, ChallengeContext(prompt="click the bus"))
+        assert shape is ChallengeShape.AREA_BBOX
+
+    asyncio.run(run())
+
+
+def test_classifier_multi_task_image_is_grid_select() -> None:
+    """Two or more .task-image tiles remain a grid-select challenge."""
+    async def run() -> None:
+        frame = FakeFrame(counts={".task-image": 9})
+        clf = ChallengeClassifier()
+        shape = await clf.detect(frame, ChallengeContext())
+        assert shape is ChallengeShape.GRID_SELECT
+
+    asyncio.run(run())
+
+
+def test_classifier_ready_true_on_any_signal() -> None:
+    """ready() is True for grid tiles, a prompt, or any shape marker."""
+    async def run() -> None:
+        clf = ChallengeClassifier()
+        assert await clf.ready(FakeFrame(counts={".task-image": 9})) is True
+        assert await clf.ready(FakeFrame(counts={".prompt-text": 1})) is True
+        assert await clf.ready(FakeFrame(counts={".slide-handle": 1})) is True
+
+    asyncio.run(run())
+
+
+def test_classifier_ready_false_on_empty_iframe() -> None:
+    """ready() is False for a not-yet-rendered (empty) challenge iframe."""
+    async def run() -> None:
+        clf = ChallengeClassifier()
+        assert await clf.ready(FakeFrame(counts={})) is False
+        assert await clf.ready(FakeFrame(counts={".task-image": 0})) is False
 
     asyncio.run(run())
 
@@ -463,6 +533,104 @@ def test_area_bbox_uses_human_pointer_click_when_page_present() -> None:
         assert not any(
             c[0] == AreaBBoxSolver.IMAGE_SELECTOR for c in frame.clicks
         )
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Screenshot-pixel → CSS-pixel coordinate mapping (high-DPR correctness)
+# ---------------------------------------------------------------------------
+
+
+def test_png_pixel_size_reads_ihdr() -> None:
+    assert BaseShapeSolver.png_pixel_size(_png_bytes(900, 600)) == (900, 600)
+
+
+def test_png_pixel_size_none_for_non_png() -> None:
+    assert BaseShapeSolver.png_pixel_size(b"not-a-png") is None
+    assert BaseShapeSolver.png_pixel_size(b"") is None
+    assert BaseShapeSolver.png_pixel_size("shot".encode()) is None
+
+
+def test_screenshot_css_scale_ratio_and_identity_fallback() -> None:
+    # CSS 300 wide, screenshot 900 wide => DPR 3 => scale 1/3.
+    box = {"x": 0.0, "y": 0.0, "width": 300.0, "height": 300.0}
+    sx, sy = BaseShapeSolver.screenshot_css_scale(box, _png_bytes(900, 900))
+    assert round(sx, 4) == round(1 / 3, 4)
+    assert round(sy, 4) == round(1 / 3, 4)
+    # No box or non-PNG screenshot => identity (unchanged DPR-1 behaviour).
+    assert BaseShapeSolver.screenshot_css_scale(None, _png_bytes(900, 900)) == (1.0, 1.0)
+    assert BaseShapeSolver.screenshot_css_scale(box, b"not-png") == (1.0, 1.0)
+
+
+def test_area_bbox_scales_high_dpr_point_and_adds_offset() -> None:
+    """A 3× screenshot point maps to CSS space and gains the element offset.
+
+    On a DPR-3 (mobile) context the screenshot is 900px for a 300px CSS image;
+    the model's point (450,450) is the image centre in screenshot pixels, which
+    must click the CSS centre at (150,150) relative to the image, i.e. absolute
+    (50+150, 60+150) once the element's page offset is added.
+    """
+    async def run() -> None:
+        sel = AreaBBoxSolver.IMAGE_SELECTOR
+        frame = FakeFrame(
+            counts={},
+            texts={},
+            boxes={sel: {"x": 50.0, "y": 60.0, "width": 300.0, "height": 300.0}},
+            shots={sel: _png_bytes(900, 900)},
+        )
+
+        class PointVision:
+            async def classify(self, req: Any):
+                return SimpleNamespace(point=(450.0, 450.0), indices=[], confidence=0.9)
+
+        poll, _state = make_token_poll([None, "CLICKED"])
+        solver = AreaBBoxSolver(vision=PointVision(), token_poll=poll)
+        page = RecordingPage()
+        ctx = ChallengeContext(
+            extra={"page": page, "humanize": True, "humanize_jitter_ms": 0}
+        )
+        token = await solver.run(frame, ctx)
+        assert token == "CLICKED"
+        # The area click lands at the scaled + offset absolute point. (A submit
+        # click follows and moves the cursor again, so assert membership, not
+        # the last move — ease_path forces the exact target so it's present.)
+        assert (200.0, 210.0) in page.mouse.moves
+
+    asyncio.run(run())
+
+
+def test_slide_scales_distance_by_dpr() -> None:
+    """The slide distance is divided by DPR so the handle travels CSS pixels."""
+    async def run() -> None:
+        bg_sel = CanvasSlideSolver.BG_SELECTOR
+        frame = FakeFrame(
+            counts={},
+            texts={},
+            boxes={bg_sel: {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}},
+            shots={bg_sel: _png_bytes(300, 300)},  # DPR 3
+        )
+
+        class DistVision:
+            async def classify(self, req: Any):
+                # 180 screenshot px => 60 CSS px at DPR 3.
+                return SimpleNamespace(distance=180.0, indices=[], confidence=0.9)
+
+        poll, _state = make_token_poll([None, "SLID"])
+        solver = CanvasSlideSolver(vision=DistVision(), token_poll=poll)
+        page = RecordingPage()
+        ctx = ChallengeContext(
+            extra={
+                "page": page,
+                "handle_origin": (10.0, 50.0),
+                "humanize": True,
+                "humanize_jitter_ms": 0,
+            }
+        )
+        token = await solver.run(frame, ctx)
+        assert token == "SLID"
+        # Handle ends at origin.x + scaled distance (10 + 60), same y.
+        assert page.mouse.moves[-1] == (70.0, 50.0)
 
     asyncio.run(run())
 

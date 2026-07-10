@@ -86,6 +86,10 @@ class Config:
     poll_interval: float  # seconds between checks
     poll_budget_passive: float  # seconds – short budget for passive/checkbox polls
     poll_budget_challenge: float  # seconds – longer budget after challenge dispatch
+    # Bounded wait for the challenge iframe DOM to render *before* the first
+    # classify/dispatch. Without it a slow (1–3s) iframe is classified with an
+    # empty DOM → UNKNOWN / zero tiles → the whole attempt is wasted and retried.
+    poll_budget_challenge_ready: float  # seconds
 
     # ── Vision routing (parsing plane) ──
     # When true, hard grid challenges may escalate to the powerful cloud model.
@@ -141,7 +145,6 @@ class Config:
     # before). ``proxy_geo_probe_url`` is the IP-geo endpoint to hit.
     proxy_geo_probe: bool
     proxy_geo_probe_url: str
-    token_cache_ttl: int  # seconds
     # Playwright runtime flavour: "chromium" (stock) | "rebrowser" | "camoufox".
     # Enterprise hCaptcha deployments should set BROWSER_RUNTIME=camoufox (a
     # hardened patched Firefox build) — stock Chromium's automation signals
@@ -184,6 +187,15 @@ class Config:
     # minted through an unverified datacenter task proxy" gap.
     enterprise_require_residential_on_task: bool
 
+    # Expose the server-side POOL proxy's credentials in the solution's
+    # ``egressServer`` (scheme://user:pass@host:port, sticky session
+    # substituted). Off by default — pool proxies are a server secret. But an
+    # IP-bound token minted through a pool proxy is worthless to a caller who
+    # can't reproduce that exit IP for their downstream submit (enterprise
+    # hCaptcha / Stripe Radar score IP consistency). Turn this on when clients
+    # are trusted and need to route their submit through the same pool egress.
+    pool_egress_expose_credentials: bool
+
     # ── Token-trust verification (opt-in siteverify closure) ──
     # When enabled AND a sitekey:secret pair is configured, a minted token is
     # verified against the provider's siteverify endpoint and the real-outcome
@@ -211,6 +223,9 @@ class Config:
     # Optional hard spend caps enforced by BudgetGuard before a cloud call.
     budget_global_cap_usd: float | None
     budget_per_client_cap_usd: float | None
+    # Rolling window (per (sitekey, proxy_kind, model) bucket) the success
+    # accounting keeps for its routing/selection success rates.
+    accounting_window: int
 
     # ── Convenience aliases (backward-compat) ──
 
@@ -308,6 +323,9 @@ def load_config() -> Config:
         poll_interval=float(os.environ.get("POLL_INTERVAL", "0.5")),
         poll_budget_passive=float(os.environ.get("POLL_BUDGET_PASSIVE", "2.0")),
         poll_budget_challenge=float(os.environ.get("POLL_BUDGET_CHALLENGE", "10.0")),
+        poll_budget_challenge_ready=float(
+            os.environ.get("POLL_BUDGET_CHALLENGE_READY", "4.0")
+        ),
         # Vision routing
         vision_cloud_enabled=os.environ.get("VISION_CLOUD_ENABLED", "true")
         .strip()
@@ -359,7 +377,6 @@ def load_config() -> Config:
         proxy_geo_probe_url=os.environ.get(
             "PROXY_GEO_PROBE_URL", "http://ip-api.com/json"
         ),
-        token_cache_ttl=int(os.environ.get("TOKEN_CACHE_TTL", "110")),
         browser_runtime=os.environ.get("BROWSER_RUNTIME", "chromium").strip().lower(),
         browser_runtime_strict=os.environ.get("BROWSER_RUNTIME_STRICT", "false")
         .strip()
@@ -392,6 +409,12 @@ def load_config() -> Config:
         .strip()
         .lower()
         in {"1", "true", "yes"},
+        pool_egress_expose_credentials=os.environ.get(
+            "POOL_EGRESS_EXPOSE_CREDENTIALS", "false"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
         # Token-trust verification (opt-in)
         token_verify_enabled=os.environ.get("TOKEN_VERIFY_ENABLED", "false")
         .strip()
@@ -417,6 +440,7 @@ def load_config() -> Config:
         budget_per_client_cap_usd=_optional_float(
             os.environ.get("BUDGET_PER_CLIENT_CAP_USD")
         ),
+        accounting_window=int(os.environ.get("ACCOUNTING_WINDOW", "100")),
     )
 
 

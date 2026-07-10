@@ -18,11 +18,12 @@ import json
 import logging
 import re
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from src.assets.model_pool import ModelPool, ModelUsage
 from src.parsing.image_grid import compose_grid
+from src.parsing.model_call import ModelInvoker
 
 log = logging.getLogger(__name__)
 
@@ -84,37 +85,6 @@ _VOTE_TEMPERATURE = 0.8
 
 _DEFAULT_CONFIDENCE = 0.5
 
-# Exception class names that indicate a *connection / availability* failure
-# (backend down, refused, timed out) rather than a bad request. Matched by
-# class name across the MRO so we stay dependency-light (no hard import of
-# openai / httpx) — covers openai.APIConnectionError / APITimeoutError, httpx
-# ConnectError / ConnectTimeout / ReadTimeout / PoolTimeout, and the builtin
-# ConnectionError / TimeoutError.
-_CONNECTION_ERROR_NAMES = frozenset(
-    {
-        "APIConnectionError",
-        "APITimeoutError",
-        "InternalServerError",
-        "ConnectionError",
-        "ConnectError",
-        "ConnectTimeout",
-        "ReadTimeout",
-        "ReadError",
-        "PoolTimeout",
-        "TimeoutError",
-        "ConnectionRefusedError",
-        "ConnectionResetError",
-    }
-)
-
-
-def _is_connection_error(exc: BaseException) -> bool:
-    """True when ``exc`` (or any base) is a connection/availability failure."""
-    for klass in type(exc).__mro__:
-        if klass.__name__ in _CONNECTION_ERROR_NAMES:
-            return True
-    return False
-
 
 @dataclass
 class VisionRequest:
@@ -159,15 +129,12 @@ class VisionRouter:
         self._ledger = ledger
         self._budget = budget
         self._accounting = accounting
-
-    # -- routing ----------------------------------------------------------
-
-    def _route(self, req: VisionRequest) -> str:
-        if req.task_tier >= 2:
-            if getattr(self._config, "vision_cloud_enabled", False):
-                return "cloud"
-            return "local"
-        return "local"
+        # The one place a model call is routed, budgeted and made. VisionRouter
+        # owns the *grid* semantics (stitch, vote, confidence gate, shape parse)
+        # and delegates the invocation core (route → budget → call → backend
+        # fallback) to this shared seam — the same seam the free-form vision
+        # solvers (classification / recognition) call.
+        self._invoker = ModelInvoker(model_pool, config, budget=budget)
 
     # -- public API -------------------------------------------------------
 
@@ -179,7 +146,8 @@ class VisionRouter:
         # one image instead of N. Transparent to the index contract (tiles keep
         # their left-to-right / top-to-bottom order) and reversible via config.
         req = await self._maybe_stitch(req)
-        model_name = self._route(req)
+        est_cost = self._estimate_cost(req)
+        model_name = self._invoker.route(req.task_tier)
 
         # Encode each image's base64 ONCE and reuse it across the initial call,
         # every vote sample, and any inline cloud escalation — instead of
@@ -190,18 +158,18 @@ class VisionRouter:
 
         # Budget gate — only paid (cloud) calls are checked. A denial with a
         # suggested downgrade falls back to the cheaper local model.
-        if self._budget is not None and model_name == "cloud":
-            est_cost = self._estimate_cost(req)
-            decision = await self._budget.check(
-                client_key, est_cost, model=model_name
-            )
-            if decision is not None and not getattr(decision, "allowed", True):
-                downgrade = getattr(decision, "downgrade_to", None)
-                if downgrade:
-                    model_name = downgrade
+        model_name = await self._invoker.guard_budget(
+            model_name, est_cost, client_key
+        )
 
-        client, content, usage = await self._call_with_backend_fallback(
-            model_name, req, client_key, image_b64
+        # Initial call through the shared seam; the returned model name is the
+        # backend that actually served (after any connection-error fallback).
+        model_name, content, usage = await self._invoker.call_with_fallback(
+            model_name,
+            self._build_messages(req, image_b64),
+            client_key=client_key,
+            est_cost=est_cost,
+            temperature=0.0,
         )
         indices, confidence, raw = self._parse(content)
         total_usage = usage
@@ -229,15 +197,14 @@ class VisionRouter:
             and confidence < threshold
             and cloud_enabled
             and inline_escalate
-            and await self._budget_allows_cloud(req, client_key)
+            and await self._invoker.budget_allows_cloud(est_cost, client_key)
         ):
-            cloud_client = self._pool.get("cloud")
             # Re-route detail to tier-2 ("high") without mutating the caller's
             # request object. task_tier=2 only affects _detail_for; _vote and
             # _build_messages ignore it.
             cloud_req = replace(req, task_tier=2)
             cloud_content, cloud_usage = await self._call(
-                cloud_client, cloud_req, temperature=0.0, image_b64=image_b64
+                "cloud", cloud_req, temperature=0.0, image_b64=image_b64
             )
             total_usage = total_usage.add(cloud_usage)
             cloud_indices, cloud_conf, cloud_raw = self._parse(cloud_content)
@@ -247,13 +214,13 @@ class VisionRouter:
             confidence = cloud_conf
             content = cloud_content
             raw = cloud_raw
-            client = cloud_client
+            model_name = "cloud"
 
             # If cloud confidence is still below threshold, engage the existing
             # voting path on the cloud client (only when samples > 1).
             if cloud_conf < threshold and samples > 1:
                 voted_indices, voted_conf, vote_usage, votes = await self._vote(
-                    cloud_client, cloud_req, samples, image_b64
+                    "cloud", cloud_req, samples, image_b64
                 )
                 indices = voted_indices
                 confidence = voted_conf
@@ -268,7 +235,7 @@ class VisionRouter:
             and samples > 1
         ):
             voted_indices, voted_conf, vote_usage, votes = await self._vote(
-                client, req, samples, image_b64
+                model_name, req, samples, image_b64
             )
             indices = voted_indices
             confidence = voted_conf
@@ -278,7 +245,7 @@ class VisionRouter:
         return VisionResult(
             indices=indices,
             confidence=confidence,
-            model=client.name,
+            model=model_name,
             usage=total_usage,
             votes=votes,
             raw=raw,
@@ -315,84 +282,11 @@ class VisionRouter:
         )
         return replace(req, images=[image_bytes], prompt=prompt, grid_size=n)
 
-    async def _budget_allows_cloud(
-        self, req: VisionRequest, client_key: "str | None"
-    ) -> bool:
-        """Budget gate for an inline escalation cloud call.
-
-        Returns True when there is no budget, or when the budget allows the
-        cloud call. Returns False on denial — the caller keeps the local
-        result instead of escalating. Mirrors the existing tier-2 budget
-        check; a denial here does NOT downgrade (the local result is already
-        in hand and is the appropriate fallback).
-        """
-        if self._budget is None:
-            return True
-        est_cost = self._estimate_cost(req)
-        decision = await self._budget.check(client_key, est_cost, model="cloud")
-        if decision is None:
-            return True
-        return bool(getattr(decision, "allowed", True))
-
-    # -- backend fallback -------------------------------------------------
-
-    async def _call_with_backend_fallback(
-        self, model_name: str, req: VisionRequest, client_key, image_b64: list
-    ):
-        """Run the initial call, retrying the other backend on a connection error.
-
-        The routed backend (local for tier-1, cloud for tier-2) is tried first.
-        If it fails with a *connection* error (service down / refused / timeout)
-        — not a parse or bad-request error — the call retries once on the other
-        backend: ``local → cloud`` (gated by ``vision_cloud_enabled`` + budget,
-        since cloud is paid) or ``cloud → local`` (always, local is free). This
-        turns a dead local model service from an instant solve failure into a
-        transparent cloud solve. Returns ``(client, content, usage)``.
-        """
-        client = self._pool.get(model_name)
-        try:
-            content, usage = await self._call(
-                client, req, temperature=0.0, image_b64=image_b64
-            )
-            return client, content, usage
-        except Exception as exc:  # noqa: BLE001
-            fallback_enabled = bool(
-                getattr(self._config, "model_connection_fallback", True)
-            )
-            if not fallback_enabled or not _is_connection_error(exc):
-                raise
-            alt = await self._fallback_backend(model_name, req, client_key)
-            if alt is None:
-                raise
-            log.warning(
-                "vision backend %r failed (%s: %s); falling back to %r",
-                model_name,
-                type(exc).__name__,
-                exc,
-                alt,
-            )
-            alt_client = self._pool.get(alt)
-            content, usage = await self._call(
-                alt_client, req, temperature=0.0, image_b64=image_b64
-            )
-            return alt_client, content, usage
-
-    async def _fallback_backend(
-        self, model_name: str, req: VisionRequest, client_key
-    ) -> "str | None":
-        """Pick the alternate backend for a connection-error retry, or None."""
-        if model_name == "cloud":
-            return "local"  # local is free + self-hosted; always a valid fallback
-        # local → cloud only when cloud is enabled and the budget allows it.
-        if not getattr(self._config, "vision_cloud_enabled", False):
-            return None
-        if await self._budget_allows_cloud(req, client_key):
-            return "cloud"
-        return None
-
     # -- voting -----------------------------------------------------------
 
-    async def _vote(self, client, req: VisionRequest, samples: int, image_b64: list):
+    async def _vote(
+        self, model_name: str, req: VisionRequest, samples: int, image_b64: list
+    ):
         counts: Counter = Counter()
         usage_total = ModelUsage()
 
@@ -406,7 +300,10 @@ class VisionRouter:
             results = await asyncio.gather(
                 *(
                     self._call(
-                        client, req, temperature=_VOTE_TEMPERATURE, image_b64=image_b64
+                        model_name,
+                        req,
+                        temperature=_VOTE_TEMPERATURE,
+                        image_b64=image_b64,
                     )
                     for _ in range(samples)
                 )
@@ -415,7 +312,7 @@ class VisionRouter:
             results = []
             for _ in range(samples):
                 content, usage = await self._call(
-                    client, req, temperature=_VOTE_TEMPERATURE, image_b64=image_b64
+                    model_name, req, temperature=_VOTE_TEMPERATURE, image_b64=image_b64
                 )
                 results.append((content, usage))
 
@@ -446,15 +343,12 @@ class VisionRouter:
     # -- model call -------------------------------------------------------
 
     async def _call(
-        self, client, req: VisionRequest, *, temperature: float, image_b64: list
+        self, model_name: str, req: VisionRequest, *, temperature: float, image_b64: list
     ):
+        """One call on a specific backend through the shared seam."""
         messages = self._build_messages(req, image_b64)
-        timeout = float(getattr(self._config, "captcha_timeout", 30))
-        return await client.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=512,
-            timeout=timeout,
+        return await self._invoker.call_backend(
+            model_name, messages, temperature=temperature, max_tokens=512
         )
 
     def _build_messages(self, req: VisionRequest, image_b64: list) -> list:

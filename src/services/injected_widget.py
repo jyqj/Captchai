@@ -220,6 +220,7 @@ class InjectedWidgetSolver(BaseBrowserSolver):
 (function() {{
     window.__omcToken = null;
     window.__omcError = null;
+    window.__omcExecuted = false;
     const __omcRenderOptions = {opts_json};
     function omcHook() {{
         if (window.{g} && window.{g}.render) {{
@@ -236,7 +237,18 @@ class InjectedWidgetSolver(BaseBrowserSolver):
                     window.__omcError = String(e);
                     if (origErr) origErr(e);
                 }};
-                return origRender(container, opts);
+                const wid = origRender(container, opts);
+                // Invisible widgets only mint a token once execute() runs. On a
+                // synthetic page (or a real page that renders but never triggers
+                // execute itself) nothing would fire, so drive it once here when
+                // WE requested invisible via the render options. Guarded so a
+                // real page that also calls execute doesn't double-trigger.
+                if (opts.size === 'invisible' && !window.__omcExecuted
+                        && window.{g} && typeof window.{g}.execute === 'function') {{
+                    window.__omcExecuted = true;
+                    try {{ window.{g}.execute(wid); }} catch (e) {{}}
+                }}
+                return wid;
             }};
         }} else {{
             setTimeout(omcHook, 50);

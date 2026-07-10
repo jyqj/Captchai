@@ -78,13 +78,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("Registered Turnstile solver for types: %s", _TURNSTILE_TYPES)
 
     # Pure-vision tasks draw from a separate concurrency pool so a burst of image
-    # requests can't starve the browser solvers.
-    recognizer = CaptchaRecognizer(config)
+    # requests can't starve the browser solvers. Both share the model-call seam
+    # (via ``services``) so their spend is budget-gated and reaches the ledger.
+    recognizer = CaptchaRecognizer(config, services=services)
     for task_type in _IMAGE_TEXT_TYPES:
         task_manager.register_solver(task_type, recognizer, TaskCategory.VISION)
     log.info("Registered image captcha recognizer for types: %s", _IMAGE_TEXT_TYPES)
 
-    classifier = ClassificationSolver(config)
+    classifier = ClassificationSolver(config, services=services)
     for task_type in _CLASSIFICATION_TYPES:
         task_manager.register_solver(task_type, classifier, TaskCategory.VISION)
     log.info("Registered classification solver for types: %s", _CLASSIFICATION_TYPES)

@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import Browser
 
@@ -32,6 +33,33 @@ from .egress import (  # noqa: F401
 )
 
 log = logging.getLogger(__name__)
+
+
+def _credentialed_egress_url(asset: Any) -> Optional[str]:
+    """Build a ``scheme://user:pass@host:port`` URL from a proxy asset.
+
+    Uses ``playwright_proxy()`` so a sticky-session ``{session}`` placeholder is
+    substituted to the SAME exit IP the solve used. Returns ``None`` when the
+    asset has no usable server. Only called when the operator opts in via
+    ``POOL_EGRESS_EXPOSE_CREDENTIALS`` — a pool proxy's credentials are a server
+    secret, but a caller with an IP-bound token needs them to route their
+    downstream submit through the identical egress.
+    """
+    pw = asset.playwright_proxy() if asset is not None else None
+    if not pw or not pw.get("server"):
+        return None
+    parts = urlsplit(pw["server"])
+    if not parts.scheme or not parts.netloc:
+        return None
+    user = pw.get("username")
+    password = pw.get("password")
+    netloc = parts.netloc
+    if user:
+        cred = user if not password else f"{user}:{password}"
+        netloc = f"{cred}@{parts.netloc}"
+    return urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+    )
 
 
 class SolveStage(str, Enum):
@@ -223,9 +251,18 @@ class BaseBrowserSolver:
             )
         params["_pool_proxy_id"] = pool_proxy.id
         params["_proxyKind"] = ProxyKind.POOL_PROXY.value
-        # Credential-free gateway of the checked-out pool proxy so the caller
-        # can route their downstream (IP-bound) submit through the same egress.
+        # Gateway of the checked-out pool proxy surfaced so the caller can route
+        # their downstream (IP-bound) submit through the same egress. Default is
+        # credential-free (the pool proxy is a server secret); when the operator
+        # opts in via POOL_EGRESS_EXPOSE_CREDENTIALS we surface the full
+        # credentialed URL (sticky session substituted) so the caller can
+        # actually reach the SAME exit IP — otherwise an enterprise/Stripe
+        # token minted here is bound to an IP the caller can never reproduce.
         params["_egress_server"] = pool_proxy.server
+        if getattr(self._config, "pool_egress_expose_credentials", False):
+            full = _credentialed_egress_url(pool_proxy)
+            if full:
+                params["_egress_server"] = full
         # WP-geo: if the proxy has no geo annotation, probe its exit IP once
         # (through the proxy itself) and cache the derived timezone/locale so a
         # German exit IP presents Europe/Berlin + de-DE instead of a random
@@ -658,47 +695,21 @@ class BaseBrowserSolver:
     ) -> None:
         """Feed a real (siteverify) outcome into accounting + proxy + session.
 
-        Mirrors the ``/reportCorrect`` // ``/reportIncorrect`` side effects but
-        driven from the live solve's :class:`SolveIdentity` instead of a stored
-        ledger record. Every downstream call is guarded so verification can
+        Delegates to the shared :func:`~src.services.outcome.record_real_outcome`
+        module — the same fan-out ``/reportCorrect`` // ``/reportIncorrect`` uses
+        — driven from the live solve's :class:`SolveIdentity` instead of a stored
+        ledger record. Every downstream call is guarded there so verification can
         never fail a solve.
         """
         if self._services is None:
             return
+        from .outcome import record_real_outcome
+
         identity = SolveIdentity.from_params(params)
         model = getattr(params.get("_vision"), "last_model", None)
-        acc = getattr(self._services, "accounting", None)
-        if acc is not None:
-            try:
-                await acc.record_real_outcome(
-                    sitekey,
-                    success=success,
-                    proxy_kind=identity.proxy_kind,
-                    model=model,
-                )
-            except Exception:  # noqa: BLE001
-                log.debug("record_real_outcome (verify) failed", exc_info=True)
-        proxy_pool = getattr(self._services, "proxy_pool", None)
-        if identity.proxy_id and proxy_pool is not None:
-            try:
-                await proxy_pool.report(identity.proxy_id, success=success)
-            except Exception:  # noqa: BLE001
-                log.debug("proxy report (verify) failed", exc_info=True)
-            if sitekey:
-                try:
-                    await proxy_pool.report_sitekey_real(
-                        identity.proxy_id, sitekey, success=success
-                    )
-                except Exception:  # noqa: BLE001
-                    log.debug("report_sitekey_real (verify) failed", exc_info=True)
-        session_pool = getattr(self._services, "session_pool", None)
-        if identity.session_id and session_pool is not None:
-            report_outcome = getattr(session_pool, "report_outcome", None)
-            if report_outcome is not None:
-                try:
-                    await report_outcome(identity.session_id, success=success)
-                except Exception:  # noqa: BLE001
-                    log.debug("session report_outcome (verify) failed", exc_info=True)
+        await record_real_outcome(
+            self._services, identity, sitekey, success=success, model=model
+        )
 
     def _proxy_ip(self, params: dict[str, Any]) -> Optional[str]:
         return proxy_ip_from_params(params)

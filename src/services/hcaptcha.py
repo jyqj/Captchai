@@ -30,6 +30,7 @@ because the token is bound to the generating egress IP.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -85,6 +86,14 @@ _EXTRACT_HCAPTCHA_TOKEN_JS = """
 # on the src host as the robust primary signal.
 _CHECKBOX_IFRAME = 'iframe[src*="hcaptcha.com"][src*="checkbox"], iframe[title*="checkbox"]'
 _CHALLENGE_IFRAME = 'iframe[src*="hcaptcha.com"][src*="challenge"], iframe[title*="challenge"]'
+
+# ``enterprisePayload`` is the 2captcha / YesCaptcha container convention whose
+# keys are hcaptcha.render() options. A few solver ecosystems use field names
+# that differ from the JS API; normalise the common ones so the widget actually
+# receives them. Everything else passes through unchanged.
+_ENTERPRISE_FIELD_ALIASES = {
+    "apiEndpoint": "endpoint",
+}
 
 
 @dataclass(frozen=True)
@@ -180,22 +189,55 @@ class HCaptchaSolver(InjectedWidgetSolver):
         """Resolve regular vs enterprise behavior in one place."""
 
         render_options: dict[str, Any] = {}
+
+        # enterprisePayload is a *container* of hcaptcha.render() options
+        # (rqdata, sentry, endpoint, reportapi, assethost, imghost, custom, …).
+        # ``hcaptcha.render`` takes those FLAT — there is no nested ``enterprise``
+        # key — so spread the payload onto the render options. Nesting it (the
+        # previous behaviour) meant the widget silently ignored it, dropping the
+        # rqdata a YesCaptcha client sends inside enterprisePayload and minting a
+        # token enterprise siteverify rejects.
+        payload = params.get("enterprisePayload")
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                render_options[_ENTERPRISE_FIELD_ALIASES.get(key, key)] = value
+
+        # A top-level ``rqdata`` wins over one nested in enterprisePayload; both
+        # forms are accepted (YesCaptcha clients send it inside the payload,
+        # others send it top-level).
         if params.get("rqdata"):
             render_options["rqdata"] = params["rqdata"]
-        if params.get("enterprisePayload"):
-            render_options["enterprise"] = params["enterprisePayload"]
         if params.get("isInvisible"):
             render_options["size"] = "invisible"
 
-        is_enterprise = bool(params.get("rqdata") or params.get("enterprisePayload"))
+        is_enterprise = bool(params.get("rqdata") or payload)
         return HCaptchaProfile(
             variant="enterprise" if is_enterprise else "regular",
             render_options=render_options,
             cache_tokens=False,
-            use_real_page=getattr(self._config, "hcaptcha_real_page", False)
-            or is_enterprise,
+            use_real_page=self._resolve_real_page(params),
             vision_tier=1,
         )
+
+    def _resolve_real_page(self, params: dict[str, Any]) -> bool:
+        """Decide injected-page vs real-page navigation for this solve.
+
+        Precedence: an explicit per-task ``realPage`` flag wins, else the
+        process default ``HCAPTCHA_REAL_PAGE``.
+
+        Enterprise no longer *forces* real-page. In the token-relay model the
+        caller captures a fresh ``rqdata`` from the target's own session and we
+        mint a token bound to ``sitekey + rqdata + hostname + egress IP``. An
+        injected page served at the correct hostname satisfies that binding
+        without depending on reproducing the target's session — which a fresh
+        ``goto`` of a session-bound URL (e.g. a Stripe checkout) usually can't
+        do. Real-page mode remains available per task/config for sites whose
+        own anti-bot JS must run.
+        """
+        task_flag = params.get("realPage")
+        if task_flag is not None:
+            return bool(task_flag)
+        return bool(getattr(self._config, "hcaptcha_real_page", False))
 
     def _enforce_enterprise_egress(
         self, params: dict[str, Any], variant: str
@@ -282,6 +324,22 @@ class HCaptchaSolver(InjectedWidgetSolver):
         # treats as residential-equivalent for enterprise risk scoring.
         if getattr(self._config, "enterprise_require_residential", True):
             params["_required_proxy_kinds"] = ("residential", "mobile")
+
+        # IP-binding footgun: an enterprise token minted through a server-side
+        # pool proxy is bound to that proxy's exit IP, but the caller only gets
+        # a credential-free ``egressServer`` and can't route their downstream
+        # submit through it. Enterprise/Stripe Radar score IP consistency, so
+        # the submit is likely rejected. Warn unless the operator opted to
+        # expose reusable pool credentials. (egress=task with the caller's own
+        # residential proxy sidesteps this entirely.)
+        if not getattr(self._config, "pool_egress_expose_credentials", False):
+            log.warning(
+                "Enterprise hCaptcha on egress=pool: token is minted through a "
+                "server-side proxy IP the caller cannot reuse. Enterprise/Stripe "
+                "score IP consistency, so the downstream submit may be rejected. "
+                "Use egress=task with your own residential proxy, or set "
+                "POOL_EGRESS_EXPOSE_CREDENTIALS=true to receive a reusable egress."
+            )
 
         # Optionally force a fresh context per enterprise solve so one sticky
         # proxy's warm session (cookie jar + fingerprint) isn't reused to
@@ -418,6 +476,19 @@ class HCaptchaSolver(InjectedWidgetSolver):
         vision = self._build_vision_adapter(website_key, client_key, params)
         dispatcher = self._build_dispatcher(vision, _token_poll)
 
+        # Give the challenge iframe a bounded moment to render its DOM before we
+        # classify. hCaptcha frequently escalates to a visual challenge whose
+        # iframe DOM lands 1–3s after the checkbox resolves; classifying an
+        # empty iframe yields UNKNOWN / zero tiles and the grid solver bails the
+        # whole attempt. If the widget instead *passes* while we wait, that
+        # token is returned directly.
+        ready_token = await self._await_challenge_ready(
+            page, dispatcher.classifier, challenge_frame
+        )
+        if ready_token:
+            params["_vision"] = vision
+            return ready_token
+
         ctx = ChallengeContext(
             prompt="",
             task_id=params.get("_taskId"),
@@ -447,6 +518,41 @@ class HCaptchaSolver(InjectedWidgetSolver):
         )
         params["_vision"] = vision
         return token
+
+    async def _await_challenge_ready(
+        self, page: Any, classifier: Any, challenge_frame: Any
+    ) -> Optional[str]:
+        """Wait (bounded) for the challenge DOM to render before classifying.
+
+        Each iteration cheaply checks, in order: an already-minted token (the
+        widget passed while we waited — return it), a widget ``error-callback``
+        (surface it as a classified error so the retry loop reacts per kind),
+        and whether the challenge iframe shows any recognizable shape/prompt
+        signal (``classifier.ready`` — stop waiting, let dispatch classify a
+        populated DOM). Returns the token if one appeared, else ``None`` once
+        the DOM is ready or the budget elapses (dispatch then proceeds
+        best-effort, exactly as before this wait existed).
+        """
+        budget = float(getattr(self._config, "poll_budget_challenge_ready", 4.0))
+        interval = max(0.02, float(getattr(self._config, "poll_interval", 0.25)))
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + budget
+        while True:
+            result = await page.evaluate(self.WIDGET_TOKEN_EXTRACTOR_JS)
+            token = result.get("token") if isinstance(result, dict) else None
+            err = result.get("error") if isinstance(result, dict) else None
+            if isinstance(token, str) and len(token) > 20:
+                return token
+            if err:
+                raise classify_widget_error(err, provider=self.PROVIDER)
+            try:
+                if await classifier.ready(challenge_frame):
+                    return None
+            except Exception:  # noqa: BLE001 - readiness probe never fails a solve
+                return None
+            if loop.time() >= deadline:
+                return None
+            await asyncio.sleep(interval)
 
     def _build_vision_adapter(
         self, website_key: str, client_key: Optional[str], params: dict[str, Any]

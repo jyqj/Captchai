@@ -26,6 +26,12 @@ class TaskObject(BaseModel):
     # `rqdata` (a.k.a. enterprise "data") binds the token to a challenge nonce.
     rqdata: str | None = None
     enterprisePayload: dict[str, object] | None = None
+    # Per-task override for hCaptcha page strategy. None => process default
+    # (HCAPTCHA_REAL_PAGE). True navigates the real target and hooks
+    # `hcaptcha.render` (runs the site's own anti-bot JS); False serves the
+    # synthetic injected page at the target hostname (token-relay: faster and
+    # doesn't depend on reproducing the target's session).
+    realPage: bool | None = None
 
     # ── Fingerprint / session binding ──
     # Callers may force a specific User-Agent so the token they submit downstream

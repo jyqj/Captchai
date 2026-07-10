@@ -20,6 +20,7 @@ from ..models.task import (
     SolutionObject,
 )
 from ..core.services import get_services
+from ..services.outcome import record_real_outcome
 from ..services.task_manager import QueueFull, TaskStatus, task_manager
 
 log = logging.getLogger(__name__)
@@ -294,67 +295,14 @@ async def _report_outcome(
     if not claimed:
         return ReportTaskResponse(errorId=0)
 
-    # Proxy-pool per-sitekey real-outcome ranking — only when both ids are
-    # present. Writes into the *real* bucket (``report_sitekey_real``) so the
-    # solver's token-obtained bucket (``report_sitekey``) stays undiluted and
-    # checkout ranking can prefer the real signal when present.
-    if rec.proxy_id and rec.sitekey:
-        try:
-            await services.proxy_pool.report_sitekey_real(
-                rec.proxy_id, rec.sitekey, success=correct
-            )
-        except Exception:  # noqa: BLE001 - non-fatal: report must not 500
-            log.debug(
-                "proxy_pool.report_sitekey_real failed for task %s",
-                request.taskId,
-                exc_info=True,
-            )
-
-    # Real outcome also drives proxy *health*, not just per-sitekey ranking:
-    # a pool proxy whose tokens are rejected downstream (correct=False) accrues
-    # a consecutive-fail streak and cools down, even though it "obtained" a
-    # token during the solve. Without this, a proxy that reliably mints tokens
-    # that Stripe/hCaptcha-enterprise then reject would keep a 100% health
-    # score and be reselected indefinitely. Only pool proxies (rec.proxy_id
-    # set) are governed here; caller-supplied task proxies are the caller's
-    # responsibility.
-    if rec.proxy_id:
-        try:
-            await services.proxy_pool.report(rec.proxy_id, success=correct)
-        except Exception:  # noqa: BLE001 - non-fatal: report must not 500
-            log.debug(
-                "proxy_pool.report (real outcome) failed for task %s",
-                request.taskId,
-                exc_info=True,
-            )
-
-    # Real-outcome accounting (always recorded, even with an empty sitekey).
-    try:
-        await services.accounting.record_real_outcome(
-            rec.sitekey,
-            success=correct,
-            proxy_kind=rec.proxy_kind,
-            model=rec.model,
-        )
-    except Exception:  # noqa: BLE001 - non-fatal
-        log.debug(
-            "accounting.record_real_outcome failed for task %s",
-            request.taskId,
-            exc_info=True,
-        )
-
-    # Session reputation nudge — no-op if the session was already retired.
-    if rec.session_id and services.session_pool is not None:
-        try:
-            await services.session_pool.report_outcome(
-                rec.session_id, success=correct
-            )
-        except Exception:  # noqa: BLE001 - non-fatal
-            log.debug(
-                "session_pool.report_outcome failed for task %s",
-                request.taskId,
-                exc_info=True,
-            )
+    # Fan the real outcome out to proxy health, the per-sitekey real bucket,
+    # success accounting and session reputation. The stored ``SolveRecord``
+    # supplies the egress/session identity; the shared module owns the fan-out
+    # (the solver's inline siteverify path calls the same function), so this
+    # route stays a thin auth + claim + delegate adapter.
+    await record_real_outcome(
+        services, rec, rec.sitekey, success=correct, model=rec.model
+    )
 
     # No post-side-effect mark: the atomic claim above already set
     # reported=True (in-memory under the lock, or via the Redis SET-NX

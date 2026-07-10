@@ -134,6 +134,65 @@ def test_pool_proxy_is_final_category_when_inventory_selected() -> None:
     asyncio.run(run())
 
 
+def test_pool_egress_server_credential_free_by_default() -> None:
+    """Default: the pool egress surfaced to the caller strips credentials."""
+    async def run() -> None:
+        manager = FakeManager()
+        pool = ProxyPool()
+        pool.add(
+            ProxyAsset(
+                id="pool-c",
+                server="http://gw:8080",
+                username="u",
+                password="p",
+            )
+        )
+        services = SimpleNamespace(session_pool=None, proxy_pool=pool)
+        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        params = {"websiteKey": "site", "egress": "pool"}
+
+        ctx = await solver._acquire_context(params)
+        assert params["_egress_server"] == "http://gw:8080"
+        await solver._release_context(ctx, True, params)
+
+    asyncio.run(run())
+
+
+def test_pool_egress_exposes_credentials_when_enabled() -> None:
+    """POOL_EGRESS_EXPOSE_CREDENTIALS surfaces a reusable credentialed egress.
+
+    Without this the caller gets a credential-free gateway they can't route
+    through, so an IP-bound enterprise/Stripe token is worthless. With it on,
+    the full ``scheme://user:pass@host:port`` (sticky session substituted) is
+    surfaced so the caller can reach the SAME exit IP for their submit.
+    """
+    async def run() -> None:
+        config = SimpleNamespace(
+            human_mouse_enabled=False,
+            human_mouse_jitter_ms=0,
+            pool_egress_expose_credentials=True,
+        )
+        manager = FakeManager()
+        pool = ProxyPool()
+        pool.add(
+            ProxyAsset(
+                id="pool-c",
+                server="http://gw:8080",
+                username="u",
+                password="p",
+            )
+        )
+        services = SimpleNamespace(session_pool=None, proxy_pool=pool)
+        solver = BaseBrowserSolver(config, manager=manager, services=services)
+        params = {"websiteKey": "site", "egress": "pool"}
+
+        ctx = await solver._acquire_context(params)
+        assert params["_egress_server"] == "http://u:p@gw:8080"
+        await solver._release_context(ctx, True, params)
+
+    asyncio.run(run())
+
+
 def test_no_proxy_and_no_pool_stays_proxyless() -> None:
     async def run() -> None:
         manager = FakeManager()

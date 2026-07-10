@@ -104,6 +104,10 @@ class ChallengeClassifier:
 
     # Selectors grouped by the signal they imply.
     GRID_SELECTORS = (".task-grid", ".task-image", "table.rc-imageselect-table")
+    # The per-tile selector inside a grid. Counting it separates a real
+    # multi-tile grid from a single-image "click the object" (area-select)
+    # challenge, which hCaptcha also renders with ``.task-image``.
+    TILE_SELECTOR = ".task-image"
     DYNAMIC_MARKERS = (
         ".rc-imageselect-dynamic-selected",
         "[data-dynamic]",
@@ -123,6 +127,21 @@ class ChallengeClassifier:
         ".piece",
     )
     BBOX_SELECTORS = (".bbox-overlay", ".area-select", ".single-image")
+    # Prompt containers — present on every rendered hCaptcha challenge (grid,
+    # area-select, etc.) regardless of interaction shape.
+    PROMPT_SELECTORS = (".prompt-text", ".challenge-prompt")
+    # Any signal that the challenge iframe DOM has actually populated. Used by
+    # the bounded pre-dispatch readiness wait so a slow (1–3s) iframe is given
+    # time to render instead of being classified UNKNOWN / zero-tile — which
+    # reads as "no challenge" and wastes the whole solve attempt + a retry.
+    READY_SELECTORS = (
+        GRID_SELECTORS
+        + SLIDER_SELECTORS
+        + DRAG_SELECTORS
+        + BBOX_SELECTORS
+        + DYNAMIC_MARKERS
+        + PROMPT_SELECTORS
+    )
 
     def __init__(self, vision: Optional[VisionClient] = None) -> None:
         self._vision = vision
@@ -142,9 +161,26 @@ class ChallengeClassifier:
                 return True
         return False
 
+    async def ready(self, frame: Any) -> bool:
+        """True once the challenge iframe DOM shows any recognizable signal.
+
+        A cheap DOM-only probe (no vision) over the union of every shape's
+        selectors plus the prompt containers. Used by the pre-dispatch
+        readiness wait so classification runs against a rendered challenge
+        rather than an empty iframe.
+        """
+        return await self._any(frame, self.READY_SELECTORS)
+
     async def detect(self, frame: Any, ctx: ChallengeContext) -> ChallengeShape:
         # 1. A grid of tiles is the most common shape.
         if await self._any(frame, self.GRID_SELECTORS):
+            # A single ``.task-image`` with no multi-tile grid is hCaptcha's
+            # area-select ("click on the X"), NOT a grid — routing it to the
+            # grid solver asks the model for tile indices on a one-image
+            # coordinate task and always answers wrong. A tile count of exactly
+            # one (language-independent, one cheap DOM read) disambiguates.
+            if await self._count(frame, self.TILE_SELECTOR) == 1:
+                return ChallengeShape.AREA_BBOX
             if await self._any(frame, self.DYNAMIC_MARKERS):
                 return ChallengeShape.RECAPTCHA_DYNAMIC
             return ChallengeShape.GRID_SELECT
@@ -207,6 +243,11 @@ class ChallengeDispatcher:
     ) -> None:
         self._classifier = classifier
         self._registry: Dict[ChallengeShape, ShapeSolver] = dict(registry or {})
+
+    @property
+    def classifier(self) -> ChallengeClassifier:
+        """The classifier used for detection (and the readiness probe)."""
+        return self._classifier
 
     def register(self, shape: ChallengeShape, solver: ShapeSolver) -> None:
         self._registry[shape] = solver

@@ -11,16 +11,12 @@ import asyncio
 import base64
 import io
 import json
-import logging
-import re
 from typing import Any
 
-from openai import AsyncOpenAI
 from PIL import Image
 
-from ..core.config import Config
-
-log = logging.getLogger(__name__)
+from ..parsing.model_call import ModelCallRequest
+from .vision_solver import VisionSolveBase, parse_json_object
 
 SYSTEM_PROMPT = """\
 You are a Computer Vision Data Annotation Assistant.
@@ -90,35 +86,14 @@ TARGET_WIDTH = 1440
 TARGET_HEIGHT = 900
 
 
-class CaptchaRecognizer:
-    """Recognises image-based captchas via an OpenAI-compatible vision API."""
+class CaptchaRecognizer(VisionSolveBase):
+    """Recognises image-based captchas — a thin adapter over the seam.
 
-    def __init__(self, config: Config) -> None:
-        self._config = config
-        self._client = AsyncOpenAI(
-            base_url=config.local_base_url,
-            api_key=config.local_api_key,
-        )
-
-    async def recognize(self, image_bytes: bytes) -> dict[str, Any]:
-        # LANCZOS resize is CPU-bound; run it in a worker thread so a batch of
-        # concurrent recognitions doesn't block the event loop (and every
-        # in-flight browser solve with it).
-        processed = await asyncio.to_thread(self._preprocess_image, image_bytes)
-        b64 = base64.b64encode(processed).decode()
-        data_url = f"data:image/png;base64,{b64}"
-
-        last_error: Exception | None = None
-        for attempt in range(self._config.captcha_retries):
-            try:
-                return await self._call_model(data_url)
-            except Exception as exc:
-                last_error = exc
-                log.warning("Recognition attempt %d failed: %s", attempt + 1, exc)
-
-        raise RuntimeError(
-            f"Recognition failed after {self._config.captcha_retries} attempts: {last_error}"
-        )
+    Supplies only the 1440x900 preprocessing, the annotation prompt and the
+    free-form JSON parsing; the model client, budget gate, connection-error
+    backend fallback and cost metering are inherited from
+    :class:`~src.services.vision_solver.VisionSolveBase`.
+    """
 
     @staticmethod
     def _preprocess_image(image_bytes: bytes) -> bytes:
@@ -129,41 +104,28 @@ class CaptchaRecognizer:
         img.save(buf, format="PNG")
         return buf.getvalue()
 
-    async def _call_model(self, data_url: str) -> dict[str, Any]:
-        response = await self._client.chat.completions.create(
-            model=self._config.captcha_multimodal_model,
+    async def _build_request(self, image_bytes: bytes) -> ModelCallRequest:
+        # LANCZOS resize is CPU-bound; run it in a worker thread so a batch of
+        # concurrent recognitions doesn't block the event loop (and every
+        # in-flight browser solve with it).
+        processed = await asyncio.to_thread(self._preprocess_image, image_bytes)
+        b64 = base64.b64encode(processed).decode()
+        return ModelCallRequest(
+            system_prompt=SYSTEM_PROMPT,
+            user_text=USER_PROMPT,
+            image_urls=[f"data:image/png;base64,{b64}"],
+            tier=1,
+            detail="high",
             temperature=0.05,
             max_tokens=1024,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url, "detail": "high"},
-                        },
-                        {
-                            "type": "text",
-                            "text": USER_PROMPT,
-                        },
-                    ],
-                },
-            ],
+            est_cost=0.002,
         )
 
-        raw = response.choices[0].message.content or ""
-        return self._parse_json(raw)
-
-    @staticmethod
-    def _parse_json(text: str) -> dict[str, Any]:
-        # Strip markdown fences if present
-        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-        cleaned = match.group(1) if match else text.strip()
-        data = json.loads(cleaned)
-        if not isinstance(data, dict):
-            raise ValueError(f"Expected JSON object, got {type(data).__name__}")
-        return data
+    async def recognize(self, image_bytes: bytes) -> dict[str, Any]:
+        """Run the model call for raw image bytes (no metering; convenience)."""
+        req = await self._build_request(image_bytes)
+        result = await self._invoker.invoke(req)
+        return parse_json_object(result.content)
 
     async def solve(self, params: dict[str, Any]) -> dict[str, Any]:
         """Solver interface for TaskManager integration."""
@@ -171,5 +133,6 @@ class CaptchaRecognizer:
         if not body:
             raise ValueError("Missing 'body' field (base64 image)")
         image_bytes = base64.b64decode(body)
-        result = await self.recognize(image_bytes)
-        return {"text": json.dumps(result)}
+        req = await self._build_request(image_bytes)
+        result = await self._invoke(req, params, challenge_shape="image_to_text")
+        return {"text": json.dumps(parse_json_object(result.content))}

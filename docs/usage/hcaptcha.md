@@ -21,18 +21,23 @@ hCaptcha presents a CAPTCHA challenge via an iframe widget. The solver renders t
 |-------|------|-------------|
 | `isInvisible` | bool | Render the widget as invisible and call `execute()` (passive flow). |
 | `rqdata` | string | hCaptcha Enterprise `rqdata` nonce. Forwarded to `hcaptcha.render`; required by enterprise widgets that set it. |
+| `enterprisePayload` | object | Enterprise render config (`rqdata`, `sentry`, `endpoint`, `reportapi`, `assethost`, `imghost`, …). Its keys are **spread flat** onto `hcaptcha.render`, matching the JS API. If you send `rqdata` here (the YesCaptcha convention) it reaches the widget — no separate top-level `rqdata` needed. |
+| `realPage` | bool | Override the page strategy for this task. `false` (enterprise default) serves a synthetic page at the target hostname (token-relay). `true` navigates the real target and hooks `hcaptcha.render` (runs the site's own anti-bot JS). Defaults to `HCAPTCHA_REAL_PAGE`. |
 | `userAgent` | string | Force a UA so the token matches your downstream submission. Echoed back in `solution.userAgent`. |
+| `egress` | string | `auto` (default) / `task` / `pool` / `proxyless`. For enterprise/Stripe use `task` with your own residential proxy (see Stripe note). |
 | `proxyType` / `proxyAddress` / `proxyPort` / `proxyLogin` / `proxyPassword` | | Solve through a proxy. Recommended for reputation-bound / IP-bound flows. |
-| `proxy` | string | Single-string proxy form, e.g. `http://user:pass@host:port`. |
+| `proxy` | string | Single-string proxy form, e.g. `http://user:pass@host:port`. Optional `\|kind=residential` / `\|country=DE` suffixes annotate the proxy. |
 
 ## Stripe note
 
-Stripe's payment/checkout flows present hCaptcha (often enterprise). To solve reliably:
+Stripe's payment/checkout flows present hCaptcha Enterprise (Radar). Enterprise is detected automatically from `rqdata` / `enterprisePayload`. To solve reliably:
 
-1. Pass the exact `websiteURL` that embeds the widget and the correct `websiteKey`.
-2. Provide `rqdata` if Stripe's page sets it on the widget.
-3. Bind a proxy + `userAgent` and reuse the returned `solution.userAgent` (and same IP) when you submit the token.
-4. Quality of the grid-challenge solve depends on your configured vision model (`LOCAL_MODEL`).
+1. Pass the exact `websiteURL` (correct **hostname** — the widget binds the token to `document.location.hostname`) and the correct `websiteKey`.
+2. Capture a **fresh** `rqdata` per challenge from Stripe's own page (it's single-use and session-bound) and pass it (top-level or inside `enterprisePayload`). A stale/missing `rqdata` mints a token Radar rejects even if the grid is answered correctly.
+3. **Match the egress IP.** Enterprise scores IP consistency, so the token must be minted through the **same IP** you submit the card-binding request from. Use `egress=task` with your **own residential/mobile proxy** and reuse that proxy for the Stripe call. Reuse `solution.userAgent` and (`solution.timezoneId` / `acceptLanguage`) too.
+    - If you rely on the server-side pool (`egress=pool`), the minted IP is a server proxy you can't reach — set `POOL_EGRESS_EXPOSE_CREDENTIALS=true` to receive a reusable credentialed `egressServer`, otherwise the token's IP won't match your submit and Radar is likely to reject it.
+4. Enterprise defaults to the **injected page** (token-relay) rather than navigating the real Stripe URL, which usually can't be reproduced from a clean context. Set `realPage: true` per task only if a specific site's own JS must run.
+5. Quality of any grid/area challenge solve depends on your configured vision model (`LOCAL_MODEL` / `CLOUD_MODEL`).
 
 ## Test targets
 

@@ -31,6 +31,10 @@ class CanvasSlideSolver(BaseShapeSolver):
         prompt = await self.read_prompt(frame) or ctx.prompt
         shot = await self.screenshot_element(frame, self.BG_SELECTOR)
         images = [shot] if shot else []
+        # Background-image CSS box + screenshot→CSS scale: the model returns the
+        # gap distance in screenshot pixels, which on a high-DPR (mobile)
+        # context is 2–3× the CSS distance the handle must actually travel.
+        bg_box = await self.element_box(frame, self.BG_SELECTOR)
         result = await self.classify(
             ClassifyRequest(
                 prompt=prompt,
@@ -45,6 +49,11 @@ class CanvasSlideSolver(BaseShapeSolver):
         if distance is None or start is None:
             log.info("canvas_slide: missing distance or handle origin")
             return await self.poll_token()
+
+        # Scale the horizontal distance out of screenshot-pixel space (identity
+        # on DPR-1 desktop; ÷DPR on a mobile fingerprint's 2.6–3.0 context).
+        scale_x, _scale_y = self.screenshot_css_scale(bg_box, shot)
+        distance *= scale_x
 
         sx, sy = start
         await self._slide(frame, sx, sy, distance, ctx)

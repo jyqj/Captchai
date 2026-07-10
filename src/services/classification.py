@@ -12,17 +12,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import json
-import logging
-import re
 from typing import Any
 
-from openai import AsyncOpenAI
 from PIL import Image
 
-from ..core.config import Config
-
-log = logging.getLogger(__name__)
+from ..parsing.model_call import ModelCallRequest
+from .vision_solver import VisionSolveBase, parse_json_object
 
 HCAPTCHA_SYSTEM_PROMPT = """\
 You are an image classification assistant for HCaptcha challenges.
@@ -86,15 +81,14 @@ Rules:
 """
 
 
-class ClassificationSolver:
-    """Solves image classification captchas using a vision model."""
+class ClassificationSolver(VisionSolveBase):
+    """Solves image classification captchas — a thin adapter over the seam.
 
-    def __init__(self, config: Config) -> None:
-        self._config = config
-        self._client = AsyncOpenAI(
-            base_url=config.local_base_url,
-            api_key=config.local_api_key,
-        )
+    Supplies only the per-task prompt corpus, image extraction and the
+    ``{answer|objects}`` output parsing; the model client, budget gate,
+    connection-error backend fallback and cost metering are inherited from
+    :class:`~src.services.vision_solver.VisionSolveBase`.
+    """
 
     async def solve(self, params: dict[str, Any]) -> dict[str, Any]:
         task_type = params.get("type", "")
@@ -106,8 +100,22 @@ class ClassificationSolver:
         if not images:
             raise ValueError("No image data provided")
 
-        result = await self._classify(system_prompt, question, images)
-        return result
+        # PIL decode/format sniffing is CPU-bound; keep it off the event loop.
+        image_urls = await asyncio.gather(
+            *(asyncio.to_thread(self._prepare_image, img_b64) for img_b64 in images)
+        )
+        req = ModelCallRequest(
+            system_prompt=system_prompt,
+            user_text=question if question else "Classify this captcha image.",
+            image_urls=list(image_urls),
+            tier=1,
+            detail="high",
+            temperature=0.05,
+            max_tokens=512,
+            est_cost=0.002 * max(1, len(image_urls)),
+        )
+        result = await self._invoke(req, params, challenge_shape="classification")
+        return parse_json_object(result.content)
 
     @staticmethod
     def _get_system_prompt(task_type: str) -> str:
@@ -156,52 +164,3 @@ class ClassificationSolver:
             return f"data:{mime};base64,{b64_data}"
         except Exception:
             return f"data:image/png;base64,{b64_data}"
-
-    async def _classify(
-        self, system_prompt: str, question: str, images: list[str]
-    ) -> dict[str, Any]:
-        content: list[dict[str, Any]] = []
-
-        # PIL decode/format sniffing is CPU-bound; keep it off the event loop.
-        data_urls = await asyncio.gather(
-            *(asyncio.to_thread(self._prepare_image, img_b64) for img_b64 in images)
-        )
-        for data_url in data_urls:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": data_url, "detail": "high"},
-            })
-
-        user_text = question if question else "Classify this captcha image."
-        content.append({"type": "text", "text": user_text})
-
-        last_error: Exception | None = None
-        for attempt in range(self._config.captcha_retries):
-            try:
-                response = await self._client.chat.completions.create(
-                    model=self._config.captcha_multimodal_model,
-                    temperature=0.05,
-                    max_tokens=512,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": content},
-                    ],
-                )
-                raw = response.choices[0].message.content or ""
-                return self._parse_json(raw)
-            except Exception as exc:
-                last_error = exc
-                log.warning("Classification attempt %d failed: %s", attempt + 1, exc)
-
-        raise RuntimeError(
-            f"Classification failed after {self._config.captcha_retries} attempts: {last_error}"
-        )
-
-    @staticmethod
-    def _parse_json(text: str) -> dict[str, Any]:
-        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-        cleaned = match.group(1) if match else text.strip()
-        data = json.loads(cleaned)
-        if not isinstance(data, dict):
-            raise ValueError(f"Expected JSON object, got {type(data).__name__}")
-        return data

@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 from ..dispatcher import ChallengeContext, VisionClient
 from .human_cursor import human_click
@@ -103,6 +103,81 @@ class BaseShapeSolver:
             return await frame.locator(selector).nth(index).screenshot()
         except Exception:  # noqa: BLE001
             return b""
+
+    # -- coordinate mapping (screenshot pixels -> element CSS pixels) --------
+    #
+    # A Playwright element ``screenshot()`` is rasterised at the context's
+    # ``device_scale_factor``. On a high-DPR context (the mobile / carrier
+    # fingerprints used for enterprise hCaptcha set DPR 2.6–3.0) the PNG is
+    # 2–3× larger than the element's CSS box. Coordinate shapes (area-select,
+    # slide, drag) ask the vision model for a point / distance *in that
+    # screenshot*, so the answer is in screenshot-pixel space and must be
+    # scaled back to CSS pixels before it is applied to ``page.mouse`` /
+    # ``locator.click(position=)`` (both of which consume CSS pixels). Without
+    # this the click lands DPR× too far and misses — silently tanking exactly
+    # the area-select challenges enterprise Radar leans on.
+
+    @staticmethod
+    def png_pixel_size(data: Any) -> Optional[Tuple[int, int]]:
+        """``(width, height)`` from PNG bytes, or ``None`` if not a parseable PNG.
+
+        Reads the IHDR dimensions straight from the header (no Pillow / decode)
+        so it's cheap on the hot path. Playwright screenshots are PNG by
+        default; anything else (or a fake test payload) returns ``None`` and the
+        caller falls back to an identity (1.0) scale.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            return None
+        if len(data) < 24 or bytes(data[:8]) != b"\x89PNG\r\n\x1a\n":
+            return None
+        try:
+            import struct
+
+            width, height = struct.unpack(">II", bytes(data[16:24]))
+        except Exception:  # noqa: BLE001
+            return None
+        if width > 0 and height > 0:
+            return int(width), int(height)
+        return None
+
+    async def element_box(
+        self, frame: Any, selector: str, index: Optional[int] = None
+    ) -> Optional[dict]:
+        """``bounding_box()`` (main-frame CSS coords) for an element, or ``None``.
+
+        Guarded so a fake frame / detached node degrades to ``None`` (the caller
+        then skips coordinate scaling and offset).
+        """
+        try:
+            locator = frame.locator(selector)
+            locator = locator.nth(index) if index is not None else locator.first
+            box = await locator.bounding_box()
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(box, dict) and "width" in box and "height" in box:
+            return box
+        return None
+
+    @staticmethod
+    def screenshot_css_scale(box: Optional[dict], shot: Any) -> Tuple[float, float]:
+        """Scale factors mapping screenshot-pixel coords → element CSS-pixel coords.
+
+        Returns ``(css_w / png_w, css_h / png_h)`` so ``model_coord * scale`` is
+        in the element's CSS space. Falls back to ``(1.0, 1.0)`` whenever the
+        box or the screenshot dimensions can't be read (identity == the
+        pre-fix behaviour, so DPR-1 desktop solves are unchanged).
+        """
+        if not box:
+            return (1.0, 1.0)
+        size = BaseShapeSolver.png_pixel_size(shot)
+        if not size:
+            return (1.0, 1.0)
+        px_w, px_h = size
+        css_w = float(box.get("width") or 0.0)
+        css_h = float(box.get("height") or 0.0)
+        sx = (css_w / px_w) if px_w > 0 and css_w > 0 else 1.0
+        sy = (css_h / px_h) if px_h > 0 and css_h > 0 else 1.0
+        return (sx, sy)
 
     async def screenshot_element(self, frame: Any, selector: str) -> bytes:
         """Screenshot the first element matching *selector*; empty bytes on failure."""

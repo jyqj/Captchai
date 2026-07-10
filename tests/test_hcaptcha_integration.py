@@ -134,14 +134,30 @@ class FakePage:
         return None
 
 
+class FakeRoute:
+    """Minimal Playwright Route so a captured document handler can be run."""
+
+    def __init__(self, resource_type="document"):
+        self.request = SimpleNamespace(resource_type=resource_type)
+        self.fulfilled = None
+        self.continued = False
+
+    async def fulfill(self, *, status=200, content_type=None, body=None):
+        self.fulfilled = {"status": status, "content_type": content_type, "body": body}
+
+    async def continue_(self):
+        self.continued = True
+
+
 class FakeContext:
     def __init__(self, page):
         self._page = page
         self.closed = False
         self.init_scripts = []
+        self.routes = []
 
     async def route(self, url, handler):
-        return None
+        self.routes.append((url, handler))
 
     async def add_init_script(self, script):
         self.init_scripts.append(script)
@@ -248,6 +264,65 @@ def test_grid_challenge_solved_via_vision_and_recorded() -> None:
     asyncio.run(run())
 
 
+def test_slow_rendering_challenge_is_awaited_not_bailed() -> None:
+    """A challenge iframe whose tiles land a few polls late is still solved.
+
+    Before the pre-dispatch readiness wait, classifying an empty iframe yielded
+    zero tiles and the grid solver bailed the whole attempt. The bounded wait
+    lets the DOM populate, so the grid is classified + solved on this attempt.
+    """
+    async def run() -> None:
+        class LateGridPage(FakePage):
+            def __init__(self, *, ready_after=2, tile_count=9):
+                super().__init__(token_after=1, tile_count=tile_count)
+                self._real_tiles = tile_count
+                self._ready_reads = 0
+                self._ready_after = ready_after
+
+            @property  # type: ignore[override]
+            def tile_count(self):
+                # The challenge iframe reports no tiles for the first few reads,
+                # then renders the grid (as a slow real iframe would).
+                self._ready_reads += 1
+                return self._real_tiles if self._ready_reads > self._ready_after else 0
+
+            @tile_count.setter
+            def tile_count(self, value):
+                self._real_tiles = value
+
+        page = LateGridPage(ready_after=2, tile_count=9)
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        vision = FakeVisionRouter(indices=[0, 3, 5])
+        services = _services(vision)
+
+        solver = HCaptchaSolver(
+            # Small poll budgets so the test exercises readiness, not timing.
+            _config(
+                poll_budget_challenge_ready=2.0,
+                poll_budget_challenge=0.1,
+                poll_budget_passive=0.05,
+            ),
+            manager=manager,
+            services=services,
+        )
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-late",
+                "type": "HCaptchaTaskProxyless",
+                "userAgent": "UA-FAKE",
+            }
+        )
+
+        assert result["gRecaptchaResponse"].startswith("P1_")
+        # The grid was classified + solved (not bailed on an empty iframe).
+        assert vision.calls >= 1
+        assert any(".task-image" in c for c in page.clicks)
+
+    asyncio.run(run())
+
+
 def test_solve_records_phase_timing() -> None:
     """The ledger record breaks wall_ms into page-load / challenge / vision phases."""
     async def run() -> None:
@@ -300,7 +375,98 @@ def test_enterprise_fields_forwarded() -> None:
         solver = HCaptchaSolver(_config(), manager=manager, services=None)
         # A task proxy is supplied so the enterprise proxyless-fallback guard
         # does not fire — this test is about enterprise field forwarding, not
-        # proxy enforcement.
+        # proxy enforcement. ``realPage`` is forced on to exercise the real-page
+        # init-script path specifically.
+        await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-ent",
+                "type": "HCaptchaTaskProxyless",
+                "rqdata": "RQ-DATA-XYZ",
+                "enterprisePayload": {"sentry": "value"},
+                "proxy": "http://user:pass@proxy.example.com:8080",
+                "realPage": True,
+            }
+        )
+
+        assert context.init_scripts
+        script = context.init_scripts[0]
+        assert "RQ-DATA-XYZ" in script
+        # enterprisePayload is flattened onto the render options (top-level
+        # ``sentry``), NOT nested under a key hcaptcha.render ignores.
+        assert '"sentry": "value"' in script
+        assert '"enterprise"' not in script
+
+    asyncio.run(run())
+
+
+def test_enterprise_rqdata_from_payload_forwarded() -> None:
+    """rqdata carried INSIDE enterprisePayload (the YesCaptcha schema) reaches
+    the widget — the core enterprise correctness fix.
+
+    A client that follows the YesCaptcha convention sends
+    ``enterprisePayload={"rqdata": ...}`` and NO top-level rqdata. The flattened
+    render options must still carry rqdata, else the widget renders without the
+    enterprise nonce and the token is rejected.
+    """
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+
+        async def eval_token(script, *args):
+            has_token = "__omcToken" in script
+            has_error = "__omcError" in script
+            if has_error and not has_token:
+                return None
+            token = "P1_" + "y" * 40
+            if has_error:
+                return {"token": token, "error": None}
+            return token
+
+        page.evaluate = eval_token  # type: ignore[assignment]
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(_config(), manager=manager, services=None)
+        await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-ent",
+                "type": "HCaptchaTaskProxyless",
+                # No top-level rqdata — it lives inside enterprisePayload.
+                "enterprisePayload": {"rqdata": "RQ-IN-PAYLOAD", "sentry": True},
+                "proxy": "http://user:pass@proxy.example.com:8080",
+                "realPage": True,
+            }
+        )
+
+        assert context.init_scripts
+        script = context.init_scripts[0]
+        assert "RQ-IN-PAYLOAD" in script
+        assert '"sentry": true' in script
+
+    asyncio.run(run())
+
+
+def test_enterprise_defaults_to_injected_page() -> None:
+    """Enterprise no longer forces real-page: default solve uses the injected
+    page (document route), and the flattened enterprise fields land in the
+    synthetic HTML served for the correct hostname."""
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+
+        async def eval_token(script, *args):
+            has_token = "__omcToken" in script
+            has_error = "__omcError" in script
+            if has_error and not has_token:
+                return None
+            token = "P1_" + "y" * 40
+            if has_error:
+                return {"token": token, "error": None}
+            return token
+
+        page.evaluate = eval_token  # type: ignore[assignment]
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(_config(), manager=manager, services=None)
         await solver.solve(
             {
                 "websiteURL": "https://example.com",
@@ -312,10 +478,16 @@ def test_enterprise_fields_forwarded() -> None:
             }
         )
 
-        assert context.init_scripts
-        script = context.init_scripts[0]
-        assert "RQ-DATA-XYZ" in script
-        assert '"enterprise": {"sentry": "value"}' in script
+        # Injected path: a document route was registered, NOT an init script.
+        assert context.init_scripts == []
+        assert context.routes
+        _url, handler = context.routes[0]
+        route = FakeRoute(resource_type="document")
+        await handler(route)
+        body = route.fulfilled["body"]
+        assert "RQ-DATA-XYZ" in body
+        assert '"sentry": "value"' in body
+        assert '"enterprise"' not in body
 
     asyncio.run(run())
 
@@ -755,11 +927,16 @@ def test_enterprise_with_task_proxy_allowed_without_pool() -> None:
             }
         )
         assert result["gRecaptchaResponse"].startswith("P1_")
-        # Enterprise fields were forwarded to the real-page init script.
-        assert context.init_scripts
-        script = context.init_scripts[0]
-        assert "RQ-DATA-XYZ" in script
-        assert '"enterprise": {"sentry": "value"}' in script
+        # Enterprise defaults to the injected page; fields land in the served
+        # HTML (flattened, not nested under an ignored ``enterprise`` key).
+        assert context.init_scripts == []
+        assert context.routes
+        _url, handler = context.routes[0]
+        route = FakeRoute(resource_type="document")
+        await handler(route)
+        body = route.fulfilled["body"]
+        assert "RQ-DATA-XYZ" in body
+        assert '"sentry": "value"' in body
 
     asyncio.run(run())
 

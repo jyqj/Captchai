@@ -32,6 +32,11 @@ class DragDropSolver(BaseShapeSolver):
         prompt = await self.read_prompt(frame) or ctx.prompt
         shot = await self.screenshot_element(frame, self.PUZZLE_SELECTOR)
         images = [shot] if shot else []
+        # Puzzle CSS box + screenshot→CSS scale: source/target come back in
+        # screenshot pixels relative to the puzzle image's top-left, so they're
+        # scaled out of DPR space and shifted by the element's page offset into
+        # absolute viewport coords for page.mouse.
+        box = await self.element_box(frame, self.PUZZLE_SELECTOR)
         result = await self.classify(
             ClassifyRequest(
                 prompt=prompt,
@@ -46,10 +51,26 @@ class DragDropSolver(BaseShapeSolver):
             log.info("drag_drop: no source/target coordinates available")
             return await self.poll_token()
 
-        (sx, sy), (tx, ty) = endpoints
+        (sx, sy), (tx, ty) = self._to_page_coords(endpoints, box, shot)
         await self._drag(frame, sx, sy, tx, ty, ctx)
         await self.human_click_submit(frame, ctx)
         return await self.poll_token()
+
+    def _to_page_coords(
+        self,
+        endpoints: Tuple[Tuple[float, float], Tuple[float, float]],
+        box: Optional[dict],
+        shot: Any,
+    ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """Map screenshot-pixel (image-relative) endpoints to absolute CSS coords."""
+        (sx, sy), (tx, ty) = endpoints
+        scale_x, scale_y = self.screenshot_css_scale(box, shot)
+        off_x = float(box["x"]) if box and "x" in box else 0.0
+        off_y = float(box["y"]) if box and "y" in box else 0.0
+        return (
+            (off_x + sx * scale_x, off_y + sy * scale_y),
+            (off_x + tx * scale_x, off_y + ty * scale_y),
+        )
 
     def _extract_endpoints(
         self, result: Any, ctx: ChallengeContext
