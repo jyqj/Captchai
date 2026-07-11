@@ -5,31 +5,32 @@
   <img src="https://img.shields.io/badge/license-MIT-2563EB?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/task%20types-19-F59E0B?style=flat-square" alt="Task Types">
   <img src="https://img.shields.io/badge/runtime-FastAPI%20%7C%20Playwright%20%7C%20OpenAI--compatible-7C3AED?style=flat-square" alt="Runtime">
-  <img src="https://img.shields.io/badge/deploy-Render%20%7C%20Hugging%20Face%20Spaces-0F172A?style=flat-square" alt="Deploy">
+  <img src="https://img.shields.io/badge/stealth-Camoufox%20%7C%20rebrowser-EF4444?style=flat-square" alt="Stealth runtimes">
   <img src="https://img.shields.io/badge/docs-bilingual-2563EB?style=flat-square" alt="Docs">
 </p>
 
 <h1 align="center">🧩 CaptchAI</h1>
 
 <p align="center">
-  <strong>Self-hostable YesCaptcha-style captcha solver for <a href="https://github.com/TheSmallHanCat/flow2api">flow2api</a> and similar integrations</strong>
+  <strong>Self-hostable, YesCaptcha-compatible captcha solver for <a href="https://github.com/TheSmallHanCat/flow2api">flow2api</a> and similar integrations</strong>
   <br/>
-  <em>19 task types · reCAPTCHA v2/v3 · hCaptcha · Cloudflare Turnstile · Image Classification</em>
+  <em>19 task types · reCAPTCHA v2/v3 · hCaptcha (incl. enterprise) · Cloudflare Turnstile · image classification</em>
 </p>
 
 <p align="center">
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-architecture">Architecture</a> •
   <a href="#-task-types">Task Types</a> •
-  <a href="#-deployment">Deployment</a> •
-  <a href="#-development">Development</a>
+  <a href="#-stealth--anti-detection">Stealth</a> •
+  <a href="#-configuration">Configuration</a> •
+  <a href="#-deployment">Deployment</a>
 </p>
 
 <p align="center">
   <a href="README.zh-CN.md">中文说明</a> •
-  <a href="https://captchai-org.github.io/captchai/">Documentation</a> •
-  <a href="https://captchai-org.github.io/captchai/deployment/render/">Render Guide</a> •
-  <a href="https://captchai-org.github.io/captchai/deployment/huggingface/">Hugging Face Guide</a>
+  <a href="https://github.com/jyqj/Captchai/tree/main/docs">Documentation</a> •
+  <a href="https://github.com/jyqj/Captchai/blob/main/docs/deployment/render.md">Render Guide</a> •
+  <a href="https://github.com/jyqj/Captchai/blob/main/docs/deployment/huggingface.md">Hugging Face Guide</a>
 </p>
 
 <p align="center">
@@ -40,15 +41,21 @@
 
 ## ✨ What Is This?
 
-**CaptchAI** is a self-hosted captcha-solving service exposing a **YesCaptcha-style async API** with **19 supported task types**. Designed as a third-party captcha solver for **flow2api** and systems that expect `createTask` / `getTaskResult` semantics.
+**CaptchAI** is a self-hosted captcha-solving service that speaks the **YesCaptcha async API** (`createTask` / `getTaskResult` / `getBalance`) across **19 task types**. Drop it in as the third-party solver for **flow2api** or anything that expects that protocol.
+
+Two things set it apart from a thin browser wrapper:
+
+- **It's built for real, IP- and fingerprint-bound tokens** — hardened browser runtimes, coherent per-context fingerprints, proxy/User-Agent binding, and human-like interaction — not just a headless Chromium that anti-bot systems flag on sight.
+- **It's cost-aware** — image challenges route to a cheap local vision model first and only escalate hard grids to a cloud model, with a per-solve cost ledger.
 
 | Capability | Details |
 |-----------|---------|
-| **Browser automation** | Playwright + Chromium for reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile |
-| **Image recognition** | Local multimodal model (Qwen3.5-2B via SGLang) for image captcha analysis |
-| **Image classification** | Local vision model for HCaptcha, reCAPTCHA v2, FunCaptcha, AWS grid classification |
-| **API compatibility** | Full YesCaptcha `createTask`/`getTaskResult`/`getBalance` protocol |
-| **Deployment** | Local, Render, Hugging Face Spaces with Docker support |
+| **Browser automation** | Playwright for reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile |
+| **Hardened runtimes** | Stock Chromium, `rebrowser`, or **Camoufox** (Firefox, engine-level anti-fingerprint) for enterprise targets |
+| **Image recognition** | Local multimodal model (Qwen3.5-2B via SGLang) for image-to-text captchas |
+| **Image classification** | Local vision model for hCaptcha / reCAPTCHA v2 / FunCaptcha / AWS grids |
+| **API compatibility** | Full YesCaptcha `createTask` / `getTaskResult` / `getBalance` protocol |
+| **Deployment** | Local, Render, Hugging Face Spaces — Docker-ready |
 
 ---
 
@@ -59,11 +66,11 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 playwright install --with-deps chromium
 
-# Local model (self-hosted via SGLang)
+# Local model (self-hosted via SGLang) — image tasks
 export LOCAL_BASE_URL="http://localhost:30000/v1"
 export LOCAL_MODEL="Qwen/Qwen3.5-2B"
 
-# Cloud model (remote API)
+# Cloud model (OpenAI-compatible) — hard-grid escalation
 export CLOUD_BASE_URL="https://your-openai-compatible-endpoint/v1"
 export CLOUD_API_KEY="your-api-key"
 export CLOUD_MODEL="gpt-5.4"
@@ -72,7 +79,7 @@ export CLIENT_KEY="your-client-key"
 python main.py
 ```
 
-Verify with:
+Verify:
 
 ```bash
 curl http://localhost:8000/api/v1/health
@@ -86,32 +93,34 @@ curl http://localhost:8000/api/v1/health
   <img src="docs/assets/captchai-diagram.png" alt="CaptchAI architecture" width="560">
 </p>
 
-**Core components:**
+A FastAPI front end accepts YesCaptcha tasks and hands them to a solver, which drives a shared browser (one process, an isolated context per solve) and delegates image work to the vision layer.
 
-- **FastAPI** — HTTP API with YesCaptcha protocol
-- **TaskManager** — async in-memory task queue with 10-min TTL
-- **RecaptchaV3Solver** — Playwright-based reCAPTCHA v3/Enterprise token generation
-- **RecaptchaV2Solver** — Playwright-based reCAPTCHA v2 checkbox solving
-- **HCaptchaSolver** — Playwright-based hCaptcha solving
-- **TurnstileSolver** — Playwright-based Cloudflare Turnstile solving
-- **CaptchaRecognizer** — Argus-inspired multimodal image analysis
-- **ClassificationSolver** — Vision model-based image classification
+| Component | Responsibility |
+|-----------|----------------|
+| **FastAPI** | HTTP API implementing the YesCaptcha protocol |
+| **TaskManager** | Async in-memory task queue, 10-minute TTL |
+| **BrowserManager** | One shared browser; per-solve context with proxy + coherent fingerprint |
+| **RecaptchaV3 / V2 Solver** | Playwright reCAPTCHA v3/enterprise token gen and v2 checkbox solving |
+| **HCaptchaSolver** | hCaptcha checkbox → passive → visual-challenge dispatch (incl. enterprise `rqdata`) |
+| **TurnstileSolver** | Cloudflare Turnstile widget solving |
+| **VisionRouter** | Local-first image analysis; escalates hard grids to cloud with self-consistency voting |
+| **ClassificationSolver** | Vision-model image classification |
 
 ---
 
 ## 🧠 Task Types
 
-### Browser-based solving (12 types)
+### Browser-based solving (12)
 
 | Category | Task Types | Solution Field |
 |----------|-----------|----------------|
-| reCAPTCHA v3 | `RecaptchaV3TaskProxyless`, `RecaptchaV3TaskProxylessM1`, `RecaptchaV3TaskProxylessM1S7`, `RecaptchaV3TaskProxylessM1S9` | `gRecaptchaResponse` |
-| reCAPTCHA v3 Enterprise | `RecaptchaV3EnterpriseTask`, `RecaptchaV3EnterpriseTaskM1` | `gRecaptchaResponse` |
+| reCAPTCHA v3 | `RecaptchaV3TaskProxyless`, `…M1`, `…M1S7`, `…M1S9` | `gRecaptchaResponse` |
+| reCAPTCHA v3 Enterprise | `RecaptchaV3EnterpriseTask`, `…M1` | `gRecaptchaResponse` |
 | reCAPTCHA v2 | `NoCaptchaTaskProxyless`, `RecaptchaV2TaskProxyless`, `RecaptchaV2EnterpriseTaskProxyless` | `gRecaptchaResponse` |
 | hCaptcha | `HCaptchaTaskProxyless` | `gRecaptchaResponse` |
 | Cloudflare Turnstile | `TurnstileTaskProxyless`, `TurnstileTaskProxylessM1` | `token` |
 
-### Image recognition (3 types)
+### Image recognition (3)
 
 | Task Type | Solution Field |
 |-----------|----------------|
@@ -119,7 +128,7 @@ curl http://localhost:8000/api/v1/health
 | `ImageToTextTaskMuggle` | `text` |
 | `ImageToTextTaskM1` | `text` |
 
-### Image classification (4 types)
+### Image classification (4)
 
 | Task Type | Solution Field |
 |-----------|----------------|
@@ -139,7 +148,8 @@ curl http://localhost:8000/api/v1/health
 | `POST /getBalance` | Return compatibility balance |
 | `GET /api/v1/health` | Health and service status |
 
-### Example: reCAPTCHA v3
+<details>
+<summary><strong>Example: reCAPTCHA v3</strong></summary>
 
 ```bash
 curl -X POST http://localhost:8000/createTask \
@@ -154,8 +164,10 @@ curl -X POST http://localhost:8000/createTask \
     }
   }'
 ```
+</details>
 
-### Example: hCaptcha
+<details>
+<summary><strong>Example: hCaptcha</strong></summary>
 
 ```bash
 curl -X POST http://localhost:8000/createTask \
@@ -169,8 +181,10 @@ curl -X POST http://localhost:8000/createTask \
     }
   }'
 ```
+</details>
 
-### Example: Cloudflare Turnstile
+<details>
+<summary><strong>Example: Cloudflare Turnstile</strong></summary>
 
 ```bash
 curl -X POST http://localhost:8000/createTask \
@@ -184,8 +198,10 @@ curl -X POST http://localhost:8000/createTask \
     }
   }'
 ```
+</details>
 
-### Example: Image classification
+<details>
+<summary><strong>Example: image classification</strong></summary>
 
 ```bash
 curl -X POST http://localhost:8000/createTask \
@@ -199,14 +215,33 @@ curl -X POST http://localhost:8000/createTask \
     }
   }'
 ```
+</details>
 
-### Poll result
+<details>
+<summary><strong>Poll result</strong></summary>
 
 ```bash
 curl -X POST http://localhost:8000/getTaskResult \
   -H "Content-Type: application/json" \
   -d '{"clientKey": "your-client-key", "taskId": "uuid-from-createTask"}'
 ```
+</details>
+
+---
+
+## 🕵️ Stealth & Anti-Detection
+
+Real sitekeys — especially enterprise hCaptcha (e.g. Stripe Radar) and Cloudflare — score the browser, not just the answer. CaptchAI's solve path is built to survive that scoring:
+
+- **Hardened browser runtimes.** `BROWSER_RUNTIME=camoufox` runs a patched Firefox build that spoofs navigator/WebGL/canvas/screen at the **engine level** (no injected JS to detect); `rebrowser` is a patched-Chromium option. Stock Chromium's automation and software-WebGL signals are trivially flagged, so enterprise solves should use a hardened runtime.
+- **Camoufox isolated-world DOM bridge.** Camoufox runs page scripts in an isolated world, so the token handoff goes through hidden **DOM elements** rather than `window.*` globals — which an isolated-world `evaluate` cannot read. This is what makes token capture, the invisible `execute()` trigger, and error surfacing actually work on the Firefox-based hardened runtime.
+- **Coherent per-context fingerprint.** User-Agent, `navigator.platform`, WebGL vendor/renderer, languages, and timezone are drawn from one consistent profile per context — not one hard-coded stealth blob reused everywhere (itself a signal).
+- **Proxy + User-Agent binding.** Tokens are IP- and UA-bound; the solve runs through the task/pool proxy and echoes back the exact `userAgent` and egress identity so your downstream submit matches.
+- **WebRTC leak guard.** WebRTC is forced through the proxy (or blocked under Camoufox) so the host's real pre-proxy IP never leaks past the egress.
+- **Human-like interaction.** Pointer paths and pre-`execute()` motion seed a real `motionData` buffer, so passive hCaptcha scoring doesn't see an empty-motion "bot" browser.
+- **Real-page mode.** Optionally navigate the real target and hook the widget's own `render` (resource-blocking off) for sites whose own anti-bot JS must run.
+
+See the [Configuration](#-configuration) table for the knobs that drive all of this.
 
 ---
 
@@ -214,7 +249,7 @@ curl -X POST http://localhost:8000/getTaskResult \
 
 ### Model backends
 
-CaptchAI uses two model backends — a **local model** for image tasks and a **cloud model** for complex reasoning:
+CaptchAI uses a **local model** for image tasks and a **cloud model** for hard-grid escalation:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -234,35 +269,44 @@ CaptchAI uses two model backends — a **local model** for image tasks and a **c
 | `CAPTCHA_TIMEOUT` | Model timeout (seconds) | `30` |
 | `CAPTCHA_MAX_CONCURRENCY` | Max concurrent browser solves | `4` |
 | `CAPTCHA_SOLVE_TIMEOUT` | Per-task wall-clock budget (seconds) | `180` |
-| `BROWSER_HEADLESS` | Headless Chromium | `true` |
+| `SERVER_HOST` / `SERVER_PORT` | Bind host / port | `0.0.0.0` / `8000` |
+
+### Browser & stealth
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BROWSER_HEADLESS` | Headless browser | `true` |
 | `BROWSER_TIMEOUT` | Page load timeout (seconds) | `30` |
-| `BROWSER_RUNTIME` | Browser runtime: `chromium` (stock) \| `rebrowser` \| `camoufox` | `chromium` |
-| `BROWSER_RUNTIME_STRICT` | Fail startup instead of silently degrading to stock Chromium when the requested hardened runtime is unavailable (recommended for enterprise hCaptcha) | `false` |
-| `ENTERPRISE_REQUIRE_HARDENED_RUNTIME` | Refuse (instead of warn about) an **enterprise** hCaptcha solve on stock Chromium — its automation + software-WebGL signals are trivially flagged. Set with `BROWSER_RUNTIME=camoufox` | `false` |
-| `ENTERPRISE_FRESH_CONTEXT` | Use a fresh browser context per enterprise solve (avoids reusing one sticky session across a sitekey, a pattern enterprise risk models cluster on) | `true` |
-| `HCAPTCHA_DEVICE_PERSISTENCE` | Re-seed the hCaptcha device-trust cookie (`hmt`) per egress identity into fresh contexts, so an enterprise solve presents a **returning** device (not zero-history) while keeping fresh-context isolation. In-memory only | `false` |
-| `HCAPTCHA_INVISIBLE_MOTION_SECONDS` | Seconds of continuous wander/scroll motion seeded before an invisible widget's `execute()`, so passive scoring sees a real `motionData` buffer | `3.0` |
-| `HCAPTCHA_INVISIBLE_PASSIVE_BUDGET` | Passive-token wait (seconds) for an invisible solve before falling through to a visual challenge (the `/getcaptcha` round-trip through a residential proxy often exceeds the checkbox-path budget) | `4.0` |
-| `HCAPTCHA_RQDATA_TTL` | Enterprise `rqdata` freshness budget (seconds); a slower solve appends an "rqdata may have expired" note to `solution.warnings`. `0` disables | `30` |
-| `HUMAN_PASSIVE_MOTION_SECONDS` | Seconds of continuous pre-checkbox wander/scroll seeded into `motionData` (a single short burst reads as an empty motion buffer to hCaptcha) | `1.4` |
-| `CAMOUFOX_HUMANIZE` | Enable Camoufox's built-in human-like cursor motion (only when `BROWSER_RUNTIME=camoufox`) | `true` |
+| `BROWSER_RUNTIME` | `chromium` (stock) \| `rebrowser` \| `camoufox` | `chromium` |
+| `BROWSER_RUNTIME_STRICT` | Fail startup instead of silently degrading to stock Chromium when a hardened runtime is unavailable (recommended for enterprise hCaptcha) | `false` |
+| `CAMOUFOX_HUMANIZE` | Camoufox built-in human-like cursor motion | `true` |
 | `CAMOUFOX_BLOCK_WEBRTC` | Block WebRTC under Camoufox to prevent an IP leak past the proxy | `true` |
-| `CAMOUFOX_OS` | Optional OS pin for Camoufox's spoofed fingerprint (comma list of `windows`/`macos`/`linux`; empty = randomise) | unset |
-| `VISION_STITCH_GRID` | Compose multi-tile grid challenges into one montage image per model call (~N× cheaper tokens/latency); set `false` for max per-tile resolution | `true` |
-| `PROXY_MAX_GB` | Per-proxy bandwidth quota in GB before the proxy is burned (removed from rotation); `0` = unlimited | `0` |
-| `SERVER_HOST` | Bind host | `0.0.0.0` |
-| `SERVER_PORT` | Bind port | `8000` |
+| `CAMOUFOX_OS` | Optional OS pin for Camoufox's spoofed fingerprint (`windows`/`macos`/`linux`; empty = randomise) | unset |
+| `HUMAN_PASSIVE_MOTION_SECONDS` | Seconds of pre-checkbox wander/scroll seeded into `motionData` | `1.4` |
+| `VISION_STITCH_GRID` | Compose grid tiles into one montage per model call (cheaper); `false` for max per-tile resolution | `true` |
+| `PROXY_MAX_GB` | Per-proxy bandwidth quota (GB) before the proxy is burned; `0` = unlimited | `0` |
 
-### Proxy & User-Agent binding (Turnstile / hCaptcha / reCAPTCHA)
+### Enterprise hCaptcha
 
-Cloudflare and Google (and hCaptcha **Enterprise**) bind tokens to the **egress IP** and **User-Agent** used at solve time. For real (non-test) sitekeys, pass a proxy and reuse the returned `solution.userAgent` (and the same proxy IP) when submitting the token downstream.
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ENTERPRISE_REQUIRE_HARDENED_RUNTIME` | Refuse (not just warn about) an enterprise solve on stock Chromium | `false` |
+| `ENTERPRISE_FRESH_CONTEXT` | Fresh browser context per enterprise solve (avoids reusing one sticky session on a sitekey) | `true` |
+| `HCAPTCHA_DEVICE_PERSISTENCE` | Re-seed the hCaptcha device-trust cookie (`hmt`) per egress into fresh contexts, so a solve presents a **returning** device (in-memory only) | `false` |
+| `HCAPTCHA_INVISIBLE_MOTION_SECONDS` | Seconds of motion seeded before an invisible widget's `execute()` | `3.0` |
+| `HCAPTCHA_INVISIBLE_PASSIVE_BUDGET` | Passive-token wait (seconds) before falling through to a visual challenge | `4.0` |
+| `HCAPTCHA_RQDATA_TTL` | Enterprise `rqdata` freshness budget (seconds); slower solves get an "may have expired" warning. `0` disables | `30` |
 
-The solution also echoes the **egress identity** so you can align an IP-bound submit even when the service solved on its own pool proxy:
+> Legacy vars (`CAPTCHA_BASE_URL`, `CAPTCHA_API_KEY`, `CAPTCHA_MODEL`, `CAPTCHA_MULTIMODAL_MODEL`) are still honoured as fallbacks.
+
+### Proxy & User-Agent binding
+
+Cloudflare, Google, and hCaptcha **Enterprise** bind tokens to the **egress IP** and **User-Agent** at solve time. For real sitekeys, pass a proxy and reuse the returned `solution.userAgent` (and the same IP) when you submit the token downstream. The solution echoes the egress so you can align an IP-bound submit:
 
 - `solution.proxyKind` — `proxyless` \| `pool_proxy` \| `task_proxy`
-- `solution.egressServer` — the credential-free proxy gateway (`scheme://host:port`) that minted the token, or `null` for proxyless solves. Route your downstream request (e.g. the Stripe card-binding call) through this same egress when the token is IP-bound.
+- `solution.egressServer` — the credential-free proxy gateway (`scheme://host:port`) that minted the token, or `null` for proxyless solves.
 
-> **Enterprise hCaptcha (e.g. Stripe):** supply your own proxy (`egress=task` / proxy fields) so the solve and your downstream submit share one IP, or route your submit through the returned `egressServer`. A token minted on a different IP than the submit will be rejected. Run the hardened **Camoufox** runtime (`BROWSER_RUNTIME=camoufox` + `BROWSER_RUNTIME_STRICT=true`; install per `requirements.txt`) — stock Chromium's automation signals are trivially flagged by enterprise detectors.
+> **Enterprise hCaptcha (e.g. Stripe):** supply your own proxy (`egress=task`) so the solve and your submit share one IP, or route your submit through the returned `egressServer` — a token minted on a different IP than the submit is rejected. Run `BROWSER_RUNTIME=camoufox` + `BROWSER_RUNTIME_STRICT=true`.
 
 ```jsonc
 "task": {
@@ -271,28 +315,26 @@ The solution also echoes the **egress identity** so you can align an IP-bound su
   "websiteKey": "0x4AAA...",
   "action": "login",          // if the widget sets one
   "cData": "…",               // if the widget sets one
-  "userAgent": "Mozilla/5.0 … Chrome/131.0.0.0 Safari/537.36",
+  "userAgent": "Mozilla/5.0 … Chrome/149.0.0.0 Safari/537.36",
   "proxyType": "http", "proxyAddress": "1.2.3.4", "proxyPort": 8080,
   "proxyLogin": "user", "proxyPassword": "pass"
 }
 ```
 
-> Legacy vars (`CAPTCHA_BASE_URL`, `CAPTCHA_API_KEY`, `CAPTCHA_MODEL`, `CAPTCHA_MULTIMODAL_MODEL`) are supported as fallbacks.
-
 ---
 
 ## 🚀 Deployment
 
-- [Local model (SGLang)](https://captchai-org.github.io/captchai/deployment/local-model/) — deploy Qwen3.5-2B locally
-- [Render deployment](https://captchai-org.github.io/captchai/deployment/render/)
-- [Hugging Face Spaces deployment](https://captchai-org.github.io/captchai/deployment/huggingface/)
-- [Full documentation](https://captchai-org.github.io/captchai/)
+- [Local model (SGLang)](https://github.com/jyqj/Captchai/blob/main/docs/deployment/local-model.md) — deploy Qwen3.5-2B locally
+- [Render deployment](https://github.com/jyqj/Captchai/blob/main/docs/deployment/render.md)
+- [Hugging Face Spaces deployment](https://github.com/jyqj/Captchai/blob/main/docs/deployment/huggingface.md)
+- [Full documentation](https://github.com/jyqj/Captchai/tree/main/docs)
 
 ---
 
 ## ✅ Test Target
 
-This service is validated against the public reCAPTCHA v3 score detector:
+Validated against the public reCAPTCHA v3 score detector:
 
 - URL: `https://antcpt.com/score_detector/`
 - Site key: `6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf`
@@ -309,18 +351,6 @@ This service is validated against the public reCAPTCHA v3 score detector:
 
 ---
 
-## 📢 Disclaimer
-
-> **This project is intended for legitimate research, security testing, and educational purposes only.**
-
-- CaptchAI is a self-hostable tool. You are solely responsible for how you deploy and use it.
-- CAPTCHA systems exist to protect services from abuse. **Do not use this tool to bypass CAPTCHAs on websites or services without explicit permission from the site owner.**
-- Unauthorized automated access to third-party services may violate their Terms of Service, and may be illegal under applicable laws (e.g., the Computer Fraud and Abuse Act, GDPR, or equivalent legislation in your jurisdiction).
-- The authors and contributors of this project **accept no liability** for any misuse, legal consequences, or damages arising from the use of this software.
-- By using this software, you agree that you are solely responsible for ensuring your usage complies with all relevant laws and terms of service.
-
----
-
 ## 🔧 Development
 
 ```bash
@@ -331,14 +361,25 @@ python -m mkdocs build --strict
 
 ---
 
+## 📢 Disclaimer
+
+> **This project is intended for legitimate research, security testing, and educational purposes only.**
+
+- CaptchAI is a self-hostable tool. You are solely responsible for how you deploy and use it.
+- CAPTCHA systems exist to protect services from abuse. **Do not use this tool to bypass CAPTCHAs without explicit permission from the site owner.**
+- Unauthorized automated access to third-party services may violate their Terms of Service and applicable laws (e.g. the Computer Fraud and Abuse Act, GDPR, or local equivalents).
+- The authors and contributors **accept no liability** for any misuse, legal consequences, or damages arising from use of this software.
+
+See [DISCLAIMER.md](DISCLAIMER.md) for full terms.
+
+---
+
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=captchai-org/captchai&type=Date)](https://www.star-history.com/#captchai-org/captchai&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=jyqj/Captchai&type=Date)](https://www.star-history.com/#jyqj/Captchai&Date)
 
 ---
 
 ## 📄 License
 
 [MIT](LICENSE) — use freely, modify openly, deploy carefully.
-
-See [DISCLAIMER.md](DISCLAIMER.md) for full terms of use and liability limitations.
