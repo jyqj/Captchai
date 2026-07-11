@@ -93,6 +93,29 @@ class ShapeSolver(Protocol):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ClassifierSelectors:
+    """Provider-scoped selector overrides for challenge-shape detection.
+
+    The classifier ships generic multi-provider defaults (grid + GeeTest slider
+    + reCAPTCHA dynamic markers + …). A single provider's challenge DOM only
+    uses a subset, and feeding it the other providers' class names invites
+    misclassification — e.g. hCaptcha has no GeeTest sliders, so carrying
+    ``.geetest_slider_button`` in its detection set is pure noise. A provider
+    passes only the sets it wants to pin; ``None`` fields fall back to the
+    classifier's generic class constants (so the default classifier — and every
+    existing test — is unchanged).
+    """
+
+    grid: "tuple[str, ...] | None" = None
+    tile: "str | None" = None
+    dynamic_markers: "tuple[str, ...] | None" = None
+    slider: "tuple[str, ...] | None" = None
+    drag: "tuple[str, ...] | None" = None
+    bbox: "tuple[str, ...] | None" = None
+    prompt: "tuple[str, ...] | None" = None
+
+
 class ChallengeClassifier:
     """Detect the challenge shape from cheap DOM signals first, vision fallback.
 
@@ -143,8 +166,43 @@ class ChallengeClassifier:
         + PROMPT_SELECTORS
     )
 
-    def __init__(self, vision: Optional[VisionClient] = None) -> None:
+    def __init__(
+        self,
+        vision: Optional[VisionClient] = None,
+        *,
+        selectors: "ClassifierSelectors | None" = None,
+        vision_hint: bool = True,
+    ) -> None:
         self._vision = vision
+        # Whether to ask the vision client "what shape is this?" when DOM
+        # detection fails. Only useful when the injected vision object can
+        # actually return a shape name; a plain grid ``VisionRouter`` cannot, so
+        # hCaptcha disables it and relies on the dispatcher's UNKNOWN fallback
+        # instead of paying for a model call that can never yield a shape.
+        self._vision_hint = vision_hint
+        sel = selectors or ClassifierSelectors()
+        # Instance selector sets: a provider override wins, else the generic
+        # class constant. Detection reads these instance attributes so a
+        # provider (hCaptcha) isn't muddied by other providers' class names.
+        self._grid = sel.grid if sel.grid is not None else self.GRID_SELECTORS
+        self._tile = sel.tile if sel.tile is not None else self.TILE_SELECTOR
+        self._dynamic = (
+            sel.dynamic_markers
+            if sel.dynamic_markers is not None
+            else self.DYNAMIC_MARKERS
+        )
+        self._slider = sel.slider if sel.slider is not None else self.SLIDER_SELECTORS
+        self._drag = sel.drag if sel.drag is not None else self.DRAG_SELECTORS
+        self._bbox = sel.bbox if sel.bbox is not None else self.BBOX_SELECTORS
+        self._prompt = sel.prompt if sel.prompt is not None else self.PROMPT_SELECTORS
+        self._ready = (
+            tuple(self._grid)
+            + tuple(self._slider)
+            + tuple(self._drag)
+            + tuple(self._bbox)
+            + tuple(self._dynamic)
+            + tuple(self._prompt)
+        )
 
     async def _count(self, frame: Any, selector: str) -> int:
         """Guarded ``frame.locator(selector).count()`` -> int (0 on any error)."""
@@ -169,43 +227,46 @@ class ChallengeClassifier:
         readiness wait so classification runs against a rendered challenge
         rather than an empty iframe.
         """
-        return await self._any(frame, self.READY_SELECTORS)
+        return await self._any(frame, self._ready)
 
     async def detect(self, frame: Any, ctx: ChallengeContext) -> ChallengeShape:
         # 1. A grid of tiles is the most common shape.
-        if await self._any(frame, self.GRID_SELECTORS):
+        if await self._any(frame, self._grid):
             # A single ``.task-image`` with no multi-tile grid is hCaptcha's
             # area-select ("click on the X"), NOT a grid — routing it to the
             # grid solver asks the model for tile indices on a one-image
             # coordinate task and always answers wrong. A tile count of exactly
             # one (language-independent, one cheap DOM read) disambiguates.
-            if await self._count(frame, self.TILE_SELECTOR) == 1:
+            if await self._count(frame, self._tile) == 1:
                 return ChallengeShape.AREA_BBOX
-            if await self._any(frame, self.DYNAMIC_MARKERS):
+            if self._dynamic and await self._any(frame, self._dynamic):
                 return ChallengeShape.RECAPTCHA_DYNAMIC
             return ChallengeShape.GRID_SELECT
 
         # 2. Slider / canvas puzzles.
-        if await self._any(frame, self.SLIDER_SELECTORS):
+        if self._slider and await self._any(frame, self._slider):
             return ChallengeShape.CANVAS_SLIDE
 
         # 3. Drag-a-piece-to-a-slot puzzles.
-        if await self._any(frame, self.DRAG_SELECTORS):
+        if self._drag and await self._any(frame, self._drag):
             return ChallengeShape.DRAG_DROP
 
         # 4. A single image with a click/area overlay.
-        if await self._any(frame, self.BBOX_SELECTORS):
+        if self._bbox and await self._any(frame, self._bbox):
             return ChallengeShape.AREA_BBOX
 
         # 5. Nothing recognizable via DOM. Optionally ask vision "what kind?".
-        if self._vision is not None:
-            hinted = await self._vision_hint(frame, ctx)
+        #    Skipped when the injected vision object can't return a shape (the
+        #    grid VisionRouter): the dispatcher's UNKNOWN fallback handles it
+        #    without a wasted, image-less model call.
+        if self._vision is not None and self._vision_hint:
+            hinted = await self._vision_hint_shape(frame, ctx)
             if hinted is not None:
                 return hinted
 
         return ChallengeShape.UNKNOWN
 
-    async def _vision_hint(
+    async def _vision_hint_shape(
         self, frame: Any, ctx: ChallengeContext
     ) -> Optional[ChallengeShape]:
         """Best-effort vision fallback. Never raises."""
@@ -240,9 +301,17 @@ class ChallengeDispatcher:
         self,
         classifier: ChallengeClassifier,
         registry: Optional[Dict[ChallengeShape, ShapeSolver]] = None,
+        *,
+        unknown_fallback: Optional[ChallengeShape] = None,
     ) -> None:
         self._classifier = classifier
         self._registry: Dict[ChallengeShape, ShapeSolver] = dict(registry or {})
+        # When detection yields UNKNOWN (a provider class-name change, an
+        # unfamiliar challenge layout), fall back to this shape's solver rather
+        # than giving up the whole attempt. hCaptcha sets GRID_SELECT — its
+        # dominant shape — so a renamed ``.task-image`` degrades to "attempt the
+        # grid" instead of a hard miss + retry.
+        self._unknown_fallback = unknown_fallback
 
     @property
     def classifier(self) -> ChallengeClassifier:
@@ -268,6 +337,16 @@ class ChallengeDispatcher:
         the same challenge twice, doubling the cost on the vision-fallback path).
         """
         shape = await self._classifier.detect(frame, ctx)
+        # UNKNOWN → optional fallback shape (e.g. hCaptcha's grid) so a DOM
+        # signature change or an unrecognised layout still gets one real solve
+        # attempt instead of an immediate miss.
+        if shape is ChallengeShape.UNKNOWN and self._unknown_fallback is not None:
+            log.info(
+                "Challenge UNKNOWN; falling back to %s (task_id=%s)",
+                self._unknown_fallback.value,
+                ctx.task_id,
+            )
+            shape = self._unknown_fallback
         log.info("Challenge classified as %s (task_id=%s)", shape.value, ctx.task_id)
         if on_detected is not None:
             try:

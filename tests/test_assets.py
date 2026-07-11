@@ -290,6 +290,66 @@ def test_build_stealth_js_canvas_offset_differs_per_fingerprint() -> None:
     assert o1 != o2 or fp1.user_agent != fp2.user_agent
 
 
+def test_build_stealth_js_canvas_noise_covers_todataurl_and_toblob() -> None:
+    """The canvas noise is applied on BOTH read paths, not just getImageData.
+
+    The previous toDataURL override was a no-op (it called the original with no
+    noise), so the most common canvas-fingerprint path (``toDataURL()``) saw an
+    un-noised canvas. Both toDataURL and toBlob must now route through the shared
+    noiser, and the perturbation must be idempotent LSB-forcing (stable across
+    repeated reads) rather than add-and-wrap (which drifts).
+    """
+    js = build_stealth_js(generate_fingerprint(seed="canvas-paths"))
+    assert "toDataURL = function" in js
+    assert "toBlob = function" in js
+    # Both overrides invoke the shared noiser before the original call.
+    assert js.count("_applyCanvasNoise(this)") >= 2
+    # Idempotent LSB force (not the old add-and-wrap that drifted on re-read).
+    assert "& 0xfe" in js
+    assert "+ _offset) & 0xff" not in js
+
+
+def test_build_stealth_js_hardens_webgl_surface() -> None:
+    """WebGL spoofing covers the whole capability surface, not just vendor/renderer.
+
+    A GPU-less headless host falls back to SwiftShader whose params + extension
+    list read as software rendering and contradict the discrete-GPU strings the
+    layer spoofs. The stealth JS now also overrides ``getSupportedExtensions``
+    and high-signal ``getParameter`` values (e.g. MAX_TEXTURE_SIZE 3379).
+    """
+    js = build_stealth_js(generate_fingerprint(seed="webgl-surface"))
+    assert "getSupportedExtensions" in js
+    assert "WEBGL_debug_renderer_info" in js  # a real extension in the list
+    assert "3379" in js  # MAX_TEXTURE_SIZE param id
+    assert "ALIASED_LINE_WIDTH_RANGE" in js
+
+
+def test_build_stealth_js_adds_audio_screen_and_connection() -> None:
+    """Deep hardening: AudioContext noise, coherent window.screen, connection."""
+    fp = generate_fingerprint(seed="deep-hardening")
+    js = build_stealth_js(fp)
+    # AudioContext fingerprint perturbation (idempotent, guarded by a WeakSet).
+    assert "getChannelData" in js
+    assert "_audioSeen" in js
+    # window.screen coherence (availWidth/colorDepth) so a headless host doesn't
+    # report 0/odd screen dims contradicting the spoofed viewport.
+    assert "window.screen" in js
+    assert "colorDepth" in js
+    # navigator.connection present (its absence is a headless tell).
+    assert "'connection'" in js
+    assert "effectiveType" in js
+
+
+def test_stealth_screen_availheight_is_coherent_desktop_vs_mobile() -> None:
+    """Desktop leaves room for a taskbar (availHeight < height); mobile is full."""
+    import re
+
+    desktop = build_stealth_js(generate_fingerprint(seed="scr-d"))
+    mobile = build_stealth_js(generate_fingerprint(seed="scr-m", mobile=True))
+    for js in (desktop, mobile):
+        assert re.search(r"availHeight:\s*\d+", js) is not None
+
+
 def test_context_kwargs_includes_timezone_and_proxy() -> None:
     fp = generate_fingerprint(seed="ck")
     proxy = {"server": "http://host:8080", "username": "u", "password": "p"}

@@ -113,6 +113,12 @@ class Config:
     # is preserved so the index contract is unchanged. Set false to send each
     # tile as its own image (max per-tile resolution, higher cost).
     vision_stitch_grid: bool
+    # When false (the default), the model's SELF-REPORTED confidence is NOT
+    # trusted to decide a grid answer (a small model is frequently confidently
+    # wrong): grid challenges instead derive confidence from cross-sample
+    # agreement (self-consistency voting) and escalate on low agreement. Set
+    # true to restore the legacy behaviour of gating on the model's own number.
+    vision_trust_self_confidence: bool
 
     # ── Resource interception (WP4 performance) ──
     # When true, BrowserManager._build_context registers a per-context route
@@ -172,12 +178,18 @@ class Config:
     # Set to false in tests / dev to relax the requirement (any pool proxy
     # is accepted, or a task proxy if explicitly supplied).
     enterprise_require_residential: bool
-    # When true, enterprise hCaptcha solves use a fresh browser context per
-    # solve instead of a reused warm session, so a single sticky proxy's cookie
-    # jar / fingerprint isn't reused to repeatedly hit the same sitekey (a
-    # pattern enterprise risk models cluster on). Off by default (warm-session
-    # reuse is faster); turn on for the hardest enterprise targets.
+    # When true (the default), enterprise hCaptcha solves use a fresh browser
+    # context per solve instead of a reused warm session, so a single sticky
+    # proxy's cookie jar / fingerprint isn't reused to repeatedly hit the same
+    # sitekey (a pattern enterprise risk models cluster on). Costs a little
+    # per-solve setup; set false to trade that safety for warm-session speed.
     enterprise_fresh_context: bool
+    # When true, an enterprise hCaptcha solve on stock (non-hardened) Chromium
+    # is REFUSED rather than attempted. Stock Chromium's automation +
+    # software-WebGL signals are trivially flagged by enterprise detectors, so
+    # this lets an operator guarantee enterprise solves only run on a hardened
+    # runtime (BROWSER_RUNTIME=camoufox/rebrowser). Off by default (warns only).
+    enterprise_require_hardened_runtime: bool
 
     # WP6: enforce the residential requirement even for a caller-supplied task
     # proxy on enterprise hCaptcha. Off by default — a caller task proxy is
@@ -212,6 +224,27 @@ class Config:
     turnstile_real_page: bool
     human_mouse_enabled: bool
     human_mouse_jitter_ms: int
+    # Seconds of continuous pre-interaction wander/scroll seeded into the
+    # motionData buffer before the checkbox click (a single short burst reads as
+    # "empty motion buffer" to hCaptcha's passive scoring).
+    human_passive_motion_seconds: float
+    # Invisible hCaptcha is scored purely on the passive behaviour timeline, so
+    # it gets a longer motion seed before execute() and a longer passive-token
+    # budget than the checkbox path (the /getcaptcha round-trip through a
+    # residential proxy commonly exceeds the 2s checkbox-path budget).
+    hcaptcha_invisible_motion_seconds: float
+    hcaptcha_invisible_passive_budget: float
+    # Conservative freshness budget (seconds) for a single-use enterprise rqdata
+    # nonce. A solve that exceeds it appends a caller-facing warning that the
+    # token may be rejected because the nonce expired. 0 disables the warning.
+    hcaptcha_rqdata_ttl: float
+    # Opt-in: persist the hCaptcha device-trust cookie (``hmt``) per egress
+    # identity and re-seed it into fresh contexts, so an enterprise solve
+    # presents a RETURNING device instead of a zero-history one (which
+    # enterprise risk models penalise). Off by default — in-memory only; pairs
+    # with ENTERPRISE_FRESH_CONTEXT to get fresh-context isolation *and* a
+    # stable device identity per exit IP.
+    hcaptcha_device_persistence: bool
 
     # ── State backend ──
     # Redis URL for the persistent task store; None => in-memory fallback.
@@ -349,6 +382,12 @@ def load_config() -> Config:
         .strip()
         .lower()
         in {"1", "true", "yes"},
+        vision_trust_self_confidence=os.environ.get(
+            "VISION_TRUST_SELF_CONFIDENCE", "false"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
         # WP4: resource interception — per-context bandwidth shaping.
         resource_block_enabled=os.environ.get("RESOURCE_BLOCK_ENABLED", "true")
         .strip()
@@ -398,7 +437,13 @@ def load_config() -> Config:
         .lower()
         in {"1", "true", "yes"},
         enterprise_fresh_context=os.environ.get(
-            "ENTERPRISE_FRESH_CONTEXT", "false"
+            "ENTERPRISE_FRESH_CONTEXT", "true"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
+        enterprise_require_hardened_runtime=os.environ.get(
+            "ENTERPRISE_REQUIRE_HARDENED_RUNTIME", "false"
         )
         .strip()
         .lower()
@@ -432,6 +477,22 @@ def load_config() -> Config:
         human_mouse_enabled=os.environ.get("HUMAN_MOUSE_ENABLED", "true").strip().lower()
         in {"1", "true", "yes"},
         human_mouse_jitter_ms=int(os.environ.get("HUMAN_MOUSE_JITTER_MS", "80")),
+        human_passive_motion_seconds=float(
+            os.environ.get("HUMAN_PASSIVE_MOTION_SECONDS", "1.4")
+        ),
+        hcaptcha_invisible_motion_seconds=float(
+            os.environ.get("HCAPTCHA_INVISIBLE_MOTION_SECONDS", "3.0")
+        ),
+        hcaptcha_invisible_passive_budget=float(
+            os.environ.get("HCAPTCHA_INVISIBLE_PASSIVE_BUDGET", "4.0")
+        ),
+        hcaptcha_rqdata_ttl=float(os.environ.get("HCAPTCHA_RQDATA_TTL", "30.0")),
+        hcaptcha_device_persistence=os.environ.get(
+            "HCAPTCHA_DEVICE_PERSISTENCE", "false"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"},
         # State backend
         redis_url=os.environ.get("REDIS_URL", "").strip() or None,
         # Billing / budget

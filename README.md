@@ -238,6 +238,13 @@ CaptchAI uses two model backends — a **local model** for image tasks and a **c
 | `BROWSER_TIMEOUT` | Page load timeout (seconds) | `30` |
 | `BROWSER_RUNTIME` | Browser runtime: `chromium` (stock) \| `rebrowser` \| `camoufox` | `chromium` |
 | `BROWSER_RUNTIME_STRICT` | Fail startup instead of silently degrading to stock Chromium when the requested hardened runtime is unavailable (recommended for enterprise hCaptcha) | `false` |
+| `ENTERPRISE_REQUIRE_HARDENED_RUNTIME` | Refuse (instead of warn about) an **enterprise** hCaptcha solve on stock Chromium — its automation + software-WebGL signals are trivially flagged. Set with `BROWSER_RUNTIME=camoufox` | `false` |
+| `ENTERPRISE_FRESH_CONTEXT` | Use a fresh browser context per enterprise solve (avoids reusing one sticky session across a sitekey, a pattern enterprise risk models cluster on) | `true` |
+| `HCAPTCHA_DEVICE_PERSISTENCE` | Re-seed the hCaptcha device-trust cookie (`hmt`) per egress identity into fresh contexts, so an enterprise solve presents a **returning** device (not zero-history) while keeping fresh-context isolation. In-memory only | `false` |
+| `HCAPTCHA_INVISIBLE_MOTION_SECONDS` | Seconds of continuous wander/scroll motion seeded before an invisible widget's `execute()`, so passive scoring sees a real `motionData` buffer | `3.0` |
+| `HCAPTCHA_INVISIBLE_PASSIVE_BUDGET` | Passive-token wait (seconds) for an invisible solve before falling through to a visual challenge (the `/getcaptcha` round-trip through a residential proxy often exceeds the checkbox-path budget) | `4.0` |
+| `HCAPTCHA_RQDATA_TTL` | Enterprise `rqdata` freshness budget (seconds); a slower solve appends an "rqdata may have expired" note to `solution.warnings`. `0` disables | `30` |
+| `HUMAN_PASSIVE_MOTION_SECONDS` | Seconds of continuous pre-checkbox wander/scroll seeded into `motionData` (a single short burst reads as an empty motion buffer to hCaptcha) | `1.4` |
 | `CAMOUFOX_HUMANIZE` | Enable Camoufox's built-in human-like cursor motion (only when `BROWSER_RUNTIME=camoufox`) | `true` |
 | `CAMOUFOX_BLOCK_WEBRTC` | Block WebRTC under Camoufox to prevent an IP leak past the proxy | `true` |
 | `CAMOUFOX_OS` | Optional OS pin for Camoufox's spoofed fingerprint (comma list of `windows`/`macos`/`linux`; empty = randomise) | unset |

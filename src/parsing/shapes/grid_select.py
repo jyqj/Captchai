@@ -70,9 +70,16 @@ class GridSelectSolver(BaseShapeSolver):
                 if reloaded:
                     continue
 
-            for i in indices:
+            # Look at the grid before the first click (a human reads the prompt
+            # + scans tiles; firing clicks the instant the model returns is a
+            # timing tell), then hesitate slightly between selections.
+            await self.human_pause(ctx, 0.4, 1.1)
+            for click_idx, i in enumerate(indices):
+                if click_idx > 0:
+                    await self.human_pause(ctx, 0.18, 0.5)
                 await self.human_click_tile(frame, i, ctx)
 
+            await self.human_pause(ctx, 0.2, 0.6)
             await self.human_click_submit(frame, ctx)
 
             token = await self.poll_token()

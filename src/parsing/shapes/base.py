@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 from ..dispatcher import ChallengeContext, VisionClient
-from .human_cursor import human_click
+from .human_cursor import human_click, human_tap_box
 
 log = logging.getLogger(__name__)
 
@@ -251,12 +252,20 @@ class BaseShapeSolver:
     ) -> bool:
         page = ctx.extra.get("page")
         humanize = ctx.extra.get("humanize", True)
+        touch = ctx.extra.get("touch", False)
         if page is not None and humanize:
             try:
                 locator = frame.locator(selector)
                 locator = locator.nth(index) if index is not None else locator.first
                 box = await locator.bounding_box()
                 if box:
+                    # Mobile context → trusted touch tap (mouse events on a
+                    # phone context are a modality contradiction hCaptcha flags).
+                    if touch:
+                        tapped = await human_tap_box(page, box)
+                        if tapped is not None:
+                            ctx.extra["_cursor"] = tapped
+                            return True
                     new_cursor = await human_click(
                         page,
                         box,
@@ -271,6 +280,32 @@ class BaseShapeSolver:
         if index is not None:
             return await self.click_tile(frame, index, selector)
         return await self.click_submit(frame, selector)
+
+    async def human_pause(
+        self, ctx: ChallengeContext, low: float, high: float
+    ) -> None:
+        """Sleep a randomised human interval when humanising a real solve.
+
+        The tile-click *path* is already humanised, but the *global* timing of a
+        grid solve is a machine tell: a solver classifies, then fires every
+        click back-to-back with no "look at the grid" delay and no gap between
+        selections. A human pauses to read the prompt/tiles before the first
+        click and hesitates slightly between clicks. This adds those gaps —
+        gated by the same ``humanize`` flag + real ``page`` the click path uses,
+        so unit tests (no page) and no-motion solves are unaffected.
+        """
+        if ctx.extra.get("page") is None or not ctx.extra.get("humanize", True):
+            return
+        # ``humanize_jitter_ms == 0`` is the established "no real delays" signal
+        # (tests set it so the humanised click path runs instantly); honour it
+        # here too so pacing never slows a unit test or a caller that opted out
+        # of wall-clock realism.
+        if float(ctx.extra.get("humanize_jitter_ms", 90.0)) <= 0:
+            return
+        try:
+            await asyncio.sleep(random.uniform(low, high))
+        except Exception:  # noqa: BLE001 - pacing is best-effort
+            pass
 
     async def classify(self, req: ClassifyRequest) -> Optional[Any]:
         """Call the injected vision client. Returns the raw result or None."""

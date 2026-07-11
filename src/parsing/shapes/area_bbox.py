@@ -15,7 +15,7 @@ from typing import Any, Optional, Tuple
 
 from ..dispatcher import ChallengeContext, ChallengeShape
 from .base import BaseShapeSolver, ClassifyRequest
-from .human_cursor import human_point_click
+from .human_cursor import human_point_click, human_tap
 
 log = logging.getLogger(__name__)
 
@@ -112,15 +112,23 @@ class AreaBBoxSolver(BaseShapeSolver):
         """
         page = ctx.extra.get("page")
         humanize = ctx.extra.get("humanize", True)
+        touch = ctx.extra.get("touch", False)
         off_x = float(box["x"]) if box and "x" in box else 0.0
         off_y = float(box["y"]) if box and "y" in box else 0.0
         abs_x, abs_y = off_x + rel_x, off_y + rel_y
         # 1. Human pointer path to the exact point (eased/jittered travel + a
         # click dwell + press duration) so the single-click challenge emits real
         # motionData instead of a teleport. Threads the cursor so a follow-up
-        # submit click continues the same path.
+        # submit click continues the same path. On a mobile context a trusted
+        # touch tap is used instead (mouse events would contradict the phone
+        # fingerprint hCaptcha mobile scores).
         if page is not None and humanize:
             try:
+                if touch:
+                    tapped = await human_tap(page, (abs_x, abs_y))
+                    if tapped is not None:
+                        ctx.extra["_cursor"] = tapped
+                        return True
                 new_cursor = await human_point_click(
                     page,
                     (abs_x, abs_y),

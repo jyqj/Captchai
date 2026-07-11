@@ -57,13 +57,27 @@ DEFAULT_USER_AGENT = (
     "Chrome/149.0.0.0 Safari/537.36"
 )
 
+# NOTE: ``--disable-gpu`` is deliberately NOT set. Disabling the GPU forces
+# Chromium onto the SwiftShader software rasteriser, whose WebGL parameters
+# (extensions, precision, un-spoofed capabilities) read as software rendering
+# and CONTRADICT the discrete-GPU vendor/renderer string the stealth layer
+# spoofs — a coherent-fingerprint mismatch enterprise hCaptcha detectors flag.
+# Leaving the GPU enabled lets a GPU-equipped host (or headful runtime) present
+# real hardware WebGL consistent with the spoofed GPU; on a GPU-less headless
+# host Chromium still falls back to ANGLE/SwiftShader (no worse than before).
 _LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-gpu",
     "--disable-features=IsolateOrigins,site-per-process",
     "--disable-site-isolation-trials",
+    # WebRTC egress leak guard: a captcha token is IP-bound, but WebRTC can
+    # surface the host's real (pre-proxy) local/public IP via ICE candidates,
+    # contradicting the proxy egress and handing enterprise risk models a
+    # datacenter-IP tell. ``disable_non_proxied_udp`` forces WebRTC through the
+    # same proxy as the rest of the context (or not at all), so no unproxied
+    # candidate leaks. Camoufox handles this via CAMOUFOX_BLOCK_WEBRTC instead.
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 ]
 
 
@@ -193,6 +207,9 @@ def resolve_context_options(config: Config, params: dict[str, Any]) -> ContextOp
     # onto params avoids changing ``new_context``'s return signature.
     params["_used_timezone"] = fingerprint.timezone_id
     params["_used_languages"] = list(fingerprint.languages)
+    # Touch modality follows the fingerprint so the solver drives touch taps /
+    # scroll motion (not mouse events) on a mobile context.
+    params["_is_mobile"] = bool(fingerprint.is_mobile)
 
     return ContextOptions(
         user_agent=user_agent,

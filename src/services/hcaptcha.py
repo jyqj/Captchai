@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -43,6 +44,7 @@ from ..parsing.dispatcher import (
     ChallengeContext,
     ChallengeDispatcher,
     ChallengeShape,
+    ClassifierSelectors,
 )
 from ..parsing.shapes.area_bbox import AreaBBoxSolver
 from ..parsing.shapes.drag_drop import DragDropSolver
@@ -60,32 +62,56 @@ from .browser_solver import (
 
 log = logging.getLogger(__name__)
 
-_EXTRACT_HCAPTCHA_TOKEN_JS = """
-() => {
-    let token = null;
-    if (window.__omcToken) {
-        token = window.__omcToken;
-    } else {
-        const textarea = document.querySelector('[name="h-captcha-response"]')
-            || document.querySelector('[name="g-recaptcha-response"]');
-        if (textarea && textarea.value && textarea.value.length > 20) {
-            token = textarea.value;
-        } else if (window.hcaptcha && typeof window.hcaptcha.getResponse === 'function') {
-            try {
-                const resp = window.hcaptcha.getResponse();
-                if (resp && resp.length > 20) token = resp;
-            } catch (e) {}
-        }
-    }
-    return {token: token, error: window.__omcError || null};
-}
-"""
+# Token extractor. Reads the shared-DOM ``#omc-result`` FIRST so it works under
+# Camoufox (whose isolated-world evaluate can't see the page's main-world
+# ``window.__omc*`` globals), then falls back to the ``window`` global, the
+# provider's own ``h-captcha-response`` textarea, and ``hcaptcha.getResponse()``
+# for stock Chromium.
+_EXTRACT_HCAPTCHA_TOKEN_JS = (
+    "() => {\n"
+    "    let token = null;\n"
+    "    let error = null;\n"
+    "    " + InjectedWidgetSolver._omc_dom_read_js() + ""
+    "    if (!token && window.__omcToken) {\n"
+    "        token = window.__omcToken;\n"
+    "    }\n"
+    "    if (!token) {\n"
+    "        const textarea = document.querySelector('[name=\"h-captcha-response\"]')\n"
+    "            || document.querySelector('[name=\"g-recaptcha-response\"]');\n"
+    "        if (textarea && textarea.value && textarea.value.length > 20) {\n"
+    "            token = textarea.value;\n"
+    "        } else if (window.hcaptcha && typeof window.hcaptcha.getResponse === 'function') {\n"
+    "            try {\n"
+    "                const resp = window.hcaptcha.getResponse();\n"
+    "                if (resp && resp.length > 20) token = resp;\n"
+    "            } catch (e) {}\n"
+    "        }\n"
+    "    }\n"
+    "    return {token: token, error: error || window.__omcError || null};\n"
+    "}\n"
+)
 
 # Localization-independent iframe matchers. The challenge iframe title is
 # localized ("Main content of the hCaptcha challenge" in English only), so match
 # on the src host as the robust primary signal.
-_CHECKBOX_IFRAME = 'iframe[src*="hcaptcha.com"][src*="checkbox"], iframe[title*="checkbox"]'
-_CHALLENGE_IFRAME = 'iframe[src*="hcaptcha.com"][src*="challenge"], iframe[title*="challenge"]'
+#
+# Self-hosted enterprise deployments serve the widget iframes from a customer
+# ``assethost`` rather than hcaptcha.com, so the host-pinned matcher alone would
+# miss them. Match the path segment (``/checkbox`` / ``/challenge``) and the
+# hCaptcha frame name convention (``a-*`` / ``c-*``) too — both are host-
+# independent — before falling back to the localized title.
+_CHECKBOX_IFRAME = (
+    'iframe[src*="hcaptcha.com"][src*="checkbox"], '
+    'iframe[src*="/checkbox"], '
+    'iframe[title*="checkbox"], '
+    'iframe[name^="a-"]'
+)
+_CHALLENGE_IFRAME = (
+    'iframe[src*="hcaptcha.com"][src*="challenge"], '
+    'iframe[src*="/challenge"], '
+    'iframe[title*="challenge"], '
+    'iframe[name^="c-"]'
+)
 
 # ``enterprisePayload`` is the 2captcha / YesCaptcha container convention whose
 # keys are hcaptcha.render() options. A few solver ecosystems use field names
@@ -94,6 +120,23 @@ _CHALLENGE_IFRAME = 'iframe[src*="hcaptcha.com"][src*="challenge"], iframe[title
 _ENTERPRISE_FIELD_ALIASES = {
     "apiEndpoint": "endpoint",
 }
+
+# hCaptcha-scoped challenge-shape detection. The generic classifier carries
+# every provider's class names (GeeTest sliders, reCAPTCHA dynamic markers,
+# invented bbox overlays); hCaptcha uses none of those, so pinning it to
+# hCaptcha's real challenge DOM (a ``.task-grid`` of ``.task-image`` tiles,
+# ``.prompt-text`` prompt, native ``draggable`` for its rare drag challenge,
+# ``.challenge-example`` panel for area-select) stops a plain grid from being
+# misrouted to a slide / dynamic solver it never matches.
+_HCAPTCHA_CLASSIFIER_SELECTORS = ClassifierSelectors(
+    grid=(".task-grid", ".task-image"),
+    tile=".task-image",
+    dynamic_markers=(),
+    slider=(),
+    drag=("[draggable='true']", ".draggable"),
+    bbox=(".challenge-example",),
+    prompt=(".prompt-text", ".challenge-prompt"),
+)
 
 
 @dataclass(frozen=True)
@@ -110,22 +153,62 @@ class HCaptchaProfile:
 class HCaptchaSolver(InjectedWidgetSolver):
     """Solves HCaptchaTaskProxyless via the shared browser + vision/parsing layers."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Opt-in cross-context device-trust store: per egress-identity bucket ->
+        # the hCaptcha domain cookies (``hmt`` etc.) captured from a prior solve.
+        # Re-seeding these into a fresh enterprise context makes the widget see
+        # a returning device instead of a brand-new zero-history one (which
+        # enterprise risk models penalise). In-memory only; a restart starts
+        # cold. Keyed so one exit IP keeps one coherent device.
+        self._device_cookies: dict[str, list] = {}
+
     PROVIDER = "hCaptcha"
     WIDGET_GLOBAL = "hcaptcha"
     WIDGET_API_JS = "https://js.hcaptcha.com/1/api.js?render=explicit"
     WIDGET_CONTAINER_ID = "omc-hcaptcha"
     WIDGET_ERROR_CALLBACK_VALUE = "String(e)"
     WIDGET_TOKEN_EXTRACTOR_JS = _EXTRACT_HCAPTCHA_TOKEN_JS
+    # Invisible hCaptcha scores the browser passively; firing execute() the
+    # instant the widget renders ships a near-empty motion buffer (a strong
+    # "invisible → challenge every time" tell). Defer it so ``_interact_invisible``
+    # can seed motionData first, then trigger the exposed ``window.__omcExecute``.
+    DEFER_INVISIBLE_EXECUTE = True
 
     def _widget_render_body(self) -> str:
         # hCaptcha renders by container *id* (not a CSS selector), stores the
-        # widget id, and drives invisible widgets with an explicit execute().
+        # widget id, and exposes an explicit execute trigger. For an invisible
+        # widget execute() is DEFERRED (``__omcDeferExecute``) so the solver can
+        # seed behaviour before the passive request; otherwise it fires inline.
         return (
             "window.__omcWidgetId = window.hcaptcha.render('omc-hcaptcha', opts);\n"
-            "            if (opts.size === 'invisible') {\n"
-            "                window.hcaptcha.execute(window.__omcWidgetId);\n"
+            "            window.__omcExecute = function () {\n"
+            "                if (window.__omcExecuted) return;\n"
+            "                window.__omcExecuted = true;\n"
+            "                try { window.hcaptcha.execute(window.__omcWidgetId); }\n"
+            "                catch (e) { window.__omcError = String(e); __omcSet('error', e && e.message ? e.message : String(e)); }\n"
+            "            };\n"
+            # Bridge the deferred invisible execute() through the shared DOM so a
+            # Camoufox isolated-world evaluate can trigger it (it cannot call the
+            # main-world __omcExecute function directly).
+            "            __omcInstallExecBridge();\n"
+            "            if (opts.size === 'invisible' && !window.__omcDeferExecute) {\n"
+            "                window.__omcExecute();\n"
             "            }"
         )
+
+    def _widget_api_js(self, options: dict[str, Any]) -> str:
+        # Self-hosted enterprise hCaptcha serves its SDK from the customer's
+        # ``assethost`` rather than js.hcaptcha.com; loading the public script
+        # there contradicts the render config (``endpoint`` / ``assethost`` /
+        # ``imghost``) and the solve fails. When ``assethost`` is an explicit
+        # https origin, load api.js from it (hCaptcha's self-host convention:
+        # ``<assethost>/1/api.js``). Standard enterprise (e.g. Stripe) sets no
+        # assethost, so this falls back to the public SDK unchanged.
+        assethost = options.get("assethost")
+        if isinstance(assethost, str) and assethost.startswith("http"):
+            return f"{assethost.rstrip('/')}/1/api.js?render=explicit"
+        return self.WIDGET_API_JS
 
     # ── public solve ───────────────────────────────────────────
 
@@ -141,6 +224,14 @@ class HCaptchaSolver(InjectedWidgetSolver):
         # proxy — and refuses proxyless server egress. Must run before
         # _acquire_context so the egress / kind requirements are honoured.
         self._enforce_enterprise_egress(params, profile.variant)
+        # Refuse (or loudly warn about) an enterprise solve on detectable stock
+        # Chromium, whose automation + software-WebGL signals enterprise
+        # detectors flag. Runs before any attempt so the refusal is fast.
+        self._enforce_enterprise_runtime(profile.variant)
+        # Caller-facing caveats the service can't enforce itself (enterprise
+        # tokens can't be server-verified without the target's secret; rqdata is
+        # single-use / IP-bound). Surfaced in ``solution.warnings``.
+        warnings = self._enterprise_warnings(params, profile)
 
         async def _attempt() -> tuple[str, str]:
             if profile.use_real_page:
@@ -169,7 +260,8 @@ class HCaptchaSolver(InjectedWidgetSolver):
             if stage == SolveStage.CHALLENGE.value:
                 params["_hcaptcha_vision_tier"] = 2
 
-        return await self._solve_with_retries(
+        started = time.monotonic()
+        solution = await self._solve_with_retries(
             params,
             sitekey=website_key,
             client_key=client_key,
@@ -177,6 +269,7 @@ class HCaptchaSolver(InjectedWidgetSolver):
             build_solution=lambda token, ua: {
                 "gRecaptchaResponse": token,
                 "userAgent": ua,
+                **({"warnings": warnings} if warnings else {}),
             },
             provider="HCaptcha",
             default_task_type=params.get("type", "HCaptchaTaskProxyless"),
@@ -184,6 +277,26 @@ class HCaptchaSolver(InjectedWidgetSolver):
             on_error=_escalate_tier,
             verify_provider="hcaptcha",
         )
+        # rqdata is single-use AND short-lived: an enterprise widget rejects a
+        # token minted from a stale nonce even if the grid was answered
+        # correctly. We can't read the true server TTL, but a solve that took
+        # longer than a conservative budget is the likeliest cause of a
+        # structurally-valid-but-rejected enterprise token, so surface it as a
+        # warning the caller can act on (capture a fresher rqdata / speed up the
+        # egress) rather than silently returning a probably-dead token.
+        if profile.variant == "enterprise" and profile.render_options.get("rqdata"):
+            elapsed = time.monotonic() - started
+            ttl = float(getattr(self._config, "hcaptcha_rqdata_ttl", 30.0))
+            if ttl > 0 and elapsed > ttl:
+                note = (
+                    f"enterprise solve took {elapsed:.0f}s (> rqdata freshness "
+                    f"budget {ttl:.0f}s); the rqdata nonce may have expired — if "
+                    "the token is rejected, capture a fresh rqdata and/or use a "
+                    "faster egress"
+                )
+                existing = solution.get("warnings") or []
+                solution["warnings"] = [*existing, note]
+        return solution
 
     def _profile(self, params: dict[str, Any]) -> HCaptchaProfile:
         """Resolve regular vs enterprise behavior in one place."""
@@ -200,7 +313,8 @@ class HCaptchaSolver(InjectedWidgetSolver):
         payload = params.get("enterprisePayload")
         if isinstance(payload, dict):
             for key, value in payload.items():
-                render_options[_ENTERPRISE_FIELD_ALIASES.get(key, key)] = value
+                name = str(key)
+                render_options[_ENTERPRISE_FIELD_ALIASES.get(name, name)] = value
 
         # A top-level ``rqdata`` wins over one nested in enterprisePayload; both
         # forms are accepted (YesCaptcha clients send it inside the payload,
@@ -218,6 +332,72 @@ class HCaptchaSolver(InjectedWidgetSolver):
             use_real_page=self._resolve_real_page(params),
             vision_tier=1,
         )
+
+    def _enforce_enterprise_runtime(self, variant: str) -> None:
+        """Warn (or refuse) an enterprise solve on detectable stock Chromium.
+
+        Stock headless Chromium's automation signals — and its software-WebGL
+        renderer, which contradicts the stealth layer's spoofed discrete-GPU
+        string — are exactly what enterprise hCaptcha detectors flag. A hardened
+        runtime (camoufox / rebrowser) avoids both. This never *changes* the
+        runtime; it surfaces the risk, and when
+        ``ENTERPRISE_REQUIRE_HARDENED_RUNTIME`` is set it refuses the solve so an
+        operator can't unknowingly mint low-trust enterprise tokens on Chromium.
+        """
+        if variant != "enterprise":
+            return
+        runtime = getattr(self._manager, "runtime", "chromium")
+        if runtime in ("camoufox", "rebrowser"):
+            return
+        if getattr(self._config, "enterprise_require_hardened_runtime", False):
+            raise RuntimeError(
+                "Enterprise hCaptcha requires a hardened browser runtime "
+                "(BROWSER_RUNTIME=camoufox or rebrowser) but the active runtime "
+                f"is {runtime!r} (ENTERPRISE_REQUIRE_HARDENED_RUNTIME=true). "
+                "Stock Chromium's automation + software-WebGL signals are "
+                "trivially flagged by enterprise detectors."
+            )
+        log.warning(
+            "Enterprise hCaptcha on stock Chromium runtime %r — enterprise "
+            "detectors flag its automation / software-WebGL signals. Set "
+            "BROWSER_RUNTIME=camoufox (and install it) for reliable solves.",
+            runtime,
+        )
+
+    def _enterprise_warnings(
+        self, params: dict[str, Any], profile: HCaptchaProfile
+    ) -> list[str]:
+        """Caller-facing caveats for an enterprise solve the service can't enforce.
+
+        Enterprise tokens are minted in a relay model: the service holds no
+        siteverify secret for the target sitekey, so it *cannot* confirm the
+        token will be accepted, and the token is bound to a single-use ``rqdata``
+        nonce plus the egress IP. These are surfaced in ``solution.warnings`` so
+        the caller knows to (a) capture a FRESH rqdata per solve and (b) submit
+        from the same egress — the two most common reasons a structurally-valid
+        enterprise token is still rejected downstream.
+        """
+        if profile.variant != "enterprise":
+            return []
+        warnings: list[str] = [
+            "enterprise hCaptcha token cannot be server-verified (no siteverify "
+            "secret for this sitekey); confirm acceptance via /reportCorrect or "
+            "your own downstream check",
+            "enterprise token is IP-bound: submit it from the same egress that "
+            "minted it (solution.egressServer / proxyKind)",
+        ]
+        rqdata = profile.render_options.get("rqdata")
+        if not rqdata:
+            warnings.append(
+                "no rqdata supplied for an enterprise solve; most enterprise "
+                "widgets reject a token minted without a fresh rqdata nonce"
+            )
+        elif not isinstance(rqdata, str) or len(rqdata.strip()) < 20:
+            warnings.append(
+                "rqdata looks malformed (too short); capture a fresh rqdata from "
+                "the target's own hCaptcha session"
+            )
+        return warnings
 
     def _resolve_real_page(self, params: dict[str, Any]) -> bool:
         """Decide injected-page vs real-page navigation for this solve.
@@ -388,6 +568,75 @@ class HCaptchaSolver(InjectedWidgetSolver):
             strategy=self._real_page_strategy(render_options),
         )
 
+    # ── device-trust persistence (opt-in) ─────────────────────
+
+    _HCAPTCHA_COOKIE_DOMAINS = ("hcaptcha.com", ".hcaptcha.com")
+
+    def _device_key(self, params: dict[str, Any]) -> str:
+        """Egress-identity bucket for the device-trust cookie store.
+
+        Tie the persisted device to the exit IP (pool proxy id / seed), so one
+        residential IP keeps one coherent returning device across solves; task
+        proxies key by their gateway; proxyless keys by a constant.
+        """
+        return str(
+            params.get("_proxy_seed")
+            or params.get("_pool_proxy_id")
+            or params.get("_egress_server")
+            or "proxyless"
+        )
+
+    def _device_persistence_on(self) -> bool:
+        return bool(getattr(self._config, "hcaptcha_device_persistence", False))
+
+    async def _restore_device(self, context: Any, params: dict[str, Any]) -> None:
+        """Re-seed persisted hCaptcha device cookies into a fresh context."""
+        if not self._device_persistence_on():
+            return
+        add_cookies = getattr(context, "add_cookies", None)
+        if add_cookies is None:
+            return
+        cookies = self._device_cookies.get(self._device_key(params))
+        if not cookies:
+            return
+        try:
+            await add_cookies(cookies)
+        except Exception as exc:  # noqa: BLE001 - device restore is best-effort
+            log.debug("hCaptcha device cookie restore failed: %s", exc)
+
+    async def _persist_device(
+        self, context: Any, params: dict[str, Any], solved: bool
+    ) -> None:
+        """Capture the hCaptcha device cookies from this context for reuse.
+
+        Persists the provider's device-trust cookies (domain ``.hcaptcha.com``)
+        keyed by egress identity so the next solve on the same IP presents a
+        returning device. Best-effort and guarded for fake contexts in tests.
+        """
+        if not self._device_persistence_on():
+            return
+        get_cookies = getattr(context, "cookies", None)
+        if get_cookies is None:
+            return
+        try:
+            all_cookies = await get_cookies()
+        except Exception as exc:  # noqa: BLE001 - device persist is best-effort
+            log.debug("hCaptcha device cookie capture failed: %s", exc)
+            return
+        if not isinstance(all_cookies, list):
+            return
+        hc = [
+            c
+            for c in all_cookies
+            if isinstance(c, dict)
+            and any(
+                str(c.get("domain", "")).endswith(d)
+                for d in self._HCAPTCHA_COOKIE_DOMAINS
+            )
+        ]
+        if hc:
+            self._device_cookies[self._device_key(params)] = hc
+
     def _guard(self, solve_context: Any, params: dict[str, Any]) -> None:
         """WP5 defensive backstop: refuse an enterprise solve on server egress.
 
@@ -416,17 +665,32 @@ class HCaptchaSolver(InjectedWidgetSolver):
         params: dict[str, Any],
         client_key: Optional[str],
     ) -> Optional[str]:
-        """Warmup → passive poll → checkbox → passive poll → challenge dispatch."""
-        params["_phase"] = SolveStage.PASSIVE.value
-        if not params.get("isInvisible") and render_options.get("size") != "invisible":
-            await self._human_mouse(page)
+        """Warmup → passive poll → checkbox → passive poll → challenge dispatch.
 
+        Invisible widgets take a distinct path (:meth:`_interact_invisible`):
+        they have no checkbox iframe, so the solver seeds motion, triggers the
+        deferred ``execute()``, then waits for a passive token or an escalated
+        challenge — instead of burning the checkbox-click timeout on an element
+        that never exists.
+        """
+        invisible = bool(
+            params.get("isInvisible") or render_options.get("size") == "invisible"
+        )
         passive_budget = getattr(self._config, "poll_budget_passive", 2.0)
 
-        # Passive / invisible widgets may resolve without interaction. Kept
-        # short: the event-driven wait returns the instant a passive token
-        # fires, so a small budget only bounds the "challenge is coming" case
-        # rather than adding fixed dead time before dispatch.
+        if invisible:
+            return await self._interact_invisible(
+                page, website_key, params, client_key, passive_budget
+            )
+
+        touch = bool(params.get("_is_mobile"))
+        params["_phase"] = SolveStage.PASSIVE.value
+        await self._human_mouse(page, touch=touch)
+
+        # Passive widgets may resolve without interaction. Kept short: the
+        # event-driven wait returns the instant a passive token fires, so a
+        # small budget only bounds the "challenge is coming" case rather than
+        # adding fixed dead time before dispatch.
         token = await self._poll_token(page, budget=passive_budget)
         if token:
             return token
@@ -439,7 +703,9 @@ class HCaptchaSolver(InjectedWidgetSolver):
         params["_phase"] = SolveStage.INTERACTION.value
         try:
             checkbox_frame = page.frame_locator(_CHECKBOX_IFRAME)
-            await self._human_click_in_frame(page, checkbox_frame, "#checkbox")
+            await self._human_click_in_frame(
+                page, checkbox_frame, "#checkbox", touch=touch
+            )
         except Exception as exc:
             log.info("hCaptcha checkbox click skipped: %s", exc)
 
@@ -451,6 +717,105 @@ class HCaptchaSolver(InjectedWidgetSolver):
         params["_phase"] = SolveStage.CHALLENGE.value
         return await self._solve_challenge(page, website_key, params, client_key)
 
+    async def _interact_invisible(
+        self,
+        page: Any,
+        website_key: str,
+        params: dict[str, Any],
+        client_key: Optional[str],
+        passive_budget: float,
+    ) -> Optional[str]:
+        """Invisible flow: seed motion → deferred execute() → poll → dispatch.
+
+        An invisible hCaptcha widget has no checkbox and is scored passively, so:
+
+        * We wait for the widget to render (``__omcExecute`` defined) *before*
+          moving the pointer, so hCaptcha's motion listeners (attached at widget
+          load) actually capture the movement — a page with an empty motion
+          buffer is one of the strongest "invisible → challenge every time"
+          signals.
+        * ``execute()`` is fired explicitly AFTER that motion (it was deferred at
+          render) so the passive ``/getcaptcha`` carries real behaviour.
+        * There is NO checkbox click. The previous flow waited out the full
+          click timeout on a checkbox iframe that never exists for an invisible
+          widget — tens of seconds of dead time per attempt.
+        """
+        params["_phase"] = SolveStage.PASSIVE.value
+        touch = bool(params.get("_is_mobile"))
+        await self._await_widget_ready(page)
+        # Invisible widgets are scored purely on the passive behaviour timeline,
+        # so seed a fuller motion history (not the short pre-checkbox warmup)
+        # BEFORE firing execute(), so the passive ``/getcaptcha`` carries a real
+        # ``motionData`` buffer rather than a near-empty one (the strongest
+        # "invisible → challenge every time" tell).
+        invisible_seconds = float(
+            getattr(self._config, "hcaptcha_invisible_motion_seconds", 3.0)
+        )
+        await self._human_mouse(page, seconds=invisible_seconds, touch=touch)
+        await self._trigger_invisible_execute(page)
+
+        # Passive pass is the entire point of an invisible widget, so give the
+        # verdict a longer budget than the checkbox-path passive poll (the
+        # /getcaptcha round-trip through a residential proxy commonly exceeds
+        # the 2s default before a passive token lands).
+        invisible_budget = max(
+            passive_budget,
+            float(getattr(self._config, "hcaptcha_invisible_passive_budget", 4.0)),
+        )
+        token = await self._poll_token(page, budget=invisible_budget)
+        if token:
+            return token
+
+        # Passive scoring rejected the browser → a visual challenge; dispatch it.
+        params["_phase"] = SolveStage.CHALLENGE.value
+        return await self._solve_challenge(page, website_key, params, client_key)
+
+    async def _await_widget_ready(self, page: Any) -> None:
+        """Wait (bounded) for the invisible widget's ``__omcExecute`` to exist.
+
+        execute() is deferred for invisible widgets, so we must wait for the
+        widget to actually render before triggering it. Bounded well under the
+        page timeout; a widget that never renders falls through and the passive
+        poll / challenge dispatch handles the miss.
+        """
+        timeout_ms = min(
+            8000, int(getattr(self._config, "browser_timeout", 30) * 1000)
+        )
+        try:
+            # DOM-first readiness: under Camoufox ``window.__omcExecute`` lives
+            # in the main world and is invisible here, so also accept the shared
+            # DOM signals (``#omc-result`` marked rendered/done/error) the page
+            # sets at render time.
+            await page.wait_for_function(
+                "() => { const el = document.getElementById('"
+                + self.OMC_RESULT_ID
+                + "'); const st = el ? el.getAttribute('data-status') : null;"
+                " return st === 'rendered' || st === 'done' || st === 'error'"
+                " || typeof window.__omcExecute === 'function'; }",
+                timeout=timeout_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness probe is best-effort
+            log.debug("hCaptcha invisible widget not ready in time: %s", exc)
+
+    async def _trigger_invisible_execute(self, page: Any) -> None:
+        """Fire the deferred invisible ``execute()`` (no-op if not yet defined).
+
+        Flips ``#omc-exec``'s ``data-exec`` on the shared DOM — the page's
+        MutationObserver (main world) then calls ``execute()`` — so the trigger
+        crosses Camoufox's isolated-world boundary. Also calls the main-world
+        function directly as a stock-Chromium fast path (guarded against a
+        double-fire by ``__omcExecuted``).
+        """
+        try:
+            await page.evaluate(
+                "() => { const t = document.getElementById('"
+                + self.OMC_EXEC_ID
+                + "'); if (t) { t.setAttribute('data-exec', '1'); }"
+                " if (window.__omcExecute) { window.__omcExecute(); } }"
+            )
+        except Exception as exc:  # noqa: BLE001 - trigger is best-effort
+            log.info("hCaptcha invisible execute trigger failed: %s", exc)
+
     # ── challenge dispatch ─────────────────────────────────────
 
     async def _solve_challenge(
@@ -461,8 +826,15 @@ class HCaptchaSolver(InjectedWidgetSolver):
         client_key: Optional[str],
     ) -> Optional[str]:
         # Surface a widget error-callback immediately as a classified error so
-        # the solve loop reacts per kind (rate-limit → fail fast, etc.).
-        err = await page.evaluate("() => window.__omcError || null")
+        # the solve loop reacts per kind (rate-limit → fail fast, etc.). Reads
+        # the shared-DOM ``#omc-result`` first (Camoufox-safe), then the
+        # main-world ``window.__omcError`` fallback.
+        err = await page.evaluate(
+            "() => { const el = document.getElementById('"
+            + self.OMC_RESULT_ID
+            + "'); if (el && el.getAttribute('data-status') === 'error') {"
+            " return el.textContent || 'error'; } return window.__omcError || null; }"
+        )
         if err:
             raise classify_widget_error(err, provider="hCaptcha")
 
@@ -503,6 +875,10 @@ class HCaptchaSolver(InjectedWidgetSolver):
                 "humanize_jitter_ms": getattr(
                     self._config, "human_mouse_jitter_ms", 90
                 ),
+                # Mobile fingerprint → shape solvers tap via the touchscreen
+                # instead of the mouse, matching the phone context hCaptcha
+                # mobile challenges score.
+                "touch": bool(params.get("_is_mobile")),
             },
         )
 
@@ -569,8 +945,20 @@ class HCaptchaSolver(InjectedWidgetSolver):
     def _build_dispatcher(
         self, vision: Optional[VisionAdapter], token_poll
     ) -> ChallengeDispatcher:
-        classifier = ChallengeClassifier(vision=vision)
-        dispatcher = ChallengeDispatcher(classifier)
+        classifier = ChallengeClassifier(
+            vision=vision,
+            selectors=_HCAPTCHA_CLASSIFIER_SELECTORS,
+            # The hCaptcha VisionAdapter classifies tile images, not "what shape
+            # is this frame" — an image-less shape hint would be a wasted model
+            # call that can't return a shape. Rely on the UNKNOWN→grid fallback.
+            vision_hint=False,
+        )
+        # UNKNOWN → grid_select: hCaptcha's dominant shape. A DOM class-name
+        # change (or an unfamiliar layout) then still gets one real grid attempt
+        # instead of a hard miss + full retry.
+        dispatcher = ChallengeDispatcher(
+            classifier, unknown_fallback=ChallengeShape.GRID_SELECT
+        )
         dispatcher.register(
             ChallengeShape.GRID_SELECT,
             GridSelectSolver(vision=vision, token_poll=token_poll),

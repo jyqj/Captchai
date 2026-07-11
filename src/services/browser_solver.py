@@ -180,6 +180,9 @@ class BaseBrowserSolver:
         if fp is not None:
             params["_used_timezone"] = fp.timezone_id
             params["_used_languages"] = list(fp.languages)
+            # Touch modality follows the fingerprint: a mobile session drives
+            # touch taps / scroll motion instead of mouse events.
+            params["_is_mobile"] = bool(fp.is_mobile)
         # Fresh-context path: resolve_context_options already stashed them.
 
     async def _acquire_task(self, params: dict[str, Any]) -> SolveContext:
@@ -715,7 +718,13 @@ class BaseBrowserSolver:
         return proxy_ip_from_params(params)
 
     async def _human_click_in_frame(
-        self, page: Any, frame_locator: Any, selector: str, *, timeout_ms: int = 10_000
+        self,
+        page: Any,
+        frame_locator: Any,
+        selector: str,
+        *,
+        timeout_ms: int = 10_000,
+        touch: bool = False,
     ) -> None:
         """Click an element inside an iframe with a human-like pointer path.
 
@@ -736,13 +745,20 @@ class BaseBrowserSolver:
         locator = frame_locator.locator(selector).first
         if getattr(self._config, "human_mouse_enabled", True):
             try:
-                from ..parsing.shapes.human_cursor import human_click
+                from ..parsing.shapes.human_cursor import human_click, human_tap_box
 
                 box = await locator.bounding_box()
                 if box:
                     jitter = float(
                         getattr(self._config, "human_mouse_jitter_ms", 90)
                     )
+                    # Mobile fingerprint → trusted touch tap; else eased mouse
+                    # path. A mouse click on a phone context contradicts the
+                    # touch-capable fingerprint hCaptcha mobile scores.
+                    if touch:
+                        tapped = await human_tap_box(page, box)
+                        if tapped is not None:
+                            return
                     result = await human_click(page, box, jitter_ms=jitter)
                     if result is not None:
                         return
@@ -750,25 +766,60 @@ class BaseBrowserSolver:
                 log.debug("human checkbox click failed, falling back: %s", exc)
         await locator.click(timeout=timeout_ms)
 
-    async def _human_mouse(self, page: Any) -> None:
-        """Simulate a small human-like pre-interaction mouse path."""
+    async def _human_mouse(
+        self, page: Any, *, seconds: "float | None" = None, touch: bool = False
+    ) -> None:
+        """Seed a realistic pre-interaction motion timeline (wander + scroll).
 
+        hCaptcha scores a *continuous* ``motionData`` timeline. The previous
+        warmup was a single ~0.5s eased move, which leaves an almost-empty
+        motion buffer — a strong "automation / invisible-every-time" tell. This
+        traces several eased sub-movements to random on-viewport points with
+        human dwell between them (see :func:`human_wander`), plus an occasional
+        small scroll, so the buffer looks like a human landing on and reading a
+        page. Gated by ``human_mouse_enabled`` (off in tests / when a caller
+        wants a deterministic no-motion solve).
+
+        ``touch=True`` (a mobile fingerprint) fills the window with scroll
+        gestures + dwell instead — a phone has no hovering cursor, so tracing
+        ``mouse.move`` on a touch context would itself be a contradiction.
+
+        ``seconds`` overrides the wander duration for the passive window; the
+        default is ``config.human_passive_motion_seconds``.
+        """
         if not getattr(self._config, "human_mouse_enabled", True):
             return
-        mouse = page.mouse
-        start_x = random.randint(100, 300)
-        start_y = random.randint(80, 200)
-        await mouse.move(start_x, start_y)
-        await asyncio.sleep(random.uniform(0.1, 0.3))
-        target_x = random.randint(300, 500)
-        target_y = random.randint(250, 400)
-        steps = random.randint(4, 8)
-        for i in range(1, steps + 1):
-            t = i / steps
-            eased = t * t * (3 - 2 * t)
-            x = start_x + (target_x - start_x) * eased + random.uniform(-4, 4)
-            y = start_y + (target_y - start_y) * eased + random.uniform(-3, 3)
-            await mouse.move(x, y)
-            jitter_s = getattr(self._config, "human_mouse_jitter_ms", 80) / 1000.0
-            await asyncio.sleep(random.uniform(0.01, jitter_s))
-        await asyncio.sleep(random.uniform(0.2, 0.5))
+        from ..parsing.shapes.human_cursor import human_touch_scroll, human_wander
+
+        budget = (
+            seconds
+            if seconds is not None
+            else float(getattr(self._config, "human_passive_motion_seconds", 1.4))
+        )
+        if touch:
+            await human_touch_scroll(page, seconds=budget)
+            return
+        jitter = float(getattr(self._config, "human_mouse_jitter_ms", 80))
+        viewport = self._viewport_size(page)
+        cursor = await human_wander(
+            page, seconds=budget, viewport=viewport, jitter_ms=jitter
+        )
+        # An occasional short scroll — a human settling onto a page usually
+        # nudges the wheel. Best-effort; a fake page without wheel is a no-op.
+        if cursor is not None and random.random() < 0.5:
+            try:
+                await page.mouse.wheel(0, random.randint(60, 240))
+                await asyncio.sleep(random.uniform(0.15, 0.5))
+            except Exception:  # noqa: BLE001 - scroll is best-effort
+                pass
+
+    @staticmethod
+    def _viewport_size(page: Any) -> "tuple[int, int] | None":
+        """Best-effort ``(width, height)`` of the page viewport, else ``None``."""
+        try:
+            vp = getattr(page, "viewport_size", None)
+            if isinstance(vp, dict) and vp.get("width") and vp.get("height"):
+                return int(vp["width"]), int(vp["height"])
+        except Exception:  # noqa: BLE001
+            pass
+        return None

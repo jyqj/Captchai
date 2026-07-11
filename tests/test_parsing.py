@@ -21,6 +21,7 @@ from src.parsing.dispatcher import (
     ChallengeContext,
     ChallengeDispatcher,
     ChallengeShape,
+    ClassifierSelectors,
 )
 from src.parsing.shapes.area_bbox import AreaBBoxSolver
 from src.parsing.shapes.base import BaseShapeSolver
@@ -241,6 +242,133 @@ def test_classifier_vision_fallback_hint() -> None:
     asyncio.run(run())
 
 
+def test_classifier_vision_hint_disabled_skips_model_call() -> None:
+    """``vision_hint=False`` never calls the vision client for shape detection.
+
+    hCaptcha sets this because its VisionAdapter classifies tile IMAGES, not
+    "what shape is this frame" — an image-less hint would be a wasted model
+    call that can't return a shape. Detection must go straight to UNKNOWN.
+    """
+    async def run() -> None:
+        class BoomVision:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def classify(self, req: Any):
+                self.calls += 1
+                raise AssertionError("vision must not be consulted for the hint")
+
+        vision = BoomVision()
+        clf = ChallengeClassifier(vision=vision, vision_hint=False)
+        shape = await clf.detect(FakeFrame(counts={}), ChallengeContext())
+        assert shape is ChallengeShape.UNKNOWN
+        assert vision.calls == 0
+
+    asyncio.run(run())
+
+
+def test_dispatcher_unknown_fallback_runs_fallback_solver() -> None:
+    """UNKNOWN detection routes to the configured fallback shape's solver.
+
+    A DOM class-name change (hCaptcha renames a tile class) yields UNKNOWN; with
+    ``unknown_fallback=GRID_SELECT`` the dispatcher still attempts the grid
+    solver instead of giving up the whole attempt.
+    """
+    async def run() -> None:
+        class StubSolver:
+            def __init__(self) -> None:
+                self.ran = False
+
+            async def run(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:
+                self.ran = True
+                return "FALLBACK-TOK"
+
+        stub = StubSolver()
+        dispatcher = ChallengeDispatcher(
+            ChallengeClassifier(), unknown_fallback=ChallengeShape.GRID_SELECT
+        )
+        dispatcher.register(ChallengeShape.GRID_SELECT, stub)
+        seen: List[ChallengeShape] = []
+        # Empty frame → UNKNOWN → fallback → grid solver.
+        token = await dispatcher.solve(
+            FakeFrame(counts={}), ChallengeContext(), on_detected=seen.append
+        )
+        assert token == "FALLBACK-TOK"
+        assert stub.ran is True
+        # on_detected observes the resolved (fallback) shape, not UNKNOWN.
+        assert seen == [ChallengeShape.GRID_SELECT]
+
+    asyncio.run(run())
+
+
+def test_dispatcher_no_unknown_fallback_returns_none() -> None:
+    """Without a fallback, UNKNOWN with no registered solver still returns None."""
+    async def run() -> None:
+        dispatcher = ChallengeDispatcher(ChallengeClassifier())
+        token = await dispatcher.solve(FakeFrame(counts={}), ChallengeContext())
+        assert token is None
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Provider-scoped selectors (hCaptcha profile drops foreign class names)
+# ---------------------------------------------------------------------------
+
+
+_HCAPTCHA_SELECTORS = ClassifierSelectors(
+    grid=(".task-grid", ".task-image"),
+    tile=".task-image",
+    dynamic_markers=(),
+    slider=(),
+    drag=("[draggable='true']", ".draggable"),
+    bbox=(".challenge-example",),
+    prompt=(".prompt-text", ".challenge-prompt"),
+)
+
+
+def test_hcaptcha_profile_ignores_geetest_slider() -> None:
+    """A GeeTest slider class is NOT a slide challenge under the hCaptcha
+    profile (hCaptcha uses no sliders), so it degrades to UNKNOWN instead of
+    misrouting a page to the slide solver."""
+    async def run() -> None:
+        frame = FakeFrame(counts={".slide-handle": 1, ".geetest_slider_button": 1})
+        clf = ChallengeClassifier(selectors=_HCAPTCHA_SELECTORS)
+        shape = await clf.detect(frame, ChallengeContext())
+        assert shape is ChallengeShape.UNKNOWN
+
+    asyncio.run(run())
+
+
+def test_hcaptcha_profile_grid_and_area_select_still_detected() -> None:
+    """The hCaptcha profile still classifies its real shapes: a multi-tile
+    ``.task-image`` grid, and a single ``.task-image`` as area-select."""
+    async def run() -> None:
+        clf = ChallengeClassifier(selectors=_HCAPTCHA_SELECTORS)
+        grid = await clf.detect(
+            FakeFrame(counts={".task-image": 9}), ChallengeContext()
+        )
+        assert grid is ChallengeShape.GRID_SELECT
+        area = await clf.detect(
+            FakeFrame(counts={".task-image": 1}), ChallengeContext()
+        )
+        assert area is ChallengeShape.AREA_BBOX
+
+    asyncio.run(run())
+
+
+def test_hcaptcha_profile_no_dynamic_grid_misroute() -> None:
+    """With empty dynamic markers, a plain hCaptcha grid that happens to carry a
+    reCAPTCHA-style ``[data-dynamic]`` attr is still a plain GRID_SELECT."""
+    async def run() -> None:
+        frame = FakeFrame(counts={".task-image": 9, "[data-dynamic]": 1})
+        clf = ChallengeClassifier(selectors=_HCAPTCHA_SELECTORS)
+        shape = await clf.detect(frame, ChallengeContext())
+        assert shape is ChallengeShape.GRID_SELECT
+
+    asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -334,6 +462,61 @@ def test_grid_select_stops_when_no_indices() -> None:
         assert token is None
         # Vision consulted once; no tiles clicked because indices was empty.
         assert len(vision.calls) == 1
+        assert not any(c[0] == ".task-image" for c in frame.clicks)
+
+    asyncio.run(run())
+
+
+class _FakeTouchscreen:
+    def __init__(self) -> None:
+        self.taps: List[tuple] = []
+
+    async def tap(self, x: float, y: float) -> None:
+        self.taps.append((x, y))
+
+
+class _FakeTouchPage:
+    """A page exposing a touchscreen (mobile) and a mouse that must NOT be used."""
+
+    def __init__(self) -> None:
+        self.touchscreen = _FakeTouchscreen()
+        self.mouse_moves: List[tuple] = []
+        self.mouse = SimpleNamespace(
+            move=self._move, down=self._noop, up=self._noop
+        )
+
+    async def _move(self, x: float, y: float) -> None:
+        self.mouse_moves.append((x, y))
+
+    async def _noop(self, *a: Any, **k: Any) -> None:
+        return None
+
+
+def test_grid_select_taps_via_touchscreen_on_mobile() -> None:
+    """A mobile context (ctx.extra['touch']) selects tiles with trusted touch
+    taps, not mouse events — a mouse click on a phone fingerprint is a modality
+    contradiction hCaptcha mobile scores."""
+    async def run() -> None:
+        frame = FakeFrame(counts={".task-image": 4}, texts={".prompt-text": "buses"})
+        vision = FakeVision(indices=[1, 3])
+        poll, _state = make_token_poll([None, "TAP-TOK"])
+        solver = GridSelectSolver(vision=vision, token_poll=poll)
+        page = _FakeTouchPage()
+        ctx = ChallengeContext(
+            extra={
+                "page": page,
+                "humanize": True,
+                "humanize_jitter_ms": 0,
+                "touch": True,
+            }
+        )
+        token = await solver.run(frame, ctx)
+        assert token == "TAP-TOK"
+        # Tiles + submit were tapped via the touchscreen (2 tiles + 1 submit).
+        assert len(page.touchscreen.taps) >= 3
+        # The mouse was never moved (no desktop pointer path on a phone).
+        assert page.mouse_moves == []
+        # And no fallback locator.click() teleport either.
         assert not any(c[0] == ".task-image" for c in frame.clicks)
 
     asyncio.run(run())

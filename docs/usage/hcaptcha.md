@@ -19,7 +19,7 @@ hCaptcha presents a CAPTCHA challenge via an iframe widget. The solver renders t
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `isInvisible` | bool | Render the widget as invisible and call `execute()` (passive flow). |
+| `isInvisible` | bool | Render the widget as invisible. The solver waits for the widget to load, seeds a **continuous** human motion timeline (multi-segment wander/scroll for `HCAPTCHA_INVISIBLE_MOTION_SECONDS`, so passive scoring sees a real `motionData` buffer instead of one short burst), then triggers `execute()` — it does **not** click a checkbox (invisible widgets have none). A mobile fingerprint seeds touch-scroll motion instead of a cursor. The passive verdict gets a longer budget (`HCAPTCHA_INVISIBLE_PASSIVE_BUDGET`); if it still escalates to a visual challenge, it's dispatched and solved. |
 | `rqdata` | string | hCaptcha Enterprise `rqdata` nonce. Forwarded to `hcaptcha.render`; required by enterprise widgets that set it. |
 | `enterprisePayload` | object | Enterprise render config (`rqdata`, `sentry`, `endpoint`, `reportapi`, `assethost`, `imghost`, …). Its keys are **spread flat** onto `hcaptcha.render`, matching the JS API. If you send `rqdata` here (the YesCaptcha convention) it reaches the widget — no separate top-level `rqdata` needed. |
 | `realPage` | bool | Override the page strategy for this task. `false` (enterprise default) serves a synthetic page at the target hostname (token-relay). `true` navigates the real target and hooks `hcaptcha.render` (runs the site's own anti-bot JS). Defaults to `HCAPTCHA_REAL_PAGE`. |
@@ -37,7 +37,13 @@ Stripe's payment/checkout flows present hCaptcha Enterprise (Radar). Enterprise 
 3. **Match the egress IP.** Enterprise scores IP consistency, so the token must be minted through the **same IP** you submit the card-binding request from. Use `egress=task` with your **own residential/mobile proxy** and reuse that proxy for the Stripe call. Reuse `solution.userAgent` and (`solution.timezoneId` / `acceptLanguage`) too.
     - If you rely on the server-side pool (`egress=pool`), the minted IP is a server proxy you can't reach — set `POOL_EGRESS_EXPOSE_CREDENTIALS=true` to receive a reusable credentialed `egressServer`, otherwise the token's IP won't match your submit and Radar is likely to reject it.
 4. Enterprise defaults to the **injected page** (token-relay) rather than navigating the real Stripe URL, which usually can't be reproduced from a clean context. Set `realPage: true` per task only if a specific site's own JS must run.
-5. Quality of any grid/area challenge solve depends on your configured vision model (`LOCAL_MODEL` / `CLOUD_MODEL`).
+5. **Run a hardened runtime.** Enterprise detectors flag stock Chromium's automation + software-WebGL signals (its spoofed GPU string contradicts the real SwiftShader renderer). Set `BROWSER_RUNTIME=camoufox`; set `ENTERPRISE_REQUIRE_HARDENED_RUNTIME=true` to *refuse* (not just warn about) an enterprise solve on stock Chromium. Even on stock Chromium the stealth layer now keeps the whole WebGL capability surface (params + extension list), `window.screen`, `navigator.connection`, the AudioContext fingerprint and canvas (`toDataURL`/`toBlob`) coherent, and forces WebRTC through the proxy (`--force-webrtc-ip-handling-policy=disable_non_proxied_udp`) so the pre-proxy IP can't leak.
+6. **Persist the device (optional).** Set `HCAPTCHA_DEVICE_PERSISTENCE=true` so the hCaptcha device-trust cookie (`hmt`) captured on one solve is re-seeded into the next fresh context on the **same egress**, presenting a *returning* device instead of a zero-history one — pairs with `ENTERPRISE_FRESH_CONTEXT` (fresh-context isolation **and** a stable per-IP device). In-memory only; a restart starts cold.
+7. **Watch the rqdata clock.** A single-use `rqdata` is short-lived; a solve slower than `HCAPTCHA_RQDATA_TTL` seconds (default 30) appends an `rqdata nonce may have expired` note to `solution.warnings`. If you see it, capture a fresher `rqdata` and/or use a faster egress.
+8. Quality of any grid/area challenge solve depends on your configured vision model (`LOCAL_MODEL` / `CLOUD_MODEL`).
+
+!!! warning "Enterprise tokens can't be server-verified"
+    In the token-relay model the service holds no siteverify secret for the target sitekey, so it **cannot confirm** an enterprise token will be accepted. Enterprise solves return a `solution.warnings` array reminding you the token is IP-bound and unverifiable — capture a **fresh** `rqdata` per solve and submit from the same egress. Confirm real acceptance via `/reportCorrect` (or your own downstream check).
 
 ## Test targets
 

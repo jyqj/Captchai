@@ -37,26 +37,34 @@ from .injected_widget import InjectedWidgetSolver
 
 log = logging.getLogger(__name__)
 
-_EXTRACT_TURNSTILE_TOKEN_JS = """
-() => {
-    let token = null;
-    if (window.__omcToken) {
-        token = window.__omcToken;
-    } else {
-        const input = document.querySelector('[name="cf-turnstile-response"]')
-            || document.querySelector('input[name*="turnstile"]');
-        if (input && input.value && input.value.length > 20) {
-            token = input.value;
-        } else if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
-            try {
-                const resp = window.turnstile.getResponse();
-                if (resp && resp.length > 20) token = resp;
-            } catch (e) {}
-        }
-    }
-    return {token: token, error: window.__omcError || null};
-}
-"""
+# Token extractor. Reads the shared-DOM ``#omc-result`` FIRST so it works under
+# Camoufox (whose isolated-world evaluate can't see the page's main-world
+# ``window.__omc*`` globals), then falls back to the ``window`` global, the
+# ``cf-turnstile-response`` input, and ``turnstile.getResponse()`` for stock
+# Chromium.
+_EXTRACT_TURNSTILE_TOKEN_JS = (
+    "() => {\n"
+    "    let token = null;\n"
+    "    let error = null;\n"
+    "    " + InjectedWidgetSolver._omc_dom_read_js() + ""
+    "    if (!token && window.__omcToken) {\n"
+    "        token = window.__omcToken;\n"
+    "    }\n"
+    "    if (!token) {\n"
+    "        const input = document.querySelector('[name=\"cf-turnstile-response\"]')\n"
+    "            || document.querySelector('input[name*=\"turnstile\"]');\n"
+    "        if (input && input.value && input.value.length > 20) {\n"
+    "            token = input.value;\n"
+    "        } else if (window.turnstile && typeof window.turnstile.getResponse === 'function') {\n"
+    "            try {\n"
+    "                const resp = window.turnstile.getResponse();\n"
+    "                if (resp && resp.length > 20) token = resp;\n"
+    "            } catch (e) {}\n"
+    "        }\n"
+    "    }\n"
+    "    return {token: token, error: error || window.__omcError || null};\n"
+    "}\n"
+)
 
 
 class TurnstileSolver(InjectedWidgetSolver):

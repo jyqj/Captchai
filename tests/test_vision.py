@@ -195,8 +195,51 @@ def test_route_tier2_cloud_disabled_uses_local():
 # Single-shot & voting
 # ---------------------------------------------------------------------------
 
-def test_single_shot_high_confidence_no_voting():
+def test_hard_grid_votes_even_at_high_self_reported_confidence():
+    """A tier-2 grid is voted on regardless of the model's self-reported
+    confidence — a single call's own number isn't trusted to finalise the grid.
+
+    (Was ``test_single_shot_high_confidence_no_voting``: the old behaviour
+    returned after one call when the model self-reported ≥ threshold. That is
+    exactly the "confidently wrong" hole the agreement gate closes.)
+    """
     config = _make_config()
+    pool, recorder = _make_pool(
+        config, _const_script('{"indices":[1,3],"confidence":0.95}')
+    )
+    router = VisionRouter(pool, config)
+    result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
+    assert result.indices == [1, 3]
+    # 1 initial + 3 vote samples (self-consistency), not a single call.
+    assert result.votes == 3
+    assert len(recorder) == 4
+    # Confidence is cross-sample agreement (all samples agreed → 1.0), not 0.95.
+    assert result.confidence == 1.0
+
+
+def test_hard_grid_agreement_overrides_confidently_wrong_initial():
+    """When samples DISAGREE, the majority (agreement) answer wins over the
+    initial single call's confidently-self-reported answer."""
+    contents = [
+        '{"indices":[0],"confidence":0.99}',  # initial (old gate would trust this)
+        '{"indices":[5],"confidence":0.99}',  # vote 1
+        '{"indices":[5],"confidence":0.99}',  # vote 2
+        '{"indices":[7],"confidence":0.99}',  # vote 3
+    ]
+    config = _make_config(vision_vote_samples=3, vision_confidence_threshold=0.6)
+    pool, recorder = _make_pool(config, _seq_script(contents))
+    router = VisionRouter(pool, config)
+    result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
+    # Majority of the 3 votes picked tile 5 (2/3); the initial [0] is discarded.
+    assert result.indices == [5]
+    assert result.votes == 3
+    assert len(recorder) == 4
+
+
+def test_trust_self_confidence_restores_single_call_gate():
+    """VISION_TRUST_SELF_CONFIDENCE=true restores the legacy single-call gate:
+    a high self-reported confidence short-circuits voting even on tier 2."""
+    config = _make_config(vision_trust_self_confidence=True)
     pool, recorder = _make_pool(
         config, _const_script('{"indices":[1,3],"confidence":0.95}')
     )
@@ -205,7 +248,7 @@ def test_single_shot_high_confidence_no_voting():
     assert result.indices == [1, 3]
     assert result.votes == 1
     assert result.confidence == 0.95
-    # Exactly one call: no escalation.
+    # Exactly one call: self-report ≥ threshold short-circuits voting.
     assert len(recorder) == 1
 
 

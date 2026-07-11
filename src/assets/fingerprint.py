@@ -396,6 +396,160 @@ def _accept_language(languages: List[str]) -> str:
 _STEALTH_JS_CACHE: Dict[tuple, str] = {}
 _STEALTH_JS_CACHE_MAX = 256
 
+# A realistic WebGL1 extension list a real desktop/mobile ANGLE backend reports.
+# Headless Chromium on a GPU-less host falls back to SwiftShader, whose
+# extension list is a "software rasteriser" shape that contradicts the discrete
+# GPU vendor/renderer the stealth layer spoofs. Returning this coherent list
+# from ``getSupportedExtensions`` keeps the capability surface consistent with
+# the spoofed GPU. Kept to widely-present extensions so it never removes one the
+# page actually relies on.
+_GL_EXTENSIONS = [
+    "ANGLE_instanced_arrays",
+    "EXT_blend_minmax",
+    "EXT_color_buffer_half_float",
+    "EXT_disjoint_timer_query",
+    "EXT_float_blend",
+    "EXT_frag_depth",
+    "EXT_shader_texture_lod",
+    "EXT_texture_compression_bptc",
+    "EXT_texture_compression_rgtc",
+    "EXT_texture_filter_anisotropic",
+    "EXT_sRGB",
+    "OES_element_index_uint",
+    "OES_fbo_render_mipmap",
+    "OES_standard_derivatives",
+    "OES_texture_float",
+    "OES_texture_float_linear",
+    "OES_texture_half_float",
+    "OES_texture_half_float_linear",
+    "OES_vertex_array_object",
+    "WEBGL_color_buffer_float",
+    "WEBGL_compressed_texture_s3tc",
+    "WEBGL_compressed_texture_s3tc_srgb",
+    "WEBGL_debug_renderer_info",
+    "WEBGL_debug_shaders",
+    "WEBGL_depth_texture",
+    "WEBGL_draw_buffers",
+    "WEBGL_lose_context",
+    "WEBGL_multi_draw",
+]
+
+# Deep stealth patches appended to every context's init script. Built as a
+# plain (non-f) string with real JS braces and ``%`` placeholders so the JS is
+# readable without f-string brace-doubling. No literal ``%`` appears in the JS
+# (bit ops use ``&``/``<<``, never modulo), so ``%``-formatting is unambiguous.
+# Placeholder order (all consumed once):
+#   1 %s  WebGL supported-extension list (JS array literal)
+#   2 %d  screen.width      3 %d screen.height
+#   4 %d  screen.availWidth 5 %d screen.availHeight
+#   6 %d  audio perturbation offset
+#   7 %d  canvas sparse step   8 %d canvas per-fingerprint offset
+_HARDENING_JS_TEMPLATE = """
+  // ---- WebGL: keep the WHOLE capability surface coherent with the spoofed
+  // GPU, not just UNMASKED vendor/renderer. A GPU-less headless host falls
+  // back to SwiftShader, whose param values + extension list read as software
+  // rendering and contradict the discrete-GPU strings the layer spoofs; align
+  // the high-signal params + extensions so the surface is internally coherent.
+  const _WEBKIT_GL_PARAMS = {
+    3379: 16384, 34024: 16384, 34076: 16384, 36347: 4096,
+    36349: 1024, 36348: 30, 34930: 16, 35660: 16, 35661: 32, 34921: 16
+  };
+  const _WEBKIT_GL_EXTS = %s;
+  const _patchGL = (proto) => {
+    if (!proto) return;
+    const getParameter = proto.getParameter;
+    proto.getParameter = function (p) {
+      if (p === 37445) return _WEBGL_VENDOR;   // UNMASKED_VENDOR_WEBGL
+      if (p === 37446) return _WEBGL_RENDERER; // UNMASKED_RENDERER_WEBGL
+      if (p === 3386) return new Int32Array([32767, 32767]);  // MAX_VIEWPORT_DIMS
+      if (p === 33901) return new Float32Array([1, 1024]);    // ALIASED_POINT_SIZE_RANGE
+      if (p === 33902) return new Float32Array([1, 1]);       // ALIASED_LINE_WIDTH_RANGE
+      if (Object.prototype.hasOwnProperty.call(_WEBKIT_GL_PARAMS, p)) return _WEBKIT_GL_PARAMS[p];
+      return getParameter.call(this, p);
+    };
+    const _getExts = proto.getSupportedExtensions;
+    if (_getExts) { proto.getSupportedExtensions = function () { return _WEBKIT_GL_EXTS.slice(); }; }
+  };
+  try { _patchGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype); } catch (e) {}
+  try { _patchGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype); } catch (e) {}
+
+  // ---- window.screen coherence: a headless host frequently reports 0/odd
+  // screen dims that contradict the spoofed viewport + platform.
+  try {
+    const _screenDefs = {width: %d, height: %d, availWidth: %d, availHeight: %d, colorDepth: 24, pixelDepth: 24};
+    for (const _k in _screenDefs) {
+      try { Object.defineProperty(window.screen, _k, {get: ((v) => () => v)(_screenDefs[_k]), configurable: true}); } catch (e) {}
+    }
+  } catch (e) {}
+
+  // ---- navigator.connection: present on real Chrome; its absence is a
+  // headless tell. Expose a plausible 4G effective type.
+  try {
+    const _conn = {effectiveType: '4g', rtt: 50, downlink: 10, saveData: false,
+      onchange: null, addEventListener: function () {}, removeEventListener: function () {}};
+    Object.defineProperty(navigator, 'connection', {get: () => _conn, configurable: true});
+  } catch (e) {}
+
+  // ---- AudioContext: idempotent, inaudible per-fingerprint perturbation so
+  // the audio fingerprint is stable-but-unique (mirrors the canvas approach).
+  // A WeakSet guards each backing buffer so repeated reads don't drift.
+  try {
+    const _AOFF = %d;
+    const _audioSeen = new WeakSet();
+    const _gcd = AudioBuffer.prototype.getChannelData;
+    AudioBuffer.prototype.getChannelData = function (ch) {
+      const d = _gcd.call(this, ch);
+      if (!_audioSeen.has(d)) {
+        _audioSeen.add(d);
+        for (let i = 0; i < d.length; i += 971) { d[i] = d[i] + ((_AOFF - 32) * 1e-7); }
+      }
+      return d;
+    };
+    if (window.AnalyserNode && AnalyserNode.prototype.getFloatFrequencyData) {
+      const _ffd = AnalyserNode.prototype.getFloatFrequencyData;
+      AnalyserNode.prototype.getFloatFrequencyData = function (arr) {
+        _ffd.call(this, arr);
+        for (let i = 0; i < arr.length; i += 131) { arr[i] = arr[i] + ((_AOFF - 32) * 1e-5); }
+      };
+    }
+  } catch (e) {}
+
+  // ---- Canvas: idempotent sparse LSB perturbation applied to BOTH read paths
+  // (getImageData AND toDataURL/toBlob). The previous toDataURL override was a
+  // no-op, so the most common canvas-fingerprint path saw an UN-noised canvas.
+  // The step is prime (not a divisor of common widths) so the noise never
+  // aligns to a column; the offset is per-fingerprint so the hash is stable
+  // for one identity but uncorrelated across identities. LSB-forcing (not
+  // add-and-wrap) is idempotent so repeated reads return the SAME bytes.
+  try {
+    const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+    const _toBlob = HTMLCanvasElement.prototype.toBlob;
+    const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
+    const _step = %d;
+    const _offset = %d;
+    const _noisify = (data) => {
+      for (let i = 0; i < data.length; i += _step) { data[i] = (data[i] & 0xfe) | ((i + _offset) & 1); }
+      return data;
+    };
+    CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {
+      const img = _getImageData.call(this, x, y, w, h);
+      _noisify(img.data);
+      return img;
+    };
+    const _applyCanvasNoise = (canvas) => {
+      try {
+        const ctx = canvas.getContext && canvas.getContext('2d');
+        if (!ctx || !canvas.width || !canvas.height) return;
+        const img = _getImageData.call(ctx, 0, 0, canvas.width, canvas.height);
+        _noisify(img.data);
+        ctx.putImageData(img, 0, 0);
+      } catch (e) {}
+    };
+    HTMLCanvasElement.prototype.toDataURL = function (...args) { _applyCanvasNoise(this); return _toDataURL.apply(this, args); };
+    if (_toBlob) { HTMLCanvasElement.prototype.toBlob = function (...args) { _applyCanvasNoise(this); return _toBlob.apply(this, args); }; }
+  } catch (e) {}
+"""
+
 
 def _stealth_identity(fp: FingerprintProfile) -> tuple:
     """Hashable key of the fingerprint fields that influence the stealth JS."""
@@ -511,8 +665,15 @@ def _build_stealth_js_uncached(fp: FingerprintProfile) -> str:
     # column pattern. Larger than the previous 251 so fewer pixels are
     # touched (sparser) while still perturbing the canvas hash.
     canvas_step = 509
+    # WebGL supported-extension list as a JS array literal for the hardening
+    # template's ``getSupportedExtensions`` override.
+    gl_exts_js = "[" + ",".join(_js_str(ext) for ext in _GL_EXTENSIONS) + "]"
+    # window.screen coherence: availWidth == width; availHeight leaves room for
+    # a desktop taskbar (~40px) but is full-height on mobile (no chrome).
+    avail_width = fp.screen_width
+    avail_height = fp.screen_height if fp.is_mobile else max(0, fp.screen_height - 40)
 
-    return f"""
+    head = f"""
 (() => {{
   Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}});
   Object.defineProperty(navigator, 'languages', {{get: () => {languages_array}}});
@@ -572,45 +733,29 @@ def _build_stealth_js_uncached(fp: FingerprintProfile) -> str:
     );
   }}
 
+  // WebGL vendor/renderer + the rest of the capability surface are patched by
+  // the shared hardening template appended below (kept as a plain string so its
+  // JS braces don't need f-string doubling).
   const _WEBGL_VENDOR = {_js_str(fp.webgl_vendor)};
   const _WEBGL_RENDERER = {_js_str(fp.webgl_renderer)};
-  const _patchGL = (proto) => {{
-    if (!proto) return;
-    const getParameter = proto.getParameter;
-    proto.getParameter = function (p) {{
-      if (p === 37445) return _WEBGL_VENDOR;   // UNMASKED_VENDOR_WEBGL
-      if (p === 37446) return _WEBGL_RENDERER; // UNMASKED_RENDERER_WEBGL
-      return getParameter.call(this, p);
-    }};
-  }};
-  try {{ _patchGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype); }} catch (e) {{}}
-  try {{ _patchGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype); }} catch (e) {{}}
-
-  // Sparse, per-fingerprint canvas noise: nudges the pixel data hash
-  // without visible artefacts. The step ({canvas_step}) is prime and not a
-  // divisor of common image widths, so the noise doesn't align to a column
-  // pattern; the offset ({fp_offset}) is derived from the UA so the same
-  // fingerprint produces a stable hash but different fingerprints produce
-  // uncorrelated noise — defeating naive canvas-fingerprint reuse without
-  // the previous fixed (hc*7+mem)%8 signature.
-  try {{
-    const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
-    const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
-    const _step = {canvas_step};
-    const _offset = {fp_offset};
-    CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {{
-      const data = _getImageData.call(this, x, y, w, h);
-      for (let i = 0; i < data.data.length; i += _step) {{
-        data.data[i] = (data.data[i] + _offset) & 0xff;
-      }}
-      return data;
-    }};
-    HTMLCanvasElement.prototype.toDataURL = function (...args) {{
-      return _toDataURL.apply(this, args);
-    }};
-  }} catch (e) {{}}
-}})();
 """
+
+    # Deep hardening (WebGL params/extensions, window.screen, navigator.
+    # connection, AudioContext, canvas noise on BOTH read paths). Rendered with
+    # ``%`` so the JS keeps real braces; the placeholder order is documented on
+    # ``_HARDENING_JS_TEMPLATE``. ``fp_offset`` is reused for the audio offset
+    # (same coherent per-identity seed) and the canvas offset.
+    hardening = _HARDENING_JS_TEMPLATE % (
+        gl_exts_js,
+        fp.screen_width,
+        fp.screen_height,
+        avail_width,
+        avail_height,
+        fp_offset,
+        canvas_step,
+        fp_offset,
+    )
+    return head + hardening + "})();\n"
 
 
 def context_kwargs(

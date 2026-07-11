@@ -568,7 +568,15 @@ def test_enterprise_refuses_proxyless_fallback() -> None:
     asyncio.run(run())
 
 
-def test_invisible_skips_human_mouse() -> None:
+def test_invisible_warms_up_and_skips_checkbox() -> None:
+    """Invisible now SEEDS motion (for passive scoring) and never clicks a
+    (nonexistent) checkbox.
+
+    The old behaviour skipped the mouse warmup entirely and then waited out the
+    full checkbox-click timeout on an iframe that never exists for an invisible
+    widget. The fix feeds motionData before triggering the deferred execute()
+    and takes a checkbox-free path.
+    """
     async def run() -> None:
         page = FakePage(token_after=1, tile_count=0)
 
@@ -590,7 +598,7 @@ def test_invisible_skips_human_mouse() -> None:
 
         mouse_calls = []
 
-        async def fake_mouse(p):
+        async def fake_mouse(p, *, seconds=None, touch=False):
             mouse_calls.append(p)
 
         solver._human_mouse = fake_mouse  # type: ignore[assignment]
@@ -603,7 +611,55 @@ def test_invisible_skips_human_mouse() -> None:
                 "isInvisible": True,
             }
         )
-        assert mouse_calls == []
+        # Motion is seeded for passive scoring (was skipped before the fix).
+        assert mouse_calls == [page]
+        # The invisible path never clicks a checkbox (there is none).
+        assert not any("#checkbox" in c for c in page.clicks)
+
+    asyncio.run(run())
+
+
+def test_invisible_defers_execute_on_injected_page() -> None:
+    """The injected page for an invisible solve flags execute() deferral so the
+    widget doesn't fire the passive request before the solver seeds motion."""
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+
+        async def eval_token(script, *args):
+            has_token = "__omcToken" in script
+            has_error = "__omcError" in script
+            if has_error and not has_token:
+                return None
+            token = "P1_" + "z" * 40
+            if has_error:
+                return {"token": token, "error": None}
+            return token
+
+        page.evaluate = eval_token  # type: ignore[assignment]
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(_config(), manager=manager, services=None)
+
+        await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-inv",
+                "type": "HCaptchaTaskProxyless",
+                "isInvisible": True,
+            }
+        )
+        # An init script flags the deferral before the injected document renders.
+        assert any(
+            "__omcDeferExecute" in s for s in context.init_scripts
+        )
+        # The synthetic document still renders the invisible widget.
+        assert context.routes
+        _url, handler = context.routes[0]
+        route = FakeRoute(resource_type="document")
+        await handler(route)
+        body = route.fulfilled["body"]
+        assert '"size": "invisible"' in body
+        assert "window.__omcExecute" in body
 
     asyncio.run(run())
 
@@ -941,6 +997,102 @@ def test_enterprise_with_task_proxy_allowed_without_pool() -> None:
     asyncio.run(run())
 
 
+def test_enterprise_solution_includes_warnings() -> None:
+    """An enterprise solve surfaces the non-enforceable caveats in
+    ``solution.warnings`` (token can't be server-verified; token is IP-bound)."""
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+
+        async def eval_token(script, *args):
+            has_token = "__omcToken" in script
+            has_error = "__omcError" in script
+            if has_error and not has_token:
+                return None
+            token = "P1_" + "y" * 40
+            if has_error:
+                return {"token": token, "error": None}
+            return token
+
+        page.evaluate = eval_token  # type: ignore[assignment]
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(_config(), manager=manager, services=None)
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-ent",
+                "type": "HCaptchaTaskProxyless",
+                "rqdata": "RQ-DATA-XYZ-long-enough-nonce",
+                "enterprisePayload": {"sentry": "value"},
+                "proxy": "http://user:pass@proxy.example.com:8080",
+            }
+        )
+        assert result["gRecaptchaResponse"].startswith("P1_")
+        warnings = result.get("warnings") or []
+        assert any("cannot be server-verified" in w for w in warnings)
+        assert any("IP-bound" in w for w in warnings)
+        # A well-formed rqdata was supplied, so no "no rqdata" / "malformed" note.
+        assert not any("no rqdata" in w for w in warnings)
+
+
+    asyncio.run(run())
+
+
+def test_regular_solve_has_no_warnings() -> None:
+    """A non-enterprise solve carries no ``warnings`` (they're enterprise-only)."""
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=9)
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        vision = FakeVisionRouter(indices=[0, 3, 5])
+        services = _services(vision)
+        solver = HCaptchaSolver(_config(), manager=manager, services=services)
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-1",
+                "type": "HCaptchaTaskProxyless",
+                "userAgent": "UA-FAKE",
+            }
+        )
+        assert "warnings" not in result
+
+    asyncio.run(run())
+
+
+def test_enterprise_require_hardened_runtime_refuses_stock_chromium() -> None:
+    """With ENTERPRISE_REQUIRE_HARDENED_RUNTIME on, an enterprise solve on a
+    stock-Chromium runtime is refused before any attempt."""
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+        context = FakeContext(page)
+
+        class ChromiumManager(FakeManager):
+            runtime = "chromium"
+
+        manager = ChromiumManager(context)
+        solver = HCaptchaSolver(
+            _config(enterprise_require_hardened_runtime=True),
+            manager=manager,
+            services=None,
+        )
+        try:
+            await solver.solve(
+                {
+                    "websiteURL": "https://example.com",
+                    "websiteKey": "sitekey-ent",
+                    "type": "HCaptchaTaskProxyless",
+                    "rqdata": "RQ-DATA-XYZ-long-enough-nonce",
+                    "proxy": "http://user:pass@proxy.example.com:8080",
+                }
+            )
+            assert False, "expected enterprise solve on stock Chromium to be refused"
+        except RuntimeError as exc:
+            assert "hardened browser runtime" in str(exc)
+
+    asyncio.run(run())
+
+
 def test_vision_tier_escalates_only_after_challenge_stage() -> None:
     """Stage-aware escalation: a page-load failure keeps tier 1; a challenge
     failure bumps to tier 2 for the retry."""
@@ -1044,14 +1196,212 @@ def test_enterprise_residential_task_proxy_allowed_when_enforced_on_task() -> No
     asyncio.run(run())
 
 
+def test_invisible_enterprise_combined_solves_and_warns() -> None:
+    """The least-tested but most real path: invisible + enterprise together.
+
+    Passive scoring passes (token on first poll), so no checkbox is clicked and
+    the enterprise caveats are still surfaced in ``solution.warnings``.
+    """
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+
+        async def eval_token(script, *args):
+            has_token = "__omcToken" in script
+            has_error = "__omcError" in script
+            if has_error and not has_token:
+                return None
+            token = "P1_" + "i" * 40
+            if has_error:
+                return {"token": token, "error": None}
+            return token
+
+        page.evaluate = eval_token  # type: ignore[assignment]
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(_config(), manager=manager, services=None)
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-inv-ent",
+                "type": "HCaptchaTaskProxyless",
+                "isInvisible": True,
+                "rqdata": "RQ-DATA-XYZ-long-enough-nonce",
+                "enterprisePayload": {"sentry": "value"},
+                "proxy": "http://user:pass@proxy.example.com:8080",
+            }
+        )
+        assert result["gRecaptchaResponse"].startswith("P1_")
+        # No checkbox on an invisible widget.
+        assert not any("#checkbox" in c for c in page.clicks)
+        # Enterprise caveats still surfaced.
+        warnings = result.get("warnings") or []
+        assert any("IP-bound" in w for w in warnings)
+        # The injected document rendered the widget as invisible.
+        _url, handler = context.routes[0]
+        route = FakeRoute(resource_type="document")
+        await handler(route)
+        assert '"size": "invisible"' in route.fulfilled["body"]
+
+    asyncio.run(run())
+
+
+def test_enterprise_rqdata_ttl_warning_on_slow_solve() -> None:
+    """A slow enterprise solve appends an rqdata-freshness warning.
+
+    ``hcaptcha_rqdata_ttl`` set to a tiny positive value forces the elapsed time
+    to exceed the budget, so the caller is warned the single-use nonce may have
+    expired (the likeliest cause of a structurally-valid-but-rejected token).
+    """
+    async def run() -> None:
+        page = FakePage(token_after=1, tile_count=0)
+
+        async def eval_token(script, *args):
+            has_token = "__omcToken" in script
+            has_error = "__omcError" in script
+            if has_error and not has_token:
+                return None
+            token = "P1_" + "t" * 40
+            if has_error:
+                return {"token": token, "error": None}
+            return token
+
+        page.evaluate = eval_token  # type: ignore[assignment]
+        context = FakeContext(page)
+        manager = FakeManager(context)
+        solver = HCaptchaSolver(
+            _config(hcaptcha_rqdata_ttl=1e-6), manager=manager, services=None
+        )
+        result = await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sitekey-ttl",
+                "type": "HCaptchaTaskProxyless",
+                "rqdata": "RQ-DATA-XYZ-long-enough-nonce",
+                "proxy": "http://user:pass@proxy.example.com:8080",
+            }
+        )
+        warnings = result.get("warnings") or []
+        assert any("rqdata nonce may have expired" in w for w in warnings)
+
+    asyncio.run(run())
+
+
+class _CookieContext(FakeContext):
+    """FakeContext with a cookie jar so device-persistence can be exercised."""
+
+    def __init__(self, page, jar=None):
+        super().__init__(page)
+        self._jar = list(jar or [])
+        self.added = []
+
+    async def add_cookies(self, cookies):
+        self.added.extend(cookies)
+
+    async def cookies(self, *a, **k):
+        return list(self._jar)
+
+
+class _MultiManager:
+    """Hands out a distinct context per new_context call (fresh-context solves)."""
+
+    def __init__(self, contexts):
+        self._contexts = list(contexts)
+        self._i = 0
+
+    async def new_context(self, params):
+        ctx = self._contexts[min(self._i, len(self._contexts) - 1)]
+        self._i += 1
+        return ctx, "UA-FAKE"
+
+
+def test_device_persistence_captures_and_restores_hmt_cookie() -> None:
+    """With device persistence on, the hCaptcha device cookie is captured from
+    one solve and re-seeded into the next fresh context — so a fresh-context
+    enterprise solve presents a RETURNING device, not a zero-history one."""
+    async def run() -> None:
+        hmt = {"name": "hmt", "domain": ".hcaptcha.com", "value": "device-123"}
+        other = {"name": "sid", "domain": "example.com", "value": "nope"}
+        ctx1 = _CookieContext(FakePage(token_after=1, tile_count=9), jar=[hmt, other])
+        ctx2 = _CookieContext(FakePage(token_after=1, tile_count=9), jar=[])
+        vision = FakeVisionRouter(indices=[0, 3, 5])
+
+        solver = HCaptchaSolver(
+            _config(
+                hcaptcha_device_persistence=True,
+                poll_budget_passive=0.02,
+                poll_budget_challenge=0.1,
+                poll_budget_challenge_ready=0.05,
+            ),
+            manager=_MultiManager([ctx1, ctx2]),
+            services=_services(vision),
+        )
+        params = {
+            "websiteURL": "https://example.com",
+            "websiteKey": "sk-dev",
+            "type": "HCaptchaTaskProxyless",
+            "userAgent": "UA-FAKE",
+        }
+        await solver.solve(dict(params))
+        # Only the hCaptcha-domain cookie is captured, keyed by egress identity.
+        assert solver._device_cookies.get("proxyless") == [hmt]
+        # First solve had nothing to restore.
+        assert ctx1.added == []
+
+        await solver.solve(dict(params))
+        # Second (fresh) context is re-seeded with the persisted device cookie.
+        assert hmt in ctx2.added
+
+    asyncio.run(run())
+
+
+def test_device_persistence_off_by_default_no_cookie_calls() -> None:
+    """Default (persistence off): no cookies are captured or restored."""
+    async def run() -> None:
+        ctx = _CookieContext(FakePage(token_after=1, tile_count=9), jar=[
+            {"name": "hmt", "domain": ".hcaptcha.com", "value": "x"}
+        ])
+        vision = FakeVisionRouter(indices=[0])
+        solver = HCaptchaSolver(
+            _config(), manager=_MultiManager([ctx]), services=_services(vision)
+        )
+        await solver.solve(
+            {
+                "websiteURL": "https://example.com",
+                "websiteKey": "sk-nodev",
+                "type": "HCaptchaTaskProxyless",
+                "userAgent": "UA-FAKE",
+            }
+        )
+        assert solver._device_cookies == {}
+        assert ctx.added == []
+
+    asyncio.run(run())
+
+
+def test_challenge_iframe_selectors_cover_self_hosted_hosts() -> None:
+    """The iframe matchers aren't pinned to hcaptcha.com only: a self-hosted
+    enterprise deployment (custom assethost) is matched by path + frame name."""
+    from src.services.hcaptcha import _CHALLENGE_IFRAME, _CHECKBOX_IFRAME
+
+    assert "/challenge" in _CHALLENGE_IFRAME
+    assert 'name^="c-"' in _CHALLENGE_IFRAME
+    assert "/checkbox" in _CHECKBOX_IFRAME
+    assert 'name^="a-"' in _CHECKBOX_IFRAME
+    # The original host-pinned matcher is still present (regression guard).
+    assert "hcaptcha.com" in _CHALLENGE_IFRAME
+
+
 if __name__ == "__main__":
     test_grid_challenge_solved_via_vision_and_recorded()
     test_solve_records_phase_timing()
     test_enterprise_fields_forwarded()
     test_token_cache_not_consulted()
     test_enterprise_refuses_proxyless_fallback()
-    test_invisible_skips_human_mouse()
+    test_invisible_warms_up_and_skips_checkbox()
+    test_invisible_defers_execute_on_injected_page()
     test_widget_error_surfaced()
+    test_enterprise_solution_includes_warnings()
+    test_enterprise_require_hardened_runtime_refuses_stock_chromium()
     test_enterprise_with_explicit_proxyless_egress_raises()
     test_enterprise_with_no_residential_proxy_in_pool_raises()
     test_enterprise_with_residential_proxy_succeeds_and_includes_geo()

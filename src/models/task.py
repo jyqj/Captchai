@@ -108,6 +108,11 @@ class SolutionObject(BaseModel):
     # (scheme://host:port) or null for proxyless / server-egress solves.
     proxyKind: str | None = None
     egressServer: str | None = None
+    # Non-fatal, caller-facing caveats about a solve the service can't enforce
+    # itself — e.g. an enterprise hCaptcha token can't be server-verified
+    # (no siteverify secret) and is IP-bound, so the caller must submit from the
+    # same egress and confirm acceptance downstream. Omitted when empty.
+    warnings: list[str] | None = None
 
 
 class GetTaskResultResponse(BaseModel):

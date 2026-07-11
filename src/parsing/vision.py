@@ -186,6 +186,28 @@ class VisionRouter:
 
         votes = 1
 
+        # Agreement over self-report. A single model call reports its OWN
+        # confidence, which a model is frequently *confidently wrong* about, so
+        # trusting that number as the finality gate lets wrong grids through
+        # untested. Grid challenges (whose per-tile answers can be
+        # majority-voted) instead derive confidence from cross-sample agreement
+        # (self-consistency). ``VISION_TRUST_SELF_CONFIDENCE`` restores the
+        # legacy self-report gating. The tier split is deliberate:
+        #
+        #   * tier 2 (the hard grid path) ALWAYS votes — never takes a single
+        #     cloud call's self-reported number at face value.
+        #   * tier 1 (the cheap first pass) keeps the self-report gate to decide
+        #     inline escalation: a low self-report is a safe "I'm unsure →
+        #     escalate" trigger, and a tier-1 overconfident error is caught by
+        #     the solver's tier-2 retry (stage-aware escalation), so paying for
+        #     a full local vote on every cheap pass isn't warranted.
+        trust_self = bool(
+            getattr(self._config, "vision_trust_self_confidence", False)
+        )
+        grid_shape = req.shape in _STITCHABLE_SHAPES
+        # Vote a grid on the hard tier regardless of the self-reported number.
+        force_grid_vote = grid_shape and not trust_self
+
         # WP4: inline tier-1 → tier-2 escalation. A low-confidence local result
         # gets a single cloud retry (optionally followed by cloud voting) before
         # the solver falls back to a full browser redo. The cloud call goes
@@ -216,9 +238,9 @@ class VisionRouter:
             raw = cloud_raw
             model_name = "cloud"
 
-            # If cloud confidence is still below threshold, engage the existing
-            # voting path on the cloud client (only when samples > 1).
-            if cloud_conf < threshold and samples > 1:
+            # Vote the escalated cloud result too when it's a grid (don't trust
+            # its self-report either) or when its self-report is low.
+            if samples > 1 and (force_grid_vote or cloud_conf < threshold):
                 voted_indices, voted_conf, vote_usage, votes = await self._vote(
                     "cloud", cloud_req, samples, image_b64
                 )
@@ -226,13 +248,14 @@ class VisionRouter:
                 confidence = voted_conf
                 total_usage = total_usage.add(vote_usage)
 
-        # Existing tier-2 voting path (only when no inline escalation happened
-        # — the elif is mutually exclusive with the if above).
+        # Hard tier: always vote a grid (self-consistency), else fall back to the
+        # legacy low-self-report gate for non-grid shapes. The elif is mutually
+        # exclusive with the tier-1 escalation above.
         elif (
-            confidence < threshold
-            and req.task_tier >= 2
+            req.task_tier >= 2
             and cloud_enabled
             and samples > 1
+            and (force_grid_vote or confidence < threshold)
         ):
             voted_indices, voted_conf, vote_usage, votes = await self._vote(
                 model_name, req, samples, image_b64

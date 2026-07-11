@@ -95,8 +95,92 @@ class InjectedWidgetSolver(BaseBrowserSolver):
     #: Extractor evaluated by :meth:`_poll_token`. Must return
     #: ``{token, error}`` and mention both ``__omcToken`` and ``__omcError``.
     WIDGET_TOKEN_EXTRACTOR_JS: str = ""
+    #: When True, an invisible widget's ``execute()`` is NOT auto-fired at
+    #: render. Instead the render hook exposes ``window.__omcExecute`` and the
+    #: solver drives it explicitly (after seeding behaviour / motionData), so
+    #: the passive ``/getcaptcha`` doesn't fire with an empty motion buffer.
+    #: hCaptcha opts in (True); Turnstile keeps the immediate fire (False).
+    DEFER_INVISIBLE_EXECUTE: bool = False
+    #: Init script that flags the deferral to the render hook. Injected before
+    #: the widget renders when ``DEFER_INVISIBLE_EXECUTE`` is set for an
+    #: invisible solve.
+    _DEFER_EXECUTE_JS: str = "window.__omcDeferExecute = true;"
+
+    # ── Camoufox-safe DOM bridge ───────────────────────────────
+    #: Camoufox (a Firefox fork) runs ``page.evaluate`` in an ISOLATED content
+    #: world for stealth, so a ``window.__omc*`` global set by the page's own
+    #: main-world ``<script>`` is invisible to the solver's evaluate calls (it
+    #: returns ``undefined``). The shared DOM, however, is the SAME across
+    #: worlds. So the token/status handoff (page → solver) and the invisible
+    #: ``execute()`` trigger (solver → page) both go through hidden DOM elements:
+    #: the page writes the token/status onto ``#omc-result`` and observes
+    #: ``#omc-exec`` for an execute signal, while the solver reads ``#omc-result``
+    #: and writes ``#omc-exec`` — all DOM ops that cross the world boundary. The
+    #: ``window.__omc*`` globals are kept as a fast path for stock Chromium and a
+    #: fallback everywhere.
+    OMC_RESULT_ID: str = "omc-result"
+    OMC_EXEC_ID: str = "omc-exec"
+
+    @classmethod
+    def _omc_bridge_js(cls) -> str:
+        """Main-world helpers the injected/real page uses for the DOM bridge.
+
+        Defines ``__omcSet`` (write token/status onto ``#omc-result``),
+        ``__omcMarkReady`` (mark the widget rendered), and
+        ``__omcInstallExecBridge`` (observe ``#omc-exec`` and fire the deferred
+        ``window.__omcExecute`` when the solver flips its ``data-exec`` attribute
+        — the cross-world trigger for an invisible widget). All create their
+        elements lazily so the real-page path (which has no synthetic HTML)
+        works too.
+        """
+        return (
+            "function __omcResultEl(){var el=document.getElementById('%(r)s');"
+            "if(!el){el=document.createElement('div');el.id='%(r)s';"
+            "el.setAttribute('data-status','');el.style.display='none';"
+            "(document.body||document.documentElement).appendChild(el);}return el;}"
+            "function __omcSet(status,value){var el=__omcResultEl();"
+            "el.textContent=(value==null?'':String(value));"
+            "el.setAttribute('data-status',status);}"
+            "function __omcMarkReady(){var el=__omcResultEl();"
+            "if(!el.getAttribute('data-status')){el.setAttribute('data-status','rendered');}}"
+            "function __omcInstallExecBridge(){var t=document.getElementById('%(e)s');"
+            "if(!t){t=document.createElement('div');t.id='%(e)s';"
+            "t.setAttribute('data-exec','0');t.style.display='none';"
+            "(document.body||document.documentElement).appendChild(t);}"
+            "try{var obs=new MutationObserver(function(){"
+            "if(t.getAttribute('data-exec')==='1'&&window.__omcExecute){"
+            "window.__omcExecute();}});"
+            "obs.observe(t,{attributes:true,attributeFilter:['data-exec']});}catch(e){}}"
+        ) % {"r": cls.OMC_RESULT_ID, "e": cls.OMC_EXEC_ID}
+
+    @classmethod
+    def _omc_dom_read_js(cls) -> str:
+        """JS fragment (statements) that reads a token/error off ``#omc-result``.
+
+        Expects ``token`` and ``error`` to be declared by the caller; sets them
+        from the DOM when present. Shared verbatim by the provider token
+        extractors so the DOM path is identical for hCaptcha and Turnstile.
+        """
+        return (
+            "const __omcEl = document.getElementById('%(r)s');\n"
+            "    if (__omcEl) {\n"
+            "        const __st = __omcEl.getAttribute('data-status');\n"
+            "        if (__st === 'done') token = __omcEl.textContent;\n"
+            "        else if (__st === 'error') error = __omcEl.textContent;\n"
+            "    }\n"
+        ) % {"r": cls.OMC_RESULT_ID}
 
     # ── injected page ──────────────────────────────────────────
+
+    def _widget_api_js(self, options: dict[str, Any]) -> str:
+        """Resolve the widget SDK script URL for this solve.
+
+        Default is the class-level public SDK (:attr:`WIDGET_API_JS`).
+        Providers override this to honour a self-hosted deployment (e.g.
+        enterprise hCaptcha served from a custom ``assethost``) so the injected
+        page doesn't contradict the render config by pulling the public script.
+        """
+        return self.WIDGET_API_JS
 
     def _widget_render_body(self) -> str:
         """JS that calls the widget's ``render`` (inside the injected page).
@@ -118,23 +202,33 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         """
         render_opts = {"sitekey": website_key, **options}
         opts_json = json.dumps(render_opts)
+        api_js = self._widget_api_js(options)
+        bridge = self._omc_bridge_js()
+        # The token/status is written onto ``#omc-result`` (and the legacy
+        # ``window.__omc*`` globals) so a Camoufox isolated-world evaluate can
+        # still read it off the shared DOM. ``#omc-exec`` is the solver→page
+        # trigger for a deferred invisible ``execute()``.
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>verify</title>
-<script src="{self.WIDGET_API_JS}" async defer></script>
+<script src="{api_js}" async defer></script>
 </head>
 <body>
 <div id="{self.WIDGET_CONTAINER_ID}"></div>
+<div id="{self.OMC_RESULT_ID}" data-status="" style="display:none"></div>
+<div id="{self.OMC_EXEC_ID}" data-exec="0" style="display:none"></div>
 <script>
     window.__omcToken = null;
+    {bridge}
     function omcRender() {{
         if (!window.{self.WIDGET_GLOBAL}) {{ setTimeout(omcRender, 50); return; }}
         const opts = {opts_json};
-        opts.callback = function (token) {{ window.__omcToken = token; }};
-        opts['error-callback'] = function (e) {{ window.__omcError = {self.WIDGET_ERROR_CALLBACK_VALUE}; }};
+        opts.callback = function (token) {{ window.__omcToken = token; __omcSet('done', token); }};
+        opts['error-callback'] = function (e) {{ window.__omcError = {self.WIDGET_ERROR_CALLBACK_VALUE}; __omcSet('error', {self.WIDGET_ERROR_CALLBACK_VALUE}); }};
         try {{
             {self._widget_render_body()}
-        }} catch (e) {{ window.__omcError = String(e); }}
+            __omcMarkReady();
+        }} catch (e) {{ window.__omcError = String(e); __omcSet('error', e && e.message ? e.message : String(e)); }}
     }}
     omcRender();
 </script>
@@ -193,8 +287,17 @@ class InjectedWidgetSolver(BaseBrowserSolver):
             if remaining_ms <= 0:
                 break
             try:
+                # DOM-first predicate: under Camoufox the ``window.__omc*``
+                # globals live in the page's main world and are invisible to
+                # this isolated-world wait, but ``#omc-result``'s status is on
+                # the shared DOM. Keep the window check as a stock-Chromium fast
+                # path / fallback.
                 await page.wait_for_function(
-                    "() => window.__omcToken || window.__omcError",
+                    "() => { const el = document.getElementById('"
+                    + self.OMC_RESULT_ID
+                    + "'); const st = el ? el.getAttribute('data-status') : null;"
+                    " return st === 'done' || st === 'error'"
+                    " || window.__omcToken || window.__omcError; }",
                     timeout=min(interval_ms * 4, remaining_ms),
                 )
             except Exception:
@@ -216,11 +319,13 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         """
         opts_json = json.dumps(options)
         g = self.WIDGET_GLOBAL
+        bridge = self._omc_bridge_js()
         return f"""
 (function() {{
     window.__omcToken = null;
     window.__omcError = null;
     window.__omcExecuted = false;
+    {bridge}
     const __omcRenderOptions = {opts_json};
     function omcHook() {{
         if (window.{g} && window.{g}.render) {{
@@ -230,23 +335,36 @@ class InjectedWidgetSolver(BaseBrowserSolver):
                 const origCb = opts.callback;
                 opts.callback = function(token) {{
                     window.__omcToken = token;
+                    __omcSet('done', token);
                     if (origCb) origCb(token);
                 }};
                 const origErr = opts['error-callback'];
                 opts['error-callback'] = function(e) {{
                     window.__omcError = String(e);
+                    __omcSet('error', e);
                     if (origErr) origErr(e);
                 }};
                 const wid = origRender(container, opts);
-                // Invisible widgets only mint a token once execute() runs. On a
-                // synthetic page (or a real page that renders but never triggers
-                // execute itself) nothing would fire, so drive it once here when
-                // WE requested invisible via the render options. Guarded so a
-                // real page that also calls execute doesn't double-trigger.
-                if (opts.size === 'invisible' && !window.__omcExecuted
-                        && window.{g} && typeof window.{g}.execute === 'function') {{
+                window.__omcWidgetId = wid;
+                // Expose an explicit execute trigger so a solver can drive an
+                // invisible widget AFTER seeding behaviour (motionData) instead
+                // of firing the passive request with an empty motion buffer.
+                // Guarded (``__omcExecuted``) so it can't double-trigger.
+                window.__omcExecute = function () {{
+                    if (window.__omcExecuted) return;
                     window.__omcExecuted = true;
-                    try {{ window.{g}.execute(wid); }} catch (e) {{}}
+                    try {{ window.{g}.execute(wid); }} catch (e) {{ window.__omcError = String(e); __omcSet('error', e && e.message ? e.message : String(e)); }}
+                }};
+                // Bridge a solver→page execute signal through the shared DOM so
+                // a Camoufox isolated-world evaluate can trigger the deferred
+                // execute() (it can't call the main-world function directly).
+                __omcInstallExecBridge();
+                // Auto-fire invisible unless the solver deferred it
+                // (``__omcDeferExecute``). hCaptcha defers; Turnstile keeps the
+                // immediate fire so its behaviour is unchanged.
+                if (opts.size === 'invisible' && !window.__omcDeferExecute
+                        && window.{g} && typeof window.{g}.execute === 'function') {{
+                    window.__omcExecute();
                 }}
                 return wid;
             }};
@@ -269,11 +387,20 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         page to make look human).
         """
         html = self._build_injected_page(website_key, render_options)
+        defer_execute = (
+            self.DEFER_INVISIBLE_EXECUTE
+            and render_options.get("size") == "invisible"
+        )
 
         async def prepare(context: Any) -> None:
             # Re-assert blocking ON in case a reused warm session had it turned
             # off by a prior real-page solve, then fulfil the document.
             set_context_resource_blocking(context, True)
+            # Flag the deferral BEFORE the page's inline render script runs
+            # (init scripts execute before any page script) so the render hook
+            # sees it and skips the automatic invisible execute().
+            if defer_execute:
+                await context.add_init_script(self._DEFER_EXECUTE_JS)
             await context.route(website_url, self._document_route_handler(html))
 
         return PageStrategy(
@@ -289,8 +416,15 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         image on a real target page is one of the easiest anti-bot signals.
         """
 
+        defer_execute = (
+            self.DEFER_INVISIBLE_EXECUTE
+            and render_options.get("size") == "invisible"
+        )
+
         async def prepare(context: Any) -> None:
             set_context_resource_blocking(context, False)
+            if defer_execute:
+                await context.add_init_script(self._DEFER_EXECUTE_JS)
             await context.add_init_script(
                 self._build_real_page_init_script(render_options)
             )
@@ -309,6 +443,21 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         Overridden by hCaptcha to refuse an enterprise solve that would run on
         a bare server-egress (proxyless) context.
         """
+        return
+
+    async def _restore_device(self, context: Any, params: dict[str, Any]) -> None:
+        """Optional pre-goto device-state restore; default no-op.
+
+        Overridden by hCaptcha to re-seed a provider device-trust cookie (the
+        ``hmt`` accessibility cookie) into a fresh context so enterprise risk
+        models see a returning device instead of a zero-history one.
+        """
+        return
+
+    async def _persist_device(
+        self, context: Any, params: dict[str, Any], solved: bool
+    ) -> None:
+        """Optional post-solve device-state persist; default no-op."""
         return
 
     async def _interact(
@@ -357,6 +506,11 @@ class InjectedWidgetSolver(BaseBrowserSolver):
             params["_phase"] = SolveStage.ACQUIRE.value
             self._guard(solve_context, params)
             await strategy.prepare_context(context)
+            # Re-seed a persisted provider device-trust cookie (hCaptcha ``hmt``)
+            # into this (possibly fresh) context so the widget sees a returning
+            # device rather than a zero-history one. No-op unless the provider
+            # overrides it and the operator opted in.
+            await self._restore_device(context, params)
             page = await context.new_page()
             params["_phase"] = SolveStage.PAGE_LOAD.value
             timeout_ms = self._config.browser_timeout * 1000
@@ -381,4 +535,8 @@ class InjectedWidgetSolver(BaseBrowserSolver):
             params["_phase_challenge_ms"] = int(
                 (time.monotonic() - _challenge_started) * 1000
             )
+            # Capture the provider device-trust cookie BEFORE the context is
+            # released/closed so the next solve on this egress can present a
+            # returning device. Guarded + no-op unless opted in.
+            await self._persist_device(context, params, solved)
             await self._release_context(solve_context, solved, params)

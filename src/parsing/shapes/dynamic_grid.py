@@ -71,7 +71,10 @@ class DynamicGridSolver(BaseShapeSolver):
                 await self.human_click_submit(frame, ctx)
                 break
 
-            for i in indices:
+            await self.human_pause(ctx, 0.4, 1.1)
+            for click_idx, i in enumerate(indices):
+                if click_idx > 0:
+                    await self.human_pause(ctx, 0.18, 0.5)
                 await self.human_click_tile(frame, i, ctx)
 
         await self.human_click_submit(frame, ctx)
