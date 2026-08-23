@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from playwright.async_api import Route
 
+from ..assets.js_loader import load_js
 from .browser import set_context_resource_blocking
 from .browser_solver import BaseBrowserSolver, SolveStage
 from .captcha_errors import classify_widget_error
@@ -104,7 +105,7 @@ class InjectedWidgetSolver(BaseBrowserSolver):
     #: Init script that flags the deferral to the render hook. Injected before
     #: the widget renders when ``DEFER_INVISIBLE_EXECUTE`` is set for an
     #: invisible solve.
-    _DEFER_EXECUTE_JS: str = "window.__omcDeferExecute = true;"
+    _DEFER_EXECUTE_JS: str = load_js("defer_execute.js").strip()
 
     # ── Camoufox-safe DOM bridge ───────────────────────────────
     #: Camoufox (a Firefox fork) runs ``page.evaluate`` in an ISOLATED content
@@ -134,24 +135,10 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         works too.
         """
         return (
-            "function __omcResultEl(){var el=document.getElementById('%(r)s');"
-            "if(!el){el=document.createElement('div');el.id='%(r)s';"
-            "el.setAttribute('data-status','');el.style.display='none';"
-            "(document.body||document.documentElement).appendChild(el);}return el;}"
-            "function __omcSet(status,value){var el=__omcResultEl();"
-            "el.textContent=(value==null?'':String(value));"
-            "el.setAttribute('data-status',status);}"
-            "function __omcMarkReady(){var el=__omcResultEl();"
-            "if(!el.getAttribute('data-status')){el.setAttribute('data-status','rendered');}}"
-            "function __omcInstallExecBridge(){var t=document.getElementById('%(e)s');"
-            "if(!t){t=document.createElement('div');t.id='%(e)s';"
-            "t.setAttribute('data-exec','0');t.style.display='none';"
-            "(document.body||document.documentElement).appendChild(t);}"
-            "try{var obs=new MutationObserver(function(){"
-            "if(t.getAttribute('data-exec')==='1'&&window.__omcExecute){"
-            "window.__omcExecute();}});"
-            "obs.observe(t,{attributes:true,attributeFilter:['data-exec']});}catch(e){}}"
-        ) % {"r": cls.OMC_RESULT_ID, "e": cls.OMC_EXEC_ID}
+            load_js("omc_bridge.js")
+            .replace("__RESULT_ID__", cls.OMC_RESULT_ID)
+            .replace("__EXEC_ID__", cls.OMC_EXEC_ID)
+        )
 
     @classmethod
     def _omc_dom_read_js(cls) -> str:
@@ -161,14 +148,7 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         from the DOM when present. Shared verbatim by the provider token
         extractors so the DOM path is identical for hCaptcha and Turnstile.
         """
-        return (
-            "const __omcEl = document.getElementById('%(r)s');\n"
-            "    if (__omcEl) {\n"
-            "        const __st = __omcEl.getAttribute('data-status');\n"
-            "        if (__st === 'done') token = __omcEl.textContent;\n"
-            "        else if (__st === 'error') error = __omcEl.textContent;\n"
-            "    }\n"
-        ) % {"r": cls.OMC_RESULT_ID}
+        return load_js("omc_dom_read.js").replace("__RESULT_ID__", cls.OMC_RESULT_ID)
 
     # ── injected page ──────────────────────────────────────────
 

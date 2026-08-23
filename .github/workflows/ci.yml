@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Redis is optional: the Redis-backed tests skip gracefully when no
+      # server is reachable (ping-based skip in tests/conftest.py), so CI runs
+      # without a Redis service and exercises the in-memory backends.
+      - name: Run tests
+        run: pytest -q
+
+      - name: Check docs bilingual parity
+        run: python scripts/check_docs_parity.py
+
+      # Type check — src/ at standard mode; tests relax fake-object rules via
+      # executionEnvironments in pyrightconfig.json.
+      - name: Type check (pyright)
+        run: |
+          pip install pyright
+          pyright
+
+      - name: Build docs (strict)
+        run: mkdocs build --strict

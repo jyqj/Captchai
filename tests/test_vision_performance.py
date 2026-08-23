@@ -33,8 +33,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.assets.model_pool import ModelUsage  # noqa: E402
+from src.core.config import Config  # noqa: E402
 from src.parsing.vision import VisionRequest, VisionRouter  # noqa: E402
 from src.services.browser import BrowserManager  # noqa: E402
+from tests.support.fakes import fake_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -123,24 +125,8 @@ class FakeRoute:
 # ---------------------------------------------------------------------------
 
 
-def _make_config(**overrides):
-    base = dict(
-        cloud_base_url="http://cloud",
-        cloud_api_key="cloud-key",
-        cloud_model="gpt-cloud",
-        local_base_url="http://local",
-        local_api_key="local-key",
-        local_model="qwen-local",
-        vision_cloud_enabled=True,
-        vision_vote_samples=3,
-        vision_confidence_threshold=0.6,
-        vision_tier2_detail="high",
-        vision_vote_concurrent=True,
-        vision_inline_escalate=True,
-        captcha_timeout=30,
-    )
-    base.update(overrides)
-    return SimpleNamespace(**base)
+def _make_config(**overrides: object) -> Config:
+    return fake_config(**overrides)
 
 
 def _req(**overrides):
@@ -434,18 +420,9 @@ def test_inline_escalation_engages_voting_when_cloud_also_low():
 # ---------------------------------------------------------------------------
 
 
-def _resource_manager(*, block_hosts=""):
+def _resource_manager(*, block_hosts: str = "") -> BrowserManager:
     """Build a BrowserManager with the default resource policy pre-parsed."""
-    config = SimpleNamespace(
-        resource_block_enabled=True,
-        resource_block_types="image,media,font,stylesheet",
-        resource_allow_hosts=(
-            "hcaptcha.com,challenges.cloudflare.com,google.com,"
-            "recaptcha.net,gstatic.com,cloudflare.com"
-        ),
-        resource_block_hosts=block_hosts,
-    )
-    return BrowserManager(config)
+    return BrowserManager(fake_config(resource_block_hosts=block_hosts))
 
 
 def test_resource_handler_blocks_image_on_generic_host():

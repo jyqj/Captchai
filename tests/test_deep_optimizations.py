@@ -12,11 +12,13 @@ import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     _ = sys.path.insert(0, str(PROJECT_ROOT))
+
+from playwright.async_api import Browser, Playwright  # noqa: E402
 
 from src.assets.fingerprint import (  # noqa: E402
     client_hint_headers,
@@ -24,6 +26,8 @@ from src.assets.fingerprint import (  # noqa: E402
     generate_fingerprint,
     sec_ch_ua,
 )
+from src.assets.model_pool import ModelPool  # noqa: E402
+from src.core.config import Config  # noqa: E402
 from src.parsing.dispatcher import ChallengeContext  # noqa: E402
 from src.parsing.shapes.grid_select import GridSelectSolver  # noqa: E402
 from src.parsing.shapes.human_cursor import ease_path, human_click, point_in_box  # noqa: E402
@@ -153,7 +157,7 @@ class _FakeVision:
     def __init__(self, indices):
         self.indices = indices
 
-    async def classify(self, req: Any):
+    async def classify(self, req: Any) -> Any:
         return SimpleNamespace(indices=list(self.indices), confidence=0.95)
 
 
@@ -224,8 +228,8 @@ def test_checkbox_click_uses_human_path_when_enabled() -> None:
                 return _Loc()
 
         page = _RecordingPage()
-        config = SimpleNamespace(human_mouse_enabled=True, human_mouse_jitter_ms=0)
-        solver = BaseBrowserSolver(config, manager=SimpleNamespace(), services=None)
+        config = cast(Config, SimpleNamespace(human_mouse_enabled=True, human_mouse_jitter_ms=0))
+        solver = BaseBrowserSolver(config, manager=cast(Any, SimpleNamespace()), services=None)
         await solver._human_click_in_frame(page, _Frame(), "#checkbox")
         # Real pointer travel + a real press, exactly like the tile clicks.
         assert len(page.mouse.moves) > 5
@@ -257,8 +261,8 @@ def test_checkbox_click_falls_back_to_locator_click_when_disabled() -> None:
                 return _Loc()
 
         page = _RecordingPage()
-        config = SimpleNamespace(human_mouse_enabled=False, human_mouse_jitter_ms=0)
-        solver = BaseBrowserSolver(config, manager=SimpleNamespace(), services=None)
+        config = cast(Config, SimpleNamespace(human_mouse_enabled=False, human_mouse_jitter_ms=0))
+        solver = BaseBrowserSolver(config, manager=cast(Any, SimpleNamespace()), services=None)
         await solver._human_click_in_frame(page, _Frame(), "#checkbox")
         assert clicked["n"] == 1
         assert page.mouse.downs == 0
@@ -325,15 +329,18 @@ def test_egress_from_params_surfaces_kind_and_server() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _runtime_config(runtime: str, strict: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        browser_headless=True,
-        browser_runtime=runtime,
-        browser_runtime_strict=strict,
-        resource_block_enabled=False,
-        resource_block_types="",
-        resource_allow_hosts="",
-        resource_block_hosts="",
+def _runtime_config(runtime: str, strict: bool) -> Config:
+    return cast(
+        Config,
+        SimpleNamespace(
+            browser_headless=True,
+            browser_runtime=runtime,
+            browser_runtime_strict=strict,
+            resource_block_enabled=False,
+            resource_block_types="",
+            resource_allow_hosts="",
+            resource_block_hosts="",
+        ),
     )
 
 
@@ -342,7 +349,7 @@ def test_strict_runtime_raises_when_hardened_runtime_unavailable() -> None:
         mgr = BrowserManager(_runtime_config("camoufox", strict=True))
         # Force "not installed" so the test is independent of the environment.
         mgr._hardened_runtime_available = lambda rt: False  # type: ignore[assignment]
-        mgr._playwright = SimpleNamespace(chromium=SimpleNamespace())
+        mgr._playwright = cast(Playwright, SimpleNamespace(chromium=SimpleNamespace()))
         try:
             await mgr._launch()
             raise AssertionError("strict mode should raise on unavailable runtime")
@@ -364,7 +371,7 @@ def test_lenient_runtime_degrades_to_chromium() -> None:
 
         mgr = BrowserManager(_runtime_config("camoufox", strict=False))
         mgr._hardened_runtime_available = lambda rt: False  # type: ignore[assignment]
-        mgr._playwright = SimpleNamespace(chromium=_Launcher())
+        mgr._playwright = cast(Playwright, SimpleNamespace(chromium=_Launcher()))
         await mgr._launch()
         # Degraded to stock chromium and recorded the divergence.
         assert launched["chromium"] is True
@@ -512,7 +519,7 @@ def _vision_config(**over):
         captcha_timeout=30,
     )
     base.update(over)
-    return SimpleNamespace(**base)
+    return cast(Config, SimpleNamespace(**base))
 
 
 def _count_images(messages) -> int:
@@ -524,7 +531,7 @@ def test_vision_stitches_grid_into_single_image() -> None:
     from src.parsing.vision import VisionRequest, VisionRouter
 
     pool = _RecPool()
-    router = VisionRouter(pool, _vision_config(vision_stitch_grid=True))
+    router = VisionRouter(cast(ModelPool, pool), _vision_config(vision_stitch_grid=True))
     req = VisionRequest(
         prompt="select all buses",
         images=[_png((i * 30 % 255, 80, 120)) for i in range(4)],
@@ -541,7 +548,7 @@ def test_vision_stitch_disabled_sends_per_tile() -> None:
     from src.parsing.vision import VisionRequest, VisionRouter
 
     pool = _RecPool()
-    router = VisionRouter(pool, _vision_config(vision_stitch_grid=False))
+    router = VisionRouter(cast(ModelPool, pool), _vision_config(vision_stitch_grid=False))
     req = VisionRequest(
         prompt="select all buses",
         images=[_png((i * 30 % 255, 80, 120)) for i in range(4)],
@@ -556,7 +563,7 @@ def test_vision_does_not_stitch_coordinate_shapes() -> None:
     from src.parsing.vision import VisionRequest, VisionRouter
 
     pool = _RecPool()
-    router = VisionRouter(pool, _vision_config(vision_stitch_grid=True))
+    router = VisionRouter(cast(ModelPool, pool), _vision_config(vision_stitch_grid=True))
     # area_bbox normally sends one image; even with 2 it must NOT be stitched
     # (stitching would corrupt the pixel-coordinate answer).
     req = VisionRequest(
@@ -808,7 +815,7 @@ def test_acreate_task_returns_cross_worker_owner_without_spawning() -> None:
                 queue_max_size=10,
                 solve_timeout=5,
             ),
-            store=store,
+            store=cast(Any, store),
         )
         tid = await mgr.acreate_task("T", {}, idempotency_key="dup")
         # Returned the other worker's task id; no local task/spawn/persist.
@@ -881,18 +888,21 @@ class _CamouFakeBrowser:
         return _CamouFakeContext()
 
 
-def _ctx_config(runtime: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        browser_headless=True,
-        browser_runtime=runtime,
-        browser_runtime_strict=False,
-        resource_block_enabled=True,
-        resource_block_types="image,media,font,stylesheet",
-        resource_allow_hosts="hcaptcha.com",
-        resource_block_hosts="",
-        camoufox_humanize=True,
-        camoufox_block_webrtc=True,
-        camoufox_os="",
+def _ctx_config(runtime: str) -> Config:
+    return cast(
+        Config,
+        SimpleNamespace(
+            browser_headless=True,
+            browser_runtime=runtime,
+            browser_runtime_strict=False,
+            resource_block_enabled=True,
+            resource_block_types="image,media,font,stylesheet",
+            resource_allow_hosts="hcaptcha.com",
+            resource_block_hosts="",
+            camoufox_humanize=True,
+            camoufox_block_webrtc=True,
+            camoufox_os="",
+        ),
     )
 
 
@@ -903,11 +913,12 @@ def test_camoufox_context_skips_chromium_spoofing() -> None:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) "
         "Gecko/20100101 Firefox/146.0"
     )
-    mgr._browser = _CamouFakeBrowser()  # type: ignore[assignment]
+    mgr._browser = cast(Browser, _CamouFakeBrowser())
 
     fp = generate_fingerprint(seed="cf", timezone_id="Europe/Berlin", locale="de-DE")
-    ctx = asyncio.run(
-        mgr._build_context(fp, {"server": "http://p:1"}, forced_ua=None)
+    ctx = cast(
+        _CamouFakeContext,
+        asyncio.run(mgr._build_context(fp, {"server": "http://p:1"}, forced_ua=None)),
     )
     kw = mgr._browser.new_context_kwargs[0]  # type: ignore[attr-defined]
     # Geo + proxy are threaded, but NO Chrome client hints and NO forced UA.
@@ -928,7 +939,7 @@ def test_camoufox_context_honours_forced_ua() -> None:
     mgr = BrowserManager(_ctx_config("camoufox"))
     mgr._runtime = "camoufox"
     mgr._camoufox_user_agent = "Firefox/146.0"
-    mgr._browser = _CamouFakeBrowser()  # type: ignore[assignment]
+    mgr._browser = cast(Browser, _CamouFakeBrowser())
     fp = generate_fingerprint(seed="cf2")
     asyncio.run(mgr._build_context(fp, None, forced_ua="ForcedUA/9.9"))
     kw = mgr._browser.new_context_kwargs[0]  # type: ignore[attr-defined]
@@ -958,7 +969,7 @@ def test_engine_version_match_is_silent_ok() -> None:
 
     async def run() -> None:
         mgr = BrowserManager(_runtime_config("chromium", strict=True))
-        mgr._browser = SimpleNamespace(version=f"{chrome_major()}.0.7827.55")
+        mgr._browser = cast(Browser, SimpleNamespace(version=f"{chrome_major()}.0.7827.55"))
         # Strict mode + matching version → no raise.
         await mgr._validate_engine_version()
 
@@ -969,7 +980,7 @@ def test_engine_version_mismatch_raises_in_strict_mode() -> None:
     """A drifted engine major fails fast under BROWSER_RUNTIME_STRICT."""
     async def run() -> None:
         mgr = BrowserManager(_runtime_config("chromium", strict=True))
-        mgr._browser = SimpleNamespace(version="131.0.6778.86")  # stale
+        mgr._browser = cast(Browser, SimpleNamespace(version="131.0.6778.86"))  # stale
         try:
             await mgr._validate_engine_version()
             raise AssertionError("expected a version-mismatch RuntimeError")
@@ -984,7 +995,7 @@ def test_engine_version_mismatch_warns_in_lenient_mode() -> None:
     """A drifted engine major only warns (doesn't raise) when strict is off."""
     async def run() -> None:
         mgr = BrowserManager(_runtime_config("chromium", strict=False))
-        mgr._browser = SimpleNamespace(version="131.0.6778.86")
+        mgr._browser = cast(Browser, SimpleNamespace(version="131.0.6778.86"))
         # Lenient mode → no raise even on mismatch.
         await mgr._validate_engine_version()
 
@@ -994,9 +1005,9 @@ def test_engine_version_mismatch_warns_in_lenient_mode() -> None:
 def test_chromium_context_still_injects_stealth_and_client_hints() -> None:
     """Regression: the camoufox branch must not change the Chromium path."""
     mgr = BrowserManager(_ctx_config("chromium"))
-    mgr._browser = _CamouFakeBrowser()  # type: ignore[assignment]
+    mgr._browser = cast(Browser, _CamouFakeBrowser())
     fp = generate_fingerprint(seed="chrome-path")
-    ctx = asyncio.run(mgr._build_context(fp, None))
+    ctx = cast(_CamouFakeContext, asyncio.run(mgr._build_context(fp, None)))
     kw = mgr._browser.new_context_kwargs[0]  # type: ignore[attr-defined]
     assert "extra_http_headers" in kw  # Chrome client hints present
     assert kw["user_agent"] == fp.user_agent

@@ -9,7 +9,7 @@ paired ``result.indices``) or from ``ctx.extra``.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple, TypeGuard
 
 from ..dispatcher import ChallengeContext, ChallengeShape
 from .base import BaseShapeSolver, ClassifyRequest
@@ -92,7 +92,7 @@ class DragDropSolver(BaseShapeSolver):
         return None
 
     @staticmethod
-    def _is_point(value: Any) -> bool:
+    def _is_point(value: Any) -> TypeGuard[Sequence[float]]:
         return isinstance(value, (list, tuple)) and len(value) >= 2
 
     def _path(

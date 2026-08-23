@@ -10,5 +10,15 @@
   "stubPath": "typings",
   "venvPath": ".",
   "venv": ".venv",
-  "typeCheckingMode": "standard"
+  "typeCheckingMode": "standard",
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "extraPaths": ["."],
+      "reportArgumentType": "none",
+      "reportOptionalMemberAccess": "none",
+      "reportOptionalSubscript": "none",
+      "reportAttributeAccessIssue": "none"
+    }
+  ]
 }
