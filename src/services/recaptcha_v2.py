@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx
 
+from ..assets.js_loader import load_js
 from .browser_solver import BaseBrowserSolver
 
 log = logging.getLogger(__name__)
@@ -39,21 +40,7 @@ class _AudioMeter:
     total_vision_calls: int = 0
     total_vision_ms: int = 0
 
-_EXTRACT_TOKEN_JS = """
-() => {
-    const textarea = document.querySelector('#g-recaptcha-response')
-        || document.querySelector('[name="g-recaptcha-response"]');
-    if (textarea && textarea.value && textarea.value.length > 20) {
-        return textarea.value;
-    }
-    const gr = window.grecaptcha?.enterprise || window.grecaptcha;
-    if (gr && typeof gr.getResponse === 'function') {
-        const resp = gr.getResponse();
-        if (resp && resp.length > 20) return resp;
-    }
-    return null;
-}
-"""
+_EXTRACT_TOKEN_JS = load_js("recaptcha_v2_extract.js")
 
 # Selector for the reCAPTCHA challenge bframe (the iframe that contains the
 # visual/audio challenge once Google decides the bot needs to prove itself).
@@ -118,15 +105,7 @@ class RecaptchaV2Solver(BaseBrowserSolver):
 
             if is_invisible:
                 token = await page.evaluate(
-                    """
-                    ([key]) => new Promise((resolve, reject) => {
-                        const gr = window.grecaptcha?.enterprise || window.grecaptcha;
-                        if (!gr) { reject(new Error('grecaptcha not found')); return; }
-                        gr.ready(() => {
-                            gr.execute(key).then(resolve).catch(reject);
-                        });
-                    })
-                    """,
+                    load_js("recaptcha_v2_invisible_execute.js"),
                     [website_key],
                 )
             else:

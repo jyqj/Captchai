@@ -1,11 +1,9 @@
 """Tests for the Redis-backed proxy pool (``RedisProxyPool``).
 
-Mirrors the existing Redis ledger test pattern in ``test_consumption.py``:
-each test calls ``pytest.importorskip("redis.asyncio")`` so the suite skips
-cleanly when the ``redis`` package isn't installed, and flushes the test key
-prefix before/after so runs don't see stale data. A real Redis server is
-required — when one isn't reachable the tests skip too (best-effort ping)
-rather than failing the suite.
+Uses the shared Redis helpers in ``tests/conftest.py``: each test skips
+cleanly when the ``redis`` package isn't installed or no real Redis server is
+reachable (best-effort ping), and flushes the test key prefix before/after so
+runs don't see stale data.
 """
 
 from __future__ import annotations
@@ -20,35 +18,10 @@ if str(PROJECT_ROOT) not in sys.path:
     _ = sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.assets.proxy_pool import ProxyAsset, build_proxy_pool  # noqa: E402
-
-
-_REDIS_URL = "redis://localhost:6379/0"
-
-
-def _redis_helper():
-    """Return (aioredis, url) or skip the test if redis isn't available."""
-    pytest = __import__("pytest")
-    aioredis = pytest.importorskip("redis.asyncio")
-    # Skip if no real Redis server is reachable — these tests need one.
-    import redis as sync_redis
-
-    try:
-        client = sync_redis.from_url(_REDIS_URL, decode_responses=True)
-        client.ping()
-        client.close()
-    except Exception:
-        pytest.skip("no reachable Redis server at localhost:6379", allow_module_level=True)
-    return aioredis, _REDIS_URL
-
-
-def _flush_prefix(prefix: str) -> None:
-    """Synchronously flush test keys so tests don't see stale data."""
-    import redis as sync_redis
-
-    r = sync_redis.from_url(_REDIS_URL, decode_responses=True)
-    for key in r.scan_iter(f"{prefix}*"):
-        r.delete(key)
-    r.close()
+from tests.conftest import (  # noqa: E402
+    flush_prefix as _flush_prefix,
+    redis_helper as _redis_helper,
+)
 
 
 # --------------------------------------------------------------------------- #

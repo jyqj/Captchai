@@ -10,5 +10,11 @@
   "stubPath": "typings",
   "venvPath": ".",
   "venv": ".venv",
-  "typeCheckingMode": "standard"
+  "typeCheckingMode": "standard",
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "extraPaths": ["."]
+    }
+  ]
 }

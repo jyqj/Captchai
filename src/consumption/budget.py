@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
-from src.consumption.ledger import CostLedger
+
+class SpendLedger(Protocol):
+    """The slice of the ledger BudgetGuard needs (in-memory or Redis-backed)."""
+
+    async def total_cost_usd(self, client_key: str | None = None) -> float: ...
 
 
 @dataclass
@@ -19,7 +24,7 @@ class BudgetGuard:
 
     def __init__(
         self,
-        ledger: CostLedger,
+        ledger: SpendLedger,
         *,
         global_cap_usd: float | None = None,
         per_client_cap_usd: float | None = None,

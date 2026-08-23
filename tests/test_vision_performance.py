@@ -27,14 +27,17 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.assets.model_pool import ModelUsage  # noqa: E402
+from src.core.config import Config  # noqa: E402
 from src.parsing.vision import VisionRequest, VisionRouter  # noqa: E402
 from src.services.browser import BrowserManager  # noqa: E402
+from tests.support.fakes import as_model_pool, fake_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -123,28 +126,14 @@ class FakeRoute:
 # ---------------------------------------------------------------------------
 
 
-def _make_config(**overrides):
-    base = dict(
-        cloud_base_url="http://cloud",
-        cloud_api_key="cloud-key",
-        cloud_model="gpt-cloud",
-        local_base_url="http://local",
-        local_api_key="local-key",
-        local_model="qwen-local",
-        vision_cloud_enabled=True,
-        vision_vote_samples=3,
-        vision_confidence_threshold=0.6,
-        vision_tier2_detail="high",
-        vision_vote_concurrent=True,
-        vision_inline_escalate=True,
-        captcha_timeout=30,
-    )
-    base.update(overrides)
-    return SimpleNamespace(**base)
+def _make_config(**overrides: object) -> Config:
+    return fake_config(**overrides)
 
 
 def _req(**overrides):
-    base = dict(prompt="select all buses", images=[b"\x89PNGfake"], task_tier=1)
+    base: dict[str, Any] = dict(
+        prompt="select all buses", images=[b"\x89PNGfake"], task_tier=1
+    )
     base.update(overrides)
     return VisionRequest(**base)
 
@@ -171,7 +160,7 @@ def test_concurrent_voting_overlaps_samples():
     cloud = ScriptedConcurrencyClient("cloud", contents, delay=0.05)
     local = ScriptedConcurrencyClient("local", contents, delay=0.05)
     pool = FakePool(local=local, cloud=cloud)
-    router = VisionRouter(pool, config)
+    router = VisionRouter(as_model_pool(pool), config)
 
     asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
 
@@ -198,7 +187,7 @@ def test_serial_voting_does_not_overlap():
     cloud = ScriptedConcurrencyClient("cloud", contents, delay=0.05)
     local = ScriptedConcurrencyClient("local", contents, delay=0.05)
     pool = FakePool(local=local, cloud=cloud)
-    router = VisionRouter(pool, config)
+    router = VisionRouter(as_model_pool(pool), config)
 
     asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
 
@@ -227,7 +216,7 @@ def test_concurrent_voting_accumulates_all_usage():
         "local", contents, delay=0.01, usage=ModelUsage(input_tokens=10, output_tokens=5)
     )
     pool = FakePool(local=local, cloud=cloud)
-    router = VisionRouter(pool, config)
+    router = VisionRouter(as_model_pool(pool), config)
 
     result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
 
@@ -262,7 +251,7 @@ def test_inline_escalation_uses_cloud_when_local_low_confidence():
         usage=ModelUsage(input_tokens=20, output_tokens=8),
     )
     pool = FakePool(local=local, cloud=cloud)
-    router = VisionRouter(pool, config)
+    router = VisionRouter(as_model_pool(pool), config)
 
     result = asyncio.run(router.classify(_req(task_tier=1)))
 
@@ -299,7 +288,7 @@ def test_inline_escalation_budget_denial_returns_local():
     )
     pool = FakePool(local=local, cloud=cloud)
     budget = FakeBudget(allowed=False, downgrade_to="local")
-    router = VisionRouter(pool, config, budget=budget)
+    router = VisionRouter(as_model_pool(pool), config, budget=budget)
 
     result = asyncio.run(router.classify(_req(task_tier=1), client_key="acct-1"))
 
@@ -339,7 +328,7 @@ def test_inline_escalation_skipped_when_local_confident():
         usage=ModelUsage(input_tokens=20, output_tokens=8),
     )
     pool = FakePool(local=local, cloud=cloud)
-    router = VisionRouter(pool, config)
+    router = VisionRouter(as_model_pool(pool), config)
 
     result = asyncio.run(router.classify(_req(task_tier=1)))
 
@@ -371,7 +360,7 @@ def test_inline_escalation_skipped_when_flag_disabled():
         usage=ModelUsage(input_tokens=20, output_tokens=8),
     )
     pool = FakePool(local=local, cloud=cloud)
-    router = VisionRouter(pool, config)
+    router = VisionRouter(as_model_pool(pool), config)
 
     result = asyncio.run(router.classify(_req(task_tier=1)))
 
@@ -413,7 +402,7 @@ def test_inline_escalation_engages_voting_when_cloud_also_low():
         usage=ModelUsage(input_tokens=10, output_tokens=5),
     )
     pool = FakePool(local=local, cloud=cloud)
-    router = VisionRouter(pool, config)
+    router = VisionRouter(as_model_pool(pool), config)
 
     result = asyncio.run(router.classify(_req(task_tier=1, grid_size=9)))
 
@@ -434,18 +423,9 @@ def test_inline_escalation_engages_voting_when_cloud_also_low():
 # ---------------------------------------------------------------------------
 
 
-def _resource_manager(*, block_hosts=""):
+def _resource_manager(*, block_hosts: str = "") -> BrowserManager:
     """Build a BrowserManager with the default resource policy pre-parsed."""
-    config = SimpleNamespace(
-        resource_block_enabled=True,
-        resource_block_types="image,media,font,stylesheet",
-        resource_allow_hosts=(
-            "hcaptcha.com,challenges.cloudflare.com,google.com,"
-            "recaptcha.net,gstatic.com,cloudflare.com"
-        ),
-        resource_block_hosts=block_hosts,
-    )
-    return BrowserManager(config)
+    return BrowserManager(fake_config(resource_block_hosts=block_hosts))
 
 
 def test_resource_handler_blocks_image_on_generic_host():

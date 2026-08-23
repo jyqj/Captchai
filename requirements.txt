@@ -6,6 +6,7 @@ pytest==8.3.5
 playwright==1.61.0
 openai==1.82.0
 Pillow==11.1.0
+redis>=4.2
 mkdocs==1.6.1
 mkdocs-material==9.6.7
 mkdocs-redirects==1.2.2

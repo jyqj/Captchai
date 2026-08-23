@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from ..assets.js_loader import load_js
 from .browser_solver import SolveStage
 from .injected_widget import InjectedWidgetSolver
 
@@ -42,28 +43,8 @@ log = logging.getLogger(__name__)
 # ``window.__omc*`` globals), then falls back to the ``window`` global, the
 # ``cf-turnstile-response`` input, and ``turnstile.getResponse()`` for stock
 # Chromium.
-_EXTRACT_TURNSTILE_TOKEN_JS = (
-    "() => {\n"
-    "    let token = null;\n"
-    "    let error = null;\n"
-    "    " + InjectedWidgetSolver._omc_dom_read_js() + ""
-    "    if (!token && window.__omcToken) {\n"
-    "        token = window.__omcToken;\n"
-    "    }\n"
-    "    if (!token) {\n"
-    "        const input = document.querySelector('[name=\"cf-turnstile-response\"]')\n"
-    "            || document.querySelector('input[name*=\"turnstile\"]');\n"
-    "        if (input && input.value && input.value.length > 20) {\n"
-    "            token = input.value;\n"
-    "        } else if (window.turnstile && typeof window.turnstile.getResponse === 'function') {\n"
-    "            try {\n"
-    "                const resp = window.turnstile.getResponse();\n"
-    "                if (resp && resp.length > 20) token = resp;\n"
-    "            } catch (e) {}\n"
-    "        }\n"
-    "    }\n"
-    "    return {token: token, error: error || window.__omcError || null};\n"
-    "}\n"
+_EXTRACT_TURNSTILE_TOKEN_JS = load_js("turnstile_token_extract.js").replace(
+    "__DOM_READ__", InjectedWidgetSolver._omc_dom_read_js()
 )
 
 

@@ -11,6 +11,7 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -18,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.assets.model_pool import ModelClient, ModelPool, ModelUsage
 from src.parsing.vision import VisionRequest, VisionResult, VisionRouter
+from tests.support.fakes import as_model_pool
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +109,9 @@ def _make_config(**overrides):
 
 
 def _req(**overrides):
-    base = dict(prompt="select all buses", images=[b"\x89PNGfake"], task_tier=1)
+    base: dict[str, Any] = dict(
+        prompt="select all buses", images=[b"\x89PNGfake"], task_tier=1
+    )
     base.update(overrides)
     return VisionRequest(**base)
 
@@ -436,7 +440,7 @@ def test_local_connection_error_falls_back_to_cloud():
         vision_stitch_grid=False,
         model_connection_fallback=True,
     )
-    router = VisionRouter(_Pool(), config)
+    router = VisionRouter(as_model_pool(_Pool()), config)
     result = asyncio.run(router.classify(_req(task_tier=1)))
     assert result.model == "cloud"  # fell back to cloud
     assert result.indices == [2, 4]
@@ -467,7 +471,7 @@ def test_cloud_connection_error_falls_back_to_local():
         vision_stitch_grid=False,
         model_connection_fallback=True,
     )
-    router = VisionRouter(_Pool(), config)
+    router = VisionRouter(as_model_pool(_Pool()), config)
     result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
     assert result.model == "local"
     assert result.indices == [1]
@@ -490,7 +494,7 @@ def test_connection_fallback_disabled_reraises():
         vision_stitch_grid=False,
         model_connection_fallback=False,
     )
-    router = VisionRouter(_Pool(), config)
+    router = VisionRouter(as_model_pool(_Pool()), config)
     try:
         asyncio.run(router.classify(_req(task_tier=1)))
         raise AssertionError("expected the connection error to propagate")
@@ -521,7 +525,7 @@ def test_non_connection_error_does_not_fall_back():
         vision_stitch_grid=False,
         model_connection_fallback=True,
     )
-    router = VisionRouter(pool, config)
+    router = VisionRouter(as_model_pool(pool), config)
     try:
         asyncio.run(router.classify(_req(task_tier=1)))
         raise AssertionError("expected the ValueError to propagate")

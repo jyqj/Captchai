@@ -15,16 +15,23 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
+
+from playwright.async_api import Browser
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.core.config import Config  # noqa: E402
 from src.services.browser import resolve_context_options  # noqa: E402
+from tests.support.fakes import fake_config  # noqa: E402
 
 
-def _config() -> SimpleNamespace:
-    return SimpleNamespace()
+def _config() -> Config:
+    # resolve_context_options ignores config today, but a real (typed) Config
+    # keeps the call site honest if that changes.
+    return fake_config()
 
 
 def test_egress_proxyless_strips_task_proxy() -> None:
@@ -210,18 +217,8 @@ class _RecordingFakeContext:
         self.listeners.append((event, handler))
 
 
-def _resource_block_config(enabled: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        browser_headless=True,
-        browser_runtime="chromium",
-        resource_block_enabled=enabled,
-        resource_block_types="image,media,font,stylesheet",
-        resource_allow_hosts=(
-            "hcaptcha.com,challenges.cloudflare.com,google.com,"
-            "recaptcha.net,gstatic.com,cloudflare.com"
-        ),
-        resource_block_hosts="",
-    )
+def _resource_block_config(enabled: bool) -> Config:
+    return fake_config(resource_block_enabled=enabled)
 
 
 def test_build_context_registers_resource_route_when_enabled() -> None:
@@ -232,10 +229,10 @@ def test_build_context_registers_resource_route_when_enabled() -> None:
     from src.services.browser import BrowserManager
 
     manager = BrowserManager(_resource_block_config(True))
-    manager._browser = _RecordingFakeBrowser()
+    manager._browser = cast(Browser, _RecordingFakeBrowser())
 
     fp = generate_fingerprint(seed="wp4-enabled")
-    ctx = asyncio.run(manager._build_context(fp, None))
+    ctx = cast(_RecordingFakeContext, asyncio.run(manager._build_context(fp, None)))
 
     # The resource route is registered with the catch-all pattern.
     assert any(url == "**/*" for url, _ in ctx.routes)
@@ -253,10 +250,10 @@ def test_build_context_does_not_register_resource_route_when_disabled() -> None:
     from src.services.browser import BrowserManager
 
     manager = BrowserManager(_resource_block_config(False))
-    manager._browser = _RecordingFakeBrowser()
+    manager._browser = cast(Browser, _RecordingFakeBrowser())
 
     fp = generate_fingerprint(seed="wp4-disabled")
-    ctx = asyncio.run(manager._build_context(fp, None))
+    ctx = cast(_RecordingFakeContext, asyncio.run(manager._build_context(fp, None)))
 
     # No catch-all resource route.
     assert not any(url == "**/*" for url, _ in ctx.routes)
@@ -281,10 +278,10 @@ def test_build_context_resource_route_ordered_before_solver_fulfill() -> None:
 
     manager = BrowserManager(_resource_block_config(True))
     fake_browser = _RecordingFakeBrowser()
-    manager._browser = fake_browser
+    manager._browser = cast(Browser, fake_browser)
 
     fp = generate_fingerprint(seed="wp4-order")
-    ctx = asyncio.run(manager._build_context(fp, None))
+    ctx = cast(_RecordingFakeContext, asyncio.run(manager._build_context(fp, None)))
 
     # Simulate the solver registering its fulfill handler after _build_context.
     async def _solver_fulfill(route) -> None:
@@ -330,7 +327,7 @@ def test_resource_handler_aborts_blockable_type_by_default() -> None:
     from src.services.browser import BrowserManager
 
     manager = BrowserManager(_resource_block_config(True))
-    manager._browser = _RecordingFakeBrowser()
+    manager._browser = cast(Browser, _RecordingFakeBrowser())
     ctx = asyncio.run(manager._build_context(generate_fingerprint(seed="rb1"), None))
 
     route = _FakeRoute(ctx, "https://cdn.example.com/x.png", "image")
@@ -347,7 +344,7 @@ def test_resource_handler_passes_everything_when_context_blocking_off() -> None:
     from src.services.browser import BrowserManager, set_context_resource_blocking
 
     manager = BrowserManager(_resource_block_config(True))
-    manager._browser = _RecordingFakeBrowser()
+    manager._browser = cast(Browser, _RecordingFakeBrowser())
     ctx = asyncio.run(manager._build_context(generate_fingerprint(seed="rb2"), None))
 
     # Real-page / enterprise solve disables blocking on the context.

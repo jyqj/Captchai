@@ -484,6 +484,7 @@ def test_enterprise_defaults_to_injected_page() -> None:
         _url, handler = context.routes[0]
         route = FakeRoute(resource_type="document")
         await handler(route)
+        assert route.fulfilled is not None
         body = route.fulfilled["body"]
         assert "RQ-DATA-XYZ" in body
         assert '"sentry": "value"' in body
@@ -657,6 +658,7 @@ def test_invisible_defers_execute_on_injected_page() -> None:
         _url, handler = context.routes[0]
         route = FakeRoute(resource_type="document")
         await handler(route)
+        assert route.fulfilled is not None
         body = route.fulfilled["body"]
         assert '"size": "invisible"' in body
         assert "window.__omcExecute" in body
@@ -990,6 +992,7 @@ def test_enterprise_with_task_proxy_allowed_without_pool() -> None:
         _url, handler = context.routes[0]
         route = FakeRoute(resource_type="document")
         await handler(route)
+        assert route.fulfilled is not None
         body = route.fulfilled["body"]
         assert "RQ-DATA-XYZ" in body
         assert '"sentry": "value"' in body
@@ -1240,6 +1243,7 @@ def test_invisible_enterprise_combined_solves_and_warns() -> None:
         _url, handler = context.routes[0]
         route = FakeRoute(resource_type="document")
         await handler(route)
+        assert route.fulfilled is not None
         assert '"size": "invisible"' in route.fulfilled["body"]
 
     asyncio.run(run())

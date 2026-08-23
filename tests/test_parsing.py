@@ -10,7 +10,7 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -22,6 +22,7 @@ from src.parsing.dispatcher import (
     ChallengeDispatcher,
     ChallengeShape,
     ClassifierSelectors,
+    VisionClient,
 )
 from src.parsing.shapes.area_bbox import AreaBBoxSolver
 from src.parsing.shapes.base import BaseShapeSolver
@@ -235,7 +236,7 @@ def test_classifier_vision_fallback_hint() -> None:
                 return SimpleNamespace(shape="drag_drop", indices=[], confidence=0.5)
 
         frame = FakeFrame(counts={})
-        clf = ChallengeClassifier(vision=HintVision())
+        clf = ChallengeClassifier(vision=cast(VisionClient, HintVision()))
         shape = await clf.detect(frame, ChallengeContext())
         assert shape is ChallengeShape.DRAG_DROP
 
@@ -428,7 +429,7 @@ def test_grid_select_clicks_indices_submits_and_returns_token() -> None:
         vision = FakeVision(indices=[0, 2, 5])
         # No token until after we submit (index 0 poll -> None, later -> token).
         poll, _state = make_token_poll([None, None, "SOLVED"])
-        solver = GridSelectSolver(vision=vision, token_poll=poll)
+        solver = GridSelectSolver(vision=cast(VisionClient, vision), token_poll=poll)
 
         token = await solver.run(frame, ChallengeContext())
         assert token == "SOLVED"
@@ -456,7 +457,7 @@ def test_grid_select_stops_when_no_indices() -> None:
         frame = FakeFrame(counts={".task-image": 4}, texts={".prompt-text": "x"})
         vision = FakeVision(indices=[])
         poll, _state = make_token_poll([None])  # never yields a token
-        solver = GridSelectSolver(vision=vision, token_poll=poll)
+        solver = GridSelectSolver(vision=cast(VisionClient, vision), token_poll=poll)
 
         token = await solver.run(frame, ChallengeContext())
         assert token is None
@@ -500,7 +501,7 @@ def test_grid_select_taps_via_touchscreen_on_mobile() -> None:
         frame = FakeFrame(counts={".task-image": 4}, texts={".prompt-text": "buses"})
         vision = FakeVision(indices=[1, 3])
         poll, _state = make_token_poll([None, "TAP-TOK"])
-        solver = GridSelectSolver(vision=vision, token_poll=poll)
+        solver = GridSelectSolver(vision=cast(VisionClient, vision), token_poll=poll)
         page = _FakeTouchPage()
         ctx = ChallengeContext(
             extra={
@@ -536,7 +537,7 @@ def test_dynamic_grid_terminates_when_token_appears() -> None:
         vision = FakeVision(indices=[1, 3])
         # Token appears on the 2nd poll of the loop.
         poll, _state = make_token_poll([None, "DYN-TOKEN"])
-        solver = DynamicGridSolver(vision=vision, token_poll=poll)
+        solver = DynamicGridSolver(vision=cast(VisionClient, vision), token_poll=poll)
 
         token = await solver.run(frame, ChallengeContext())
         assert token == "DYN-TOKEN"
@@ -553,7 +554,7 @@ def test_dynamic_grid_is_bounded_no_infinite_loop() -> None:
         # Vision always returns matches and token never appears; must still stop.
         vision = FakeVision(indices=[0])
         poll, _state = make_token_poll([])  # always None
-        solver = DynamicGridSolver(vision=vision, token_poll=poll)
+        solver = DynamicGridSolver(vision=cast(VisionClient, vision), token_poll=poll)
 
         token = await solver.run(frame, ChallengeContext())
         assert token is None
@@ -571,7 +572,7 @@ def test_dynamic_grid_settles_when_no_matches() -> None:
         )
         vision = FakeVision(indices=[])  # nothing to click -> settle immediately
         poll, _state = make_token_poll([None, "DONE"])
-        solver = DynamicGridSolver(vision=vision, token_poll=poll)
+        solver = DynamicGridSolver(vision=cast(VisionClient, vision), token_poll=poll)
 
         token = await solver.run(frame, ChallengeContext())
         assert token == "DONE"
@@ -768,7 +769,7 @@ def test_area_bbox_scales_high_dpr_point_and_adds_offset() -> None:
                 return SimpleNamespace(point=(450.0, 450.0), indices=[], confidence=0.9)
 
         poll, _state = make_token_poll([None, "CLICKED"])
-        solver = AreaBBoxSolver(vision=PointVision(), token_poll=poll)
+        solver = AreaBBoxSolver(vision=cast(VisionClient, PointVision()), token_poll=poll)
         page = RecordingPage()
         ctx = ChallengeContext(
             extra={"page": page, "humanize": True, "humanize_jitter_ms": 0}
@@ -800,7 +801,7 @@ def test_slide_scales_distance_by_dpr() -> None:
                 return SimpleNamespace(distance=180.0, indices=[], confidence=0.9)
 
         poll, _state = make_token_poll([None, "SLID"])
-        solver = CanvasSlideSolver(vision=DistVision(), token_poll=poll)
+        solver = CanvasSlideSolver(vision=cast(VisionClient, DistVision()), token_poll=poll)
         page = RecordingPage()
         ctx = ChallengeContext(
             extra={
@@ -822,7 +823,8 @@ def test_slide_falls_back_to_raw_move_without_page() -> None:
     """With no page (fake frame carries the mouse), the raw stepped path runs."""
     async def run() -> None:
         frame = FakeFrame(counts={}, texts={})
-        frame.mouse = RecordingMouse()  # type: ignore[attr-defined]
+        mouse = RecordingMouse()
+        frame.mouse = mouse  # type: ignore[attr-defined]
         poll, _state = make_token_poll([None, "SLID"])
         solver = CanvasSlideSolver(vision=None, token_poll=poll)
         ctx = ChallengeContext(
@@ -835,7 +837,7 @@ def test_slide_falls_back_to_raw_move_without_page() -> None:
         token = await solver.run(frame, ctx)
         assert token == "SLID"
         # Raw stepped path still presses + moves via the frame's mouse.
-        assert frame.mouse.downs == 1 and frame.mouse.ups == 1
-        assert len(frame.mouse.moves) > 5
+        assert mouse.downs == 1 and mouse.ups == 1
+        assert len(mouse.moves) > 5
 
     asyncio.run(run())

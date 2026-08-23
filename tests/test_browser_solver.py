@@ -6,12 +6,15 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.assets.proxy_pool import ProxyAsset, ProxyPool  # noqa: E402
+from src.core.config import Config  # noqa: E402
+from src.services.browser import BrowserManager  # noqa: E402
 from src.services.browser_solver import (  # noqa: E402
     BaseBrowserSolver,
     ProxyKind,
@@ -39,10 +42,22 @@ class FakeManager:
         return ctx, params.get("userAgent") or "UA"
 
 
-def _config():
-    return SimpleNamespace(
-        human_mouse_enabled=False,
-        human_mouse_jitter_ms=0,
+def _config(**overrides: Any) -> Config:
+    """Minimal fake config; cast so call sites type-check as a real Config."""
+    return cast(
+        Config,
+        SimpleNamespace(
+            human_mouse_enabled=False,
+            human_mouse_jitter_ms=0,
+            **overrides,
+        ),
+    )
+
+
+def _solver(config: Config, manager: FakeManager, services: Any = None) -> BaseBrowserSolver:
+    """Construct a solver with the FakeManager standing in for BrowserManager."""
+    return BaseBrowserSolver(
+        config, manager=cast(BrowserManager, manager), services=services
     )
 
 
@@ -94,7 +109,7 @@ def test_solve_identity_defaults_when_params_empty() -> None:
 def test_task_proxy_is_explicit_category() -> None:
     async def run() -> None:
         manager = FakeManager()
-        solver = BaseBrowserSolver(_config(), manager=manager, services=None)
+        solver = _solver(_config(), manager, services=None)
         params = {
             "websiteKey": "site",
             "proxyType": "http",
@@ -119,7 +134,7 @@ def test_pool_proxy_is_final_category_when_inventory_selected() -> None:
         pool = ProxyPool()
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site"}
 
         ctx = await solver._acquire_context(params)
@@ -148,7 +163,7 @@ def test_pool_egress_server_credential_free_by_default() -> None:
             )
         )
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site", "egress": "pool"}
 
         ctx = await solver._acquire_context(params)
@@ -167,11 +182,7 @@ def test_pool_egress_exposes_credentials_when_enabled() -> None:
     surfaced so the caller can reach the SAME exit IP for their submit.
     """
     async def run() -> None:
-        config = SimpleNamespace(
-            human_mouse_enabled=False,
-            human_mouse_jitter_ms=0,
-            pool_egress_expose_credentials=True,
-        )
+        config = _config(pool_egress_expose_credentials=True)
         manager = FakeManager()
         pool = ProxyPool()
         pool.add(
@@ -183,7 +194,7 @@ def test_pool_egress_exposes_credentials_when_enabled() -> None:
             )
         )
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
-        solver = BaseBrowserSolver(config, manager=manager, services=services)
+        solver = _solver(config, manager, services=services)
         params = {"websiteKey": "site", "egress": "pool"}
 
         ctx = await solver._acquire_context(params)
@@ -197,7 +208,7 @@ def test_no_proxy_and_no_pool_stays_proxyless() -> None:
     async def run() -> None:
         manager = FakeManager()
         services = SimpleNamespace(session_pool=None)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site"}
 
         ctx = await solver._acquire_context(params)
@@ -212,7 +223,7 @@ def test_no_proxy_and_no_pool_stays_proxyless() -> None:
 def test_egress_task_without_proxy_raises() -> None:
     async def run() -> None:
         manager = FakeManager()
-        solver = BaseBrowserSolver(_config(), manager=manager, services=None)
+        solver = _solver(_config(), manager, services=None)
         params = {"websiteKey": "site", "egress": "task"}
 
         try:
@@ -230,7 +241,7 @@ def test_egress_pool_with_empty_pool_raises() -> None:
         manager = FakeManager()
         pool = ProxyPool()  # empty: checkout returns None
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site", "egress": "pool"}
 
         try:
@@ -247,7 +258,7 @@ def test_egress_proxyless_skips_task_proxy() -> None:
     async def run() -> None:
         manager = FakeManager()
         services = SimpleNamespace(session_pool=None)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {
             "websiteKey": "site",
             "egress": "proxyless",
@@ -269,7 +280,7 @@ def test_egress_auto_legacy_behavior() -> None:
     async def run() -> None:
         # Subcase 1: no egress, has task proxy → TASK_PROXY.
         manager = FakeManager()
-        solver = BaseBrowserSolver(_config(), manager=manager, services=None)
+        solver = _solver(_config(), manager, services=None)
         params = {
             "websiteKey": "site",
             "proxyType": "http",
@@ -284,7 +295,7 @@ def test_egress_auto_legacy_behavior() -> None:
 
         # Subcase 2: no egress, no proxy, no services → PROXYLESS (server egress).
         manager2 = FakeManager()
-        solver2 = BaseBrowserSolver(_config(), manager=manager2, services=None)
+        solver2 = _solver(_config(), manager2, services=None)
         params2 = {"websiteKey": "site"}
 
         ctx2 = await solver2._acquire_context(params2)
@@ -304,7 +315,7 @@ def test_release_context_stashes_proxy_bytes() -> None:
         pool = ProxyPool()
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site"}
 
         ctx = await solver._acquire_context(params)
@@ -338,7 +349,7 @@ def test_release_context_session_skips_proxy_bytes() -> None:
                 return None
 
         services = SimpleNamespace(session_pool=FakeSessionPool(), proxy_pool=None)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site"}
 
         from src.services.browser_solver import SolveContext
@@ -404,7 +415,7 @@ def test_auto_uses_pool_when_pool_has_proxies_and_session_pool_wired() -> None:
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         session_pool = FakeSessionPool()
         services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site"}
 
         ctx = await solver._acquire_context(params)
@@ -433,7 +444,7 @@ def test_auto_falls_to_proxyless_when_pool_empty_with_session_pool() -> None:
         pool = ProxyPool()  # empty
         session_pool = FakeSessionPool()
         services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site"}
 
         ctx = await solver._acquire_context(params)
@@ -456,10 +467,11 @@ def test_pool_path_reuses_sticky_session_for_same_proxy() -> None:
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         session_pool = FakeSessionPool()
         services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
 
         params1 = {"websiteKey": "site"}
         ctx1 = await solver._acquire_context(params1)
+        assert ctx1.session is not None
         sess1_id = ctx1.session.id
         await solver._release_context(ctx1, True, params1)
 
@@ -467,6 +479,7 @@ def test_pool_path_reuses_sticky_session_for_same_proxy() -> None:
         ctx2 = await solver._acquire_context(params2)
         # Same sticky session was reused (returned to the pool bucket between
         # calls).
+        assert ctx2.session is not None
         assert ctx2.session.id == sess1_id
         assert ctx2.proxy_id == "pool-1"
         await solver._release_context(ctx2, True, params2)
@@ -482,7 +495,7 @@ def test_pool_session_release_reports_to_proxy_pool_without_bytes() -> None:
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         session_pool = FakeSessionPool()
         services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site-key"}
 
         ctx = await solver._acquire_context(params)
@@ -506,7 +519,7 @@ def test_egress_pool_with_session_pool_uses_warm_session() -> None:
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         session_pool = FakeSessionPool()
         services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site", "egress": "pool"}
 
         ctx = await solver._acquire_context(params)
@@ -527,7 +540,7 @@ def test_egress_proxyless_wins_over_pool_when_pool_has_proxies() -> None:
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         session_pool = FakeSessionPool()
         services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site", "egress": "proxyless"}
 
         ctx = await solver._acquire_context(params)
@@ -551,7 +564,7 @@ def test_task_proxy_wins_over_pool_when_pool_has_proxies() -> None:
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         session_pool = FakeSessionPool()
         services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {
             "websiteKey": "site",
             "proxyType": "http",
@@ -591,7 +604,7 @@ def test_acquire_pool_stashes_pool_geo_and_seed() -> None:
         )
         pool.add(de_proxy)
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {"websiteKey": "site", "egress": "pool"}
 
         ctx = await solver._acquire_context(params)
@@ -617,7 +630,7 @@ def test_acquire_pool_required_kind_filters_checkout() -> None:
             ProxyAsset(id="res-1", server="http://res:8080", kind="residential")
         )
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {
             "websiteKey": "site",
             "egress": "pool",
@@ -639,7 +652,7 @@ def test_acquire_pool_required_kind_raises_when_none_available() -> None:
         pool = ProxyPool()
         pool.add(ProxyAsset(id="dc-1", server="http://dc:8080", kind="datacenter"))
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {
             "websiteKey": "site",
             "egress": "pool",
@@ -663,7 +676,7 @@ def test_force_fresh_context_bypasses_warm_session() -> None:
         pool.add(ProxyAsset(id="pool-1", server="http://pool:8080"))
         session_pool = FakeSessionPool()
         services = SimpleNamespace(session_pool=session_pool, proxy_pool=pool)
-        solver = BaseBrowserSolver(_config(), manager=manager, services=services)
+        solver = _solver(_config(), manager, services=services)
         params = {
             "websiteKey": "site",
             "egress": "pool",
@@ -693,13 +706,11 @@ def test_acquire_pool_probes_geo_when_unannotated() -> None:
         pool.add(ProxyAsset(id="p-nogeo", server="http://user:pass@gw:8080"))
         services = SimpleNamespace(session_pool=None, proxy_pool=pool)
         # Enable the probe on the config and stub the network fetch.
-        config = SimpleNamespace(
-            human_mouse_enabled=False,
-            human_mouse_jitter_ms=0,
+        config = _config(
             proxy_geo_probe=True,
             proxy_geo_probe_url="http://ip-api.com/json",
         )
-        solver = BaseBrowserSolver(config, manager=manager, services=services)
+        solver = _solver(config, manager, services=services)
 
         import src.assets.geo_probe as gp
 
@@ -709,7 +720,7 @@ def test_acquire_pool_probes_geo_when_unannotated() -> None:
         orig = gp._httpx_fetch_json
         gp._httpx_fetch_json = fake_fetch  # type: ignore[assignment]
         try:
-            params = {"websiteKey": "site", "egress": "pool"}
+            params: dict[str, Any] = {"websiteKey": "site", "egress": "pool"}
             ctx = await solver._acquire_context(params)
         finally:
             gp._httpx_fetch_json = orig  # type: ignore[assignment]
@@ -734,7 +745,7 @@ def test_stash_fingerprint_geo_reads_session_fingerprint() -> None:
         from src.services.browser_solver import SolveContext
 
         manager = FakeManager()
-        solver = BaseBrowserSolver(_config(), manager=manager, services=None)
+        solver = _solver(_config(), manager, services=None)
         fp = generate_fingerprint(
             seed="de", timezone_id="Europe/Berlin", locale="de-DE"
         )

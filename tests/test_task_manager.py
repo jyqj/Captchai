@@ -29,6 +29,18 @@ def _cfg(**over):
     return SimpleNamespace(**base)
 
 
+def _task(mgr: "tm.TaskManager", task_id: str) -> "tm.Task":
+    """Fetch a task that must exist, narrowing ``get_task``'s ``Task | None``.
+
+    Every assertion here inspects a task the test just created, so a ``None``
+    return is a bug in the test setup, not an expected branch — asserting keeps
+    the call sites typed as ``Task`` without the relaxed optional-access rule.
+    """
+    task = mgr.get_task(task_id)
+    assert task is not None
+    return task
+
+
 def test_backpressure_rejects_when_full() -> None:
     async def run() -> None:
         mgr = tm.TaskManager()
@@ -53,7 +65,7 @@ def test_backpressure_rejects_when_full() -> None:
         release.set()
         # let the first finish
         await asyncio.sleep(0.05)
-        assert mgr.get_task(first).status == tm.TaskStatus.READY
+        assert _task(mgr, first).status == tm.TaskStatus.READY
 
     asyncio.run(run())
 
@@ -100,7 +112,7 @@ def test_split_pools_vision_not_blocked_by_browser() -> None:
         mgr.create_task("B", {})  # occupies the single browser slot
         v = mgr.create_task("V", {})  # must still run on the vision pool
         await asyncio.sleep(0.05)
-        assert mgr.get_task(v).status == tm.TaskStatus.READY
+        assert _task(mgr, v).status == tm.TaskStatus.READY
         release_browser.set()
         await asyncio.sleep(0.05)
 
@@ -134,7 +146,7 @@ def test_task_proxy_not_blocked_by_proxyless_browser_pool() -> None:
             {"proxyType": "http", "proxyAddress": "1.2.3.4", "proxyPort": 8080},
         )
         await asyncio.sleep(0.05)
-        task = mgr.get_task(proxied)
+        task = _task(mgr, proxied)
         assert task.status == tm.TaskStatus.READY
         assert task.solution == {"token": "task_proxy"}
         release_proxyless.set()
@@ -156,7 +168,7 @@ def test_timeout_marks_failed() -> None:
         mgr.register_solver("T", Hang(), tm.TaskCategory.BROWSER)
         t = mgr.create_task("T", {})
         await asyncio.sleep(0.1)
-        task = mgr.get_task(t)
+        task = _task(mgr, t)
         assert task.status == tm.TaskStatus.FAILED
         assert task.error_code == "ERROR_CAPTCHA_TIMEOUT"
 
@@ -209,8 +221,8 @@ def test_pool_proxy_semaphore_separate() -> None:
         # semaphore, so the pool_proxy task can't block it.
         proxyless_id = mgr.create_task("B", {"egress": "proxyless"})
         await asyncio.sleep(0.05)
-        assert mgr.get_task(pool_id).status == tm.TaskStatus.PROCESSING
-        assert mgr.get_task(proxyless_id).status == tm.TaskStatus.READY
+        assert _task(mgr, pool_id).status == tm.TaskStatus.PROCESSING
+        assert _task(mgr, proxyless_id).status == tm.TaskStatus.READY
         release_pool.set()
         await asyncio.sleep(0.05)
 
@@ -244,8 +256,8 @@ def test_egress_task_uses_proxied_sem() -> None:
         # semaphore — it should land on the proxied sem and run concurrently.
         task_id = mgr.create_task("B", {"egress": "task"})
         await asyncio.sleep(0.05)
-        assert mgr.get_task(proxyless_id).status == tm.TaskStatus.PROCESSING
-        assert mgr.get_task(task_id).status == tm.TaskStatus.READY
+        assert _task(mgr, proxyless_id).status == tm.TaskStatus.PROCESSING
+        assert _task(mgr, task_id).status == tm.TaskStatus.READY
         release_proxyless.set()
         await asyncio.sleep(0.05)
 
@@ -281,8 +293,8 @@ def test_egress_auto_preserves_legacy_behavior() -> None:
         # No egress, no proxy → proxyless sem; should complete while proxied held.
         proxyless_id = mgr.create_task("B", {})
         await asyncio.sleep(0.05)
-        assert mgr.get_task(proxied_id).status == tm.TaskStatus.PROCESSING
-        assert mgr.get_task(proxyless_id).status == tm.TaskStatus.READY
+        assert _task(mgr, proxied_id).status == tm.TaskStatus.PROCESSING
+        assert _task(mgr, proxyless_id).status == tm.TaskStatus.READY
         release_proxied.set()
         await asyncio.sleep(0.05)
 
@@ -318,8 +330,8 @@ def test_auto_peeks_proxy_pool_for_routing() -> None:
         # A proxyless task draws from a separate sem → completes immediately.
         proxyless_id = mgr.create_task("B", {"egress": "proxyless"})
         await asyncio.sleep(0.05)
-        assert mgr.get_task(pool_id).status == tm.TaskStatus.PROCESSING
-        assert mgr.get_task(proxyless_id).status == tm.TaskStatus.READY
+        assert _task(mgr, pool_id).status == tm.TaskStatus.PROCESSING
+        assert _task(mgr, proxyless_id).status == tm.TaskStatus.READY
         release_pool.set()
         await asyncio.sleep(0.05)
 
@@ -354,8 +366,8 @@ def test_auto_falls_to_proxyless_when_pool_empty() -> None:
         # An explicit pool task draws from pool_proxy sem → completes immediately.
         pool_id = mgr.create_task("B", {"egress": "pool"})
         await asyncio.sleep(0.05)
-        assert mgr.get_task(proxyless_id).status == tm.TaskStatus.PROCESSING
-        assert mgr.get_task(pool_id).status == tm.TaskStatus.READY
+        assert _task(mgr, proxyless_id).status == tm.TaskStatus.PROCESSING
+        assert _task(mgr, pool_id).status == tm.TaskStatus.READY
         release_proxyless.set()
         await asyncio.sleep(0.05)
 

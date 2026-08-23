@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -76,6 +75,15 @@ class Solver(Protocol):
 
 class TaskManager:
     TASK_TTL = timedelta(minutes=10)
+    # Interval between background expiry sweeps (see ``_cleanup_loop``).
+    CLEANUP_INTERVAL_SECONDS = 60
+
+    # Pre-configure fallback limits (mirror ``core.config`` defaults). Applied
+    # only until ``configure`` installs the real Config-derived values.
+    _DEFAULT_BROWSER_CONCURRENCY = 4
+    _DEFAULT_VISION_CONCURRENCY = 8
+    _DEFAULT_QUEUE_MAX_SIZE = 128
+    _DEFAULT_SOLVE_TIMEOUT = 180
 
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
@@ -99,35 +107,21 @@ class TaskManager:
         # them mid-flight (see asyncio.create_task docs).
         self._pending_persist: set[asyncio.Task] = set()
 
-        # Limits + pools. Populated with env defaults now; overridden by
-        # ``configure`` once the app Config is available.
-        self._browser_concurrency = int(os.environ.get("BROWSER_CONCURRENCY", "4"))
-        self._browser_proxyless_concurrency = int(
-            os.environ.get(
-                "BROWSER_PROXYLESS_CONCURRENCY",
-                os.environ.get("BROWSER_CONCURRENCY", "4"),
-            )
-        )
-        self._browser_proxied_concurrency = int(
-            os.environ.get(
-                "BROWSER_PROXIED_CONCURRENCY",
-                os.environ.get("BROWSER_CONCURRENCY", "4"),
-            )
-        )
-        self._browser_pool_proxy_concurrency = int(
-            os.environ.get(
-                "BROWSER_POOL_PROXY_CONCURRENCY",
-                os.environ.get(
-                    "BROWSER_PROXIED_CONCURRENCY",
-                    os.environ.get("BROWSER_CONCURRENCY", "4"),
-                ),
-            )
-        )
-        self._vision_concurrency = int(os.environ.get("VISION_CONCURRENCY", "8"))
-        self._queue_max_size = int(os.environ.get("QUEUE_MAX_SIZE", "128"))
-        self._solve_timeout = int(
-            os.environ.get("CAPTCHA_SOLVE_TIMEOUT", os.environ.get("SOLVE_TIMEOUT", "180"))
-        )
+        # Limits + pools. Concurrency and timeout limits are the authoritative
+        # concern of :class:`Config`; ``configure`` overwrites every one of
+        # these once the app Config is available. These literals are only the
+        # pre-configure fallback so the object is usable (semaphores exist)
+        # before ``configure`` runs — they intentionally do NOT re-parse env
+        # vars, which would duplicate (and risk drifting from) config.py.
+        self._browser_concurrency = self._DEFAULT_BROWSER_CONCURRENCY
+        self._browser_proxyless_concurrency = self._DEFAULT_BROWSER_CONCURRENCY
+        self._browser_proxied_concurrency = self._DEFAULT_BROWSER_CONCURRENCY
+        self._browser_pool_proxy_concurrency = self._DEFAULT_BROWSER_CONCURRENCY
+        self._vision_concurrency = self._DEFAULT_VISION_CONCURRENCY
+        self._queue_max_size = self._DEFAULT_QUEUE_MAX_SIZE
+        self._solve_timeout = self._DEFAULT_SOLVE_TIMEOUT
+        # Background sweeper handle (started/stopped in ``configure``/``shutdown``).
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._browser_sem = asyncio.Semaphore(self._browser_concurrency)
         self._browser_proxyless_sem = asyncio.Semaphore(
             self._browser_proxyless_concurrency
@@ -189,6 +183,26 @@ class TaskManager:
         self._vision_sem = asyncio.Semaphore(self._vision_concurrency)
         self._store = store if store is not None else build_store(config)
         self._proxy_pool = proxy_pool
+        self._start_cleanup_loop()
+
+    def _start_cleanup_loop(self) -> None:
+        """Start the periodic expiry sweeper if a loop is running.
+
+        Lazy cleanup at ``create_task`` time only reaps expired records when new
+        work arrives; an idle service would leak an expired-but-hung task's
+        browser context until the next admission. This background sweep bounds
+        that window to ``CLEANUP_INTERVAL_SECONDS``. Best-effort: if ``configure``
+        is called with no running loop (unusual), the sweep is skipped and lazy
+        cleanup still applies.
+        """
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            self._cleanup_task = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._cleanup_task = loop.create_task(self._cleanup_loop())
 
     def register_solver(
         self,
@@ -432,8 +446,28 @@ class TaskManager:
             # Sync method → can't await; fire-and-forget the store delete.
             self._delete_fire_and_forget(tid)
 
+    async def _cleanup_loop(self) -> None:
+        """Periodically sweep expired tasks until cancelled on shutdown."""
+        try:
+            while True:
+                await asyncio.sleep(self.CLEANUP_INTERVAL_SECONDS)
+                try:
+                    self._cleanup_expired()
+                except Exception:  # noqa: BLE001 - a sweep error must not kill the loop
+                    log.exception("Background task cleanup sweep failed")
+        except asyncio.CancelledError:
+            raise
+
     async def shutdown(self) -> None:
         """Cancel every in-flight task (used on app shutdown)."""
+        # Stop the background sweeper first so it can't race the teardown.
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._cleanup_task = None
         runners = [r for r in self._running.values() if not r.done()]
         for r in runners:
             r.cancel()
