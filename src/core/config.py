@@ -48,6 +48,11 @@ class Config:
 
     # Auth: YesCaptcha clientKey
     client_key: str | None
+    # Optional dedicated key for the /admin/* endpoints. Falls back to
+    # ``client_key`` when unset so existing single-key deployments keep working;
+    # set it to gate admin/introspection behind a secret separate from the
+    # caller-facing clientKey.
+    admin_key: str | None
 
     # ── Cloud model (remote API) ──
     cloud_base_url: str
@@ -305,6 +310,7 @@ def load_config() -> Config:
         server_host=os.environ.get("SERVER_HOST", "0.0.0.0"),
         server_port=int(os.environ.get("SERVER_PORT", "8000")),
         client_key=os.environ.get("CLIENT_KEY", "").strip() or None,
+        admin_key=os.environ.get("ADMIN_KEY", "").strip() or None,
         # Cloud model
         cloud_base_url=os.environ.get(
             "CLOUD_BASE_URL",
