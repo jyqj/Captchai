@@ -26,6 +26,12 @@ _TRUTHY = {"1", "true", "yes"}
 # who forgot to set the corresponding env var sees it at startup instead of
 # discovering it via a confusing connection failure mid-solve.
 _PLACEHOLDER_CLOUD_BASE_URL = "https://your-openai-compatible-endpoint/v1"
+# Default model names shipped so the service boots without config. They're
+# reasonable placeholders, not guaranteed to exist on a given endpoint, so
+# ``config_warnings`` flags them when left untouched — a wrong model name
+# otherwise surfaces as an opaque 404 from the provider mid-solve.
+_PLACEHOLDER_CLOUD_MODEL = "gpt-5.4"
+_PLACEHOLDER_LOCAL_MODEL = "Qwen/Qwen3.5-2B"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -322,7 +328,7 @@ def load_config() -> Config:
         ),
         cloud_model=os.environ.get(
             "CLOUD_MODEL",
-            os.environ.get("CAPTCHA_MODEL", "gpt-5.4"),
+            os.environ.get("CAPTCHA_MODEL", _PLACEHOLDER_CLOUD_MODEL),
         ),
         cloud_audio_model=os.environ.get("CLOUD_AUDIO_MODEL", "whisper-1"),
         # Local model
@@ -336,7 +342,7 @@ def load_config() -> Config:
         ),
         local_model=os.environ.get(
             "LOCAL_MODEL",
-            os.environ.get("CAPTCHA_MULTIMODAL_MODEL", "Qwen/Qwen3.5-2B"),
+            os.environ.get("CAPTCHA_MULTIMODAL_MODEL", _PLACEHOLDER_LOCAL_MODEL),
         ),
         cloud_max_concurrency=int(os.environ.get("CLOUD_MAX_CONCURRENCY", "4")),
         local_max_concurrency=int(os.environ.get("LOCAL_MAX_CONCURRENCY", "0")),
@@ -485,6 +491,22 @@ def config_warnings(cfg: Config) -> list[str]:
         warnings.append(
             "CLOUD_API_KEY is empty; authenticated cloud model calls will fail. "
             "Set CLOUD_API_KEY (or CAPTCHA_API_KEY)."
+        )
+
+    # Default model names are placeholders that may not exist on the operator's
+    # endpoint. A wrong model name otherwise surfaces as an opaque provider 404
+    # mid-solve, so flag an untouched default at startup.
+    if cfg.cloud_model == _PLACEHOLDER_CLOUD_MODEL:
+        warnings.append(
+            f"CLOUD_MODEL is unset and still uses the default "
+            f"'{_PLACEHOLDER_CLOUD_MODEL}'; confirm your endpoint serves it or "
+            "set CLOUD_MODEL (or CAPTCHA_MODEL)."
+        )
+    if cfg.local_model == _PLACEHOLDER_LOCAL_MODEL:
+        warnings.append(
+            f"LOCAL_MODEL is unset and still uses the default "
+            f"'{_PLACEHOLDER_LOCAL_MODEL}'; confirm your self-hosted server "
+            "serves it or set LOCAL_MODEL (or CAPTCHA_MULTIMODAL_MODEL)."
         )
 
     # Fully-open service (no CLIENT_KEY) advertising a large balance is a
