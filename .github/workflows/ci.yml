@@ -38,13 +38,12 @@ jobs:
       - name: Run tests
         run: pytest -q
 
-      # Type check. Advisory for now (continue-on-error) because the repo has
-      # a backlog of pre-existing type errors, mostly in test fixtures that
-      # pass SimpleNamespace / fakes where a concrete type is annotated. It
-      # still surfaces new type regressions as annotations in the PR without
-      # blocking the merge; flip to a hard gate once the backlog is cleared.
+      - name: Check docs bilingual parity
+        run: python scripts/check_docs_parity.py
+
+      # Type check — src/ at standard mode; tests relax fake-object rules via
+      # executionEnvironments in pyrightconfig.json.
       - name: Type check (pyright)
-        continue-on-error: true
         run: |
           pip install pyright
           pyright

@@ -7,6 +7,7 @@ import logging
 
 from fastapi import APIRouter, Header
 
+from ..assets.js_loader import js_bundle_version
 from ..core.config import config
 from ..core.task_types import ValidationKind, names_for_validation
 from ..models.task import (
@@ -23,6 +24,7 @@ from ..models.task import (
 from ..core.services import get_services
 from ..services.outcome import record_real_outcome
 from ..services.task_manager import QueueFull, TaskStatus, task_manager
+from .error_codes import ApiErrorCode
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +77,7 @@ def _check_client_key(client_key: str) -> CreateTaskResponse | None:
     if not _client_authorized(client_key):
         return CreateTaskResponse(
             errorId=1,
-            errorCode="ERROR_KEY_DOES_NOT_EXIST",
+            errorCode=ApiErrorCode.KEY_DOES_NOT_EXIST,
             errorDescription="Invalid clientKey",
         )
     return None
@@ -91,7 +93,7 @@ async def create_task(request: CreateTaskRequest) -> CreateTaskResponse:
     if request.task.type not in supported:
         return CreateTaskResponse(
             errorId=1,
-            errorCode="ERROR_TASK_NOT_SUPPORTED",
+            errorCode=ApiErrorCode.TASK_NOT_SUPPORTED,
             errorDescription=f"Task type '{request.task.type}' is not supported. "
             f"Supported: {supported}",
         )
@@ -101,7 +103,7 @@ async def create_task(request: CreateTaskRequest) -> CreateTaskResponse:
         if not request.task.websiteURL or not request.task.websiteKey:
             return CreateTaskResponse(
                 errorId=1,
-                errorCode="ERROR_TASK_PROPERTY_EMPTY",
+                errorCode=ApiErrorCode.TASK_PROPERTY_EMPTY,
                 errorDescription="websiteURL and websiteKey are required",
             )
 
@@ -110,7 +112,7 @@ async def create_task(request: CreateTaskRequest) -> CreateTaskResponse:
         if not request.task.body:
             return CreateTaskResponse(
                 errorId=1,
-                errorCode="ERROR_TASK_PROPERTY_EMPTY",
+                errorCode=ApiErrorCode.TASK_PROPERTY_EMPTY,
                 errorDescription="body (base64 image) is required",
             )
 
@@ -125,7 +127,7 @@ async def create_task(request: CreateTaskRequest) -> CreateTaskResponse:
         if not has_image:
             return CreateTaskResponse(
                 errorId=1,
-                errorCode="ERROR_TASK_PROPERTY_EMPTY",
+                errorCode=ApiErrorCode.TASK_PROPERTY_EMPTY,
                 errorDescription="image data is required for classification tasks",
             )
 
@@ -141,7 +143,7 @@ async def create_task(request: CreateTaskRequest) -> CreateTaskResponse:
         log.warning("Rejecting task (queue full): %s", exc)
         return CreateTaskResponse(
             errorId=1,
-            errorCode="ERROR_NO_SLOT_AVAILABLE",
+            errorCode=ApiErrorCode.NO_SLOT_AVAILABLE,
             errorDescription=str(exc),
         )
 
@@ -156,7 +158,7 @@ async def get_task_result(
     if not _client_authorized(request.clientKey):
         return GetTaskResultResponse(
             errorId=1,
-            errorCode="ERROR_KEY_DOES_NOT_EXIST",
+            errorCode=ApiErrorCode.KEY_DOES_NOT_EXIST,
             errorDescription="Invalid clientKey",
         )
 
@@ -164,7 +166,7 @@ async def get_task_result(
     if task is None:
         return GetTaskResultResponse(
             errorId=1,
-            errorCode="ERROR_NO_SUCH_CAPCHA_ID",
+            errorCode=ApiErrorCode.NO_SUCH_CAPCHA_ID,
             errorDescription="Task not found",
         )
 
@@ -180,7 +182,7 @@ async def get_task_result(
 
     return GetTaskResultResponse(
         errorId=1,
-        errorCode=task.error_code or "ERROR_CAPTCHA_UNSOLVABLE",
+        errorCode=task.error_code or ApiErrorCode.CAPTCHA_UNSOLVABLE,
         errorDescription=task.error_description,
     )
 
@@ -205,7 +207,7 @@ async def admin_metrics(
 ) -> dict[str, object]:
     """Per-sitekey / per-model consumption summary from the cost ledger."""
     if not _admin_authorized(x_admin_key, clientKey):
-        return {"errorId": 1, "errorCode": "ERROR_KEY_DOES_NOT_EXIST"}
+        return {"errorId": 1, "errorCode": ApiErrorCode.KEY_DOES_NOT_EXIST}
     services = get_services()
     if services is None:
         return {"errorId": 0, "summary": {}, "note": "services not initialised"}
@@ -219,7 +221,7 @@ async def admin_proxies(
 ) -> dict[str, object]:
     """Proxy-pool health / consumption snapshot."""
     if not _admin_authorized(x_admin_key, clientKey):
-        return {"errorId": 1, "errorCode": "ERROR_KEY_DOES_NOT_EXIST"}
+        return {"errorId": 1, "errorCode": ApiErrorCode.KEY_DOES_NOT_EXIST}
     services = get_services()
     if services is None:
         return {"errorId": 0, "proxies": [], "sessions": []}
@@ -253,6 +255,7 @@ async def health() -> dict[str, object]:
         "browser_runtime_degraded": runtime_actual != runtime_requested,
         "cloud_model": config.cloud_model,
         "local_model": config.local_model,
+        "js_bundle_version": js_bundle_version(),
     }
 
 
@@ -292,7 +295,7 @@ async def _report_outcome(
     if not _client_authorized(request.clientKey):
         return ReportTaskResponse(
             errorId=1,
-            errorCode="ERROR_KEY_DOES_NOT_EXIST",
+            errorCode=ApiErrorCode.KEY_DOES_NOT_EXIST,
             errorDescription="Invalid clientKey",
         )
 
@@ -300,7 +303,7 @@ async def _report_outcome(
     if services is None:
         return ReportTaskResponse(
             errorId=1,
-            errorCode="ERROR_NO_SUCH_CAPCHA_ID",
+            errorCode=ApiErrorCode.NO_SUCH_CAPCHA_ID,
             errorDescription="No solve record for this task",
         )
 
@@ -308,7 +311,7 @@ async def _report_outcome(
     if rec is None:
         return ReportTaskResponse(
             errorId=1,
-            errorCode="ERROR_NO_SUCH_CAPCHA_ID",
+            errorCode=ApiErrorCode.NO_SUCH_CAPCHA_ID,
             errorDescription="No solve record for this task",
         )
 
@@ -319,7 +322,7 @@ async def _report_outcome(
     if rec.client_key is not None and rec.client_key != request.clientKey:
         return ReportTaskResponse(
             errorId=1,
-            errorCode="ERROR_NO_SUCH_CAPCHA_ID",
+            errorCode=ApiErrorCode.NO_SUCH_CAPCHA_ID,
             errorDescription="No solve record for this task",
         )
 
