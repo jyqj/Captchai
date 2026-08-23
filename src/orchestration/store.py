@@ -184,7 +184,10 @@ class RedisTaskStore:
         await self._redis.srem(self._INDEX, task_id)
 
     async def all_ids(self) -> list[str]:
-        return list(await self._redis.smembers(self._INDEX))
+        # decode_responses=True means str at runtime; the redis type stubs
+        # still surface ``bytes | str``, so normalise defensively.
+        members = await self._redis.smembers(self._INDEX)
+        return [m.decode() if isinstance(m, bytes) else m for m in members]
 
     async def claim_idempotency(
         self, key: str, task_id: str, ttl_seconds: int
@@ -201,6 +204,8 @@ class RedisTaskStore:
         if won:
             return task_id
         existing = await self._redis.get(redis_key)
+        if isinstance(existing, bytes):
+            existing = existing.decode()
         return existing or task_id
 
     async def close(self) -> None:

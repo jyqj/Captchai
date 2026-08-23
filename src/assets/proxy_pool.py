@@ -738,7 +738,9 @@ class RedisProxyPool:
         )
 
     @staticmethod
-    def _deserialize(blob: str) -> ProxyAsset:
+    def _deserialize(blob: Union[str, bytes]) -> ProxyAsset:
+        # decode_responses=True means str at runtime, but the redis type stubs
+        # surface ``bytes | str`` — json.loads accepts both.
         data = json.loads(blob)
         sk_stats = data.get("sitekey_stats") or {}
         real_sk_stats = data.get("real_sitekey_stats") or {}

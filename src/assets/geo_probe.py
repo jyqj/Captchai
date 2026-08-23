@@ -85,7 +85,10 @@ async def _httpx_fetch_json(
         try:
             client = httpx.AsyncClient(proxy=proxy_url, timeout=timeout)
         except TypeError:  # pragma: no cover - older httpx keyword
-            client = httpx.AsyncClient(proxies=proxy_url, timeout=timeout)
+            client = httpx.AsyncClient(
+                proxies=proxy_url,  # pyright: ignore[reportCallIssue]
+                timeout=timeout,
+            )
         async with client:
             resp = await client.get(url)
             if resp.status_code != 200:
