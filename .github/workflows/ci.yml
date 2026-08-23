@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Redis is optional: the Redis-backed tests skip gracefully when no
+      # server is reachable (ping-based skip in tests/conftest.py), so CI runs
+      # without a Redis service and exercises the in-memory backends.
+      - name: Run tests
+        run: pytest -q
+
+      # Type check. Advisory for now (continue-on-error) because the repo has
+      # a backlog of pre-existing type errors, mostly in test fixtures that
+      # pass SimpleNamespace / fakes where a concrete type is annotated. It
+      # still surfaces new type regressions as annotations in the PR without
+      # blocking the merge; flip to a hard gate once the backlog is cleared.
+      - name: Type check (pyright)
+        continue-on-error: true
+        run: |
+          pip install pyright
+          pyright
+
+      - name: Build docs (strict)
+        run: mkdocs build --strict

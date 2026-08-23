@@ -13,6 +13,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.consumption.accounting import SuccessAccounting
 from src.consumption.budget import BudgetGuard
 from src.consumption.ledger import CostLedger, SolveRecord, estimate_cost
+from tests.conftest import (
+    flush_prefix as _flush_prefix,
+    redis_helper as _redis_helper,
+)
 
 
 def _rec(
@@ -482,23 +486,6 @@ def test_recaptcha_v2_defaults_egress_auto() -> None:
 # ---------------------------------------------------------------------------
 # RedisCostLedger (persisted spend / records across restarts)
 # ---------------------------------------------------------------------------
-
-
-def _redis_helper():
-    """Return (aioredis, url) or skip the test if redis isn't available."""
-    pytest = __import__("pytest")
-    aioredis = pytest.importorskip("redis.asyncio")
-    return aioredis, "redis://localhost:6379/0"
-
-
-def _flush_prefix(prefix: str) -> None:
-    """Synchronously flush test keys so tests don't see stale data."""
-    import redis as sync_redis
-
-    r = sync_redis.from_url("redis://localhost:6379/0", decode_responses=True)
-    for key in r.scan_iter(f"{prefix}:*"):
-        r.delete(key)
-    r.close()
 
 
 def test_redis_ledger_persists_total_and_records() -> None:

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header
 
 from ..core.config import config
 from ..core.task_types import ValidationKind, names_for_validation
@@ -35,9 +36,43 @@ _IMAGE_TASK_TYPES = names_for_validation(ValidationKind.IMAGE)
 _CLASSIFICATION_TASK_TYPES = names_for_validation(ValidationKind.CLASSIFICATION)
 
 
+# ── Unified auth ─────────────────────────────────────────────
+#
+# One constant-time predicate underpins every auth check so the three former
+# patterns (create-task error response, inline comparison, admin bool) can't
+# drift in their comparison semantics. ``hmac.compare_digest`` avoids the
+# early-exit timing leak of ``==`` on secret comparison.
+
+
+def _key_matches(supplied: str | None, expected: str | None) -> bool:
+    """Constant-time key check. An unset ``expected`` means auth is disabled."""
+    if not expected:
+        return True
+    return hmac.compare_digest(supplied or "", expected)
+
+
+def _client_authorized(client_key: str | None) -> bool:
+    """True when the caller's clientKey is valid (or no key is configured)."""
+    return _key_matches(client_key, config.client_key)
+
+
+def _admin_authorized(header_key: str | None, query_key: str) -> bool:
+    """Authorise an /admin/* call.
+
+    Prefers a dedicated ``ADMIN_KEY`` (falling back to ``CLIENT_KEY`` so
+    single-key deployments still work). The key is read from the ``X-Admin-Key``
+    header when present, else the legacy ``clientKey`` query param (kept for
+    backward compatibility — a header avoids leaking the secret into proxy /
+    server access logs, so it is preferred). Comparison is constant-time.
+    """
+    expected = config.admin_key or config.client_key
+    supplied = header_key if header_key is not None else query_key
+    return _key_matches(supplied, expected)
+
+
 def _check_client_key(client_key: str) -> CreateTaskResponse | None:
     """Return an error response if the client key is invalid, else None."""
-    if config.client_key and client_key != config.client_key:
+    if not _client_authorized(client_key):
         return CreateTaskResponse(
             errorId=1,
             errorCode="ERROR_KEY_DOES_NOT_EXIST",
@@ -118,7 +153,7 @@ async def create_task(request: CreateTaskRequest) -> CreateTaskResponse:
 async def get_task_result(
     request: GetTaskResultRequest,
 ) -> GetTaskResultResponse:
-    if config.client_key and request.clientKey != config.client_key:
+    if not _client_authorized(request.clientKey):
         return GetTaskResultResponse(
             errorId=1,
             errorCode="ERROR_KEY_DOES_NOT_EXIST",
@@ -152,7 +187,7 @@ async def get_task_result(
 
 @router.post("/getBalance", response_model=GetBalanceResponse)
 async def get_balance(request: GetBalanceRequest) -> GetBalanceResponse:
-    if config.client_key and request.clientKey != config.client_key:
+    if not _client_authorized(request.clientKey):
         return GetBalanceResponse(errorId=1, balance=0)
     # Real balance semantics: starting credit minus this client's ledger spend.
     services = get_services()
@@ -163,14 +198,13 @@ async def get_balance(request: GetBalanceRequest) -> GetBalanceResponse:
     return GetBalanceResponse(errorId=0, balance=balance)
 
 
-def _authorized(client_key: str) -> bool:
-    return not config.client_key or client_key == config.client_key
-
-
 @router.get("/admin/metrics")
-async def admin_metrics(clientKey: str = "") -> dict[str, object]:
+async def admin_metrics(
+    clientKey: str = "",
+    x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+) -> dict[str, object]:
     """Per-sitekey / per-model consumption summary from the cost ledger."""
-    if not _authorized(clientKey):
+    if not _admin_authorized(x_admin_key, clientKey):
         return {"errorId": 1, "errorCode": "ERROR_KEY_DOES_NOT_EXIST"}
     services = get_services()
     if services is None:
@@ -179,9 +213,12 @@ async def admin_metrics(clientKey: str = "") -> dict[str, object]:
 
 
 @router.get("/admin/proxies")
-async def admin_proxies(clientKey: str = "") -> dict[str, object]:
+async def admin_proxies(
+    clientKey: str = "",
+    x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+) -> dict[str, object]:
     """Proxy-pool health / consumption snapshot."""
-    if not _authorized(clientKey):
+    if not _admin_authorized(x_admin_key, clientKey):
         return {"errorId": 1, "errorCode": "ERROR_KEY_DOES_NOT_EXIST"}
     services = get_services()
     if services is None:
@@ -252,7 +289,7 @@ async def _report_outcome(
     session state. The in-memory ledger claims under its lock; the Redis
     ledger claims via ``SET {prefix}:reported:{task_id} 1 NX EX <ttl>``.
     """
-    if not _authorized(request.clientKey):
+    if not _client_authorized(request.clientKey):
         return ReportTaskResponse(
             errorId=1,
             errorCode="ERROR_KEY_DOES_NOT_EXIST",
