@@ -777,12 +777,7 @@ class HCaptchaSolver(InjectedWidgetSolver):
         double-fire by ``__omcExecuted``).
         """
         try:
-            await page.evaluate(
-                "() => { const t = document.getElementById('"
-                + self.OMC_EXEC_ID
-                + "'); if (t) { t.setAttribute('data-exec', '1'); }"
-                " if (window.__omcExecute) { window.__omcExecute(); } }"
-            )
+            await page.evaluate(self._omc_trigger_exec_js())
         except Exception as exc:  # noqa: BLE001 - trigger is best-effort
             log.info("hCaptcha invisible execute trigger failed: %s", exc)
 
@@ -799,12 +794,7 @@ class HCaptchaSolver(InjectedWidgetSolver):
         # the solve loop reacts per kind (rate-limit → fail fast, etc.). Reads
         # the shared-DOM ``#omc-result`` first (Camoufox-safe), then the
         # main-world ``window.__omcError`` fallback.
-        err = await page.evaluate(
-            "() => { const el = document.getElementById('"
-            + self.OMC_RESULT_ID
-            + "'); if (el && el.getAttribute('data-status') === 'error') {"
-            " return el.textContent || 'error'; } return window.__omcError || null; }"
-        )
+        err = await page.evaluate(self._omc_read_error_js())
         if err:
             raise classify_widget_error(err, provider="hCaptcha")
 

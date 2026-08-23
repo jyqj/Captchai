@@ -86,6 +86,22 @@ def test_js_bundle_version_covers_all_bundled_assets() -> None:
     assert partial.hexdigest()[:12] != js_bundle_version()
 
 
+def test_omc_trigger_exec_asset_carries_exec_placeholder() -> None:
+    """The invisible-execute trigger asset ships the ``__EXEC_ID__`` placeholder
+    the base solver substitutes with ``OMC_EXEC_ID`` at load time."""
+    js = load_js("omc_trigger_exec.js")
+    assert "__EXEC_ID__" in js
+    assert "window.__omcExecute" in js
+
+
+def test_omc_read_error_asset_carries_result_placeholder() -> None:
+    """The widget-error read asset ships the ``__RESULT_ID__`` placeholder and
+    the main-world ``window.__omcError`` fallback."""
+    js = load_js("omc_read_error.js")
+    assert "__RESULT_ID__" in js
+    assert "window.__omcError" in js
+
+
 def test_expected_manifest_matches_directory() -> None:
     """EXPECTED_JS_ASSETS is the exact set of ``.js`` files on disk.
 

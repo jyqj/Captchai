@@ -150,6 +150,29 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         """
         return load_js("omc_dom_read.js").replace("__RESULT_ID__", cls.OMC_RESULT_ID)
 
+    @classmethod
+    def _omc_trigger_exec_js(cls) -> str:
+        """Main-world expression that fires the deferred invisible ``execute()``.
+
+        Flips ``#omc-exec``'s ``data-exec`` on the shared DOM (the page's
+        MutationObserver then calls ``execute()``) and also invokes the
+        main-world function directly as a stock-Chromium fast path.
+        """
+        return load_js("omc_trigger_exec.js").strip().replace(
+            "__EXEC_ID__", cls.OMC_EXEC_ID
+        )
+
+    @classmethod
+    def _omc_read_error_js(cls) -> str:
+        """Main-world expression that reads a widget error off ``#omc-result``.
+
+        Returns the DOM-carried error text (Camoufox-safe) when the status is
+        ``error``, else falls back to the main-world ``window.__omcError``.
+        """
+        return load_js("omc_read_error.js").strip().replace(
+            "__RESULT_ID__", cls.OMC_RESULT_ID
+        )
+
     # ── injected page ──────────────────────────────────────────
 
     def _widget_api_js(self, options: dict[str, Any]) -> str:

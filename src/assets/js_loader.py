@@ -28,6 +28,8 @@ EXPECTED_JS_ASSETS: frozenset[str] = frozenset(
         "hcaptcha_widget_render.js",
         "omc_bridge.js",
         "omc_dom_read.js",
+        "omc_read_error.js",
+        "omc_trigger_exec.js",
         "recaptcha_v2_extract.js",
         "recaptcha_v2_invisible_execute.js",
         "recaptcha_v3_execute.js",
