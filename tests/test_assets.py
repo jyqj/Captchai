@@ -283,8 +283,11 @@ def test_build_stealth_js_canvas_offset_differs_per_fingerprint() -> None:
     js1 = build_stealth_js(fp1)
     js2 = build_stealth_js(fp2)
     import re
-    o1 = int(re.search(r"const _offset = (\d+);", js1).group(1))
-    o2 = int(re.search(r"const _offset = (\d+);", js2).group(1))
+    m1 = re.search(r"const _offset = (\d+);", js1)
+    m2 = re.search(r"const _offset = (\d+);", js2)
+    assert m1 is not None and m2 is not None
+    o1 = int(m1.group(1))
+    o2 = int(m2.group(1))
     # Two different seeds very likely produce different UAs → different
     # offsets. Assert they differ (extremely high probability).
     assert o1 != o2 or fp1.user_agent != fp2.user_agent
@@ -718,6 +721,7 @@ def test_proxy_session_metadata_injects_username_placeholder() -> None:
     assert p is not None
     assert p.sticky_session_id == "abc123"
     pw = p.playwright_proxy()
+    assert pw is not None
     assert pw["username"] == "user-abc123"
     # The gateway host is untouched; only the credential token changes.
     assert pw["server"] == "http://gw.example.com:8080"
@@ -730,8 +734,11 @@ def test_proxy_sticky_true_autogenerates_stable_session() -> None:
     )
     assert p is not None
     assert p.sticky_session_id  # auto-generated, non-empty
-    first = p.playwright_proxy()["username"]
-    second = p.playwright_proxy()["username"]
+    pw_first = p.playwright_proxy()
+    pw_second = p.playwright_proxy()
+    assert pw_first is not None and pw_second is not None
+    first = pw_first["username"]
+    second = pw_second["username"]
     # Same exit IP across calls: the substituted username is stable.
     assert first == second
     assert p.sticky_session_id in first
@@ -742,9 +749,13 @@ def test_proxy_placeholder_without_metadata_lazy_generates_once() -> None:
     p = proxy_from_params({"proxy": "http://u_{session}:p@gw:8080"})
     assert p is not None
     assert p.sticky_session_id is None  # not generated until first use
-    first = p.playwright_proxy()["username"]
+    pw_first = p.playwright_proxy()
+    assert pw_first is not None
+    first = pw_first["username"]
     assert p.sticky_session_id is not None  # generated on first playwright_proxy()
-    second = p.playwright_proxy()["username"]
+    pw_second = p.playwright_proxy()
+    assert pw_second is not None
+    second = pw_second["username"]
     assert first == second  # stable thereafter
 
 
@@ -753,7 +764,9 @@ def test_proxy_no_placeholder_leaves_username_untouched() -> None:
     p = proxy_from_params({"proxy": "http://user:pass@gw:8080|sticky=true"})
     assert p is not None
     # sticky=true set an id, but with no placeholder the username is literal.
-    assert p.playwright_proxy()["username"] == "user"
+    pw = p.playwright_proxy()
+    assert pw is not None
+    assert pw["username"] == "user"
 
 
 # --------------------------------------------------------------------------- #
@@ -815,6 +828,7 @@ def test_geo_probe_skips_manually_annotated_proxy() -> None:
 
     async def scenario():
         proxy = proxy_from_params({"proxy": "http://gw:8080|country=DE"})
+        assert proxy is not None
         applied = await probe_proxy_geo(
             proxy, url="http://ip-api.com/json", fetch=fake_fetch
         )

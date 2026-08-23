@@ -15,6 +15,7 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -164,7 +165,7 @@ def test_solver_services_close_releases_redis_backends() -> None:
         async def close(self) -> None:
             closed.append("accounting")
 
-    svc = SolverServices.__new__(SolverServices)  # bypass __init__
+    svc: Any = SolverServices.__new__(SolverServices)  # bypass __init__
     svc.session_pool = None
     svc.ledger = StubLedger()
     svc.proxy_pool = StubProxy()
@@ -178,7 +179,7 @@ def test_solver_services_close_skips_in_memory_backends() -> None:
     """close() is a no-op when backends are in-memory (no ``close`` method)."""
     from src.core.services import SolverServices
 
-    svc = SolverServices.__new__(SolverServices)  # bypass __init__
+    svc: Any = SolverServices.__new__(SolverServices)  # bypass __init__
     svc.session_pool = None
     # In-memory backends don't define close() — getattr returns None.
     svc.ledger = object()

@@ -34,6 +34,7 @@ def test_update_and_delete() -> None:
         await store.put("t1", {"status": "processing"})
         await store.update("t1", status="ready", solution={"token": "x"})
         rec = await store.get("t1")
+        assert rec is not None
         assert rec["status"] == "ready"
         assert rec["solution"] == {"token": "x"}
         await store.delete("t1")

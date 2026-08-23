@@ -23,7 +23,9 @@ from src.consumption.token_verify import (  # noqa: E402
     build_token_verifier,
     parse_secret_map,
 )
+from src.core.config import Config  # noqa: E402
 from src.services.turnstile import TurnstileSolver  # noqa: E402
+from tests.support.fakes import as_browser_manager, fake_config  # noqa: E402
 
 
 # ── pure helpers ───────────────────────────────────────────────
@@ -152,8 +154,8 @@ class _FakeVerifier:
         return self.verdict
 
 
-def _config(retries: int = 1):
-    return SimpleNamespace(
+def _config(retries: int = 1) -> Config:
+    return fake_config(
         captcha_retries=retries,
         browser_timeout=5,
         poll_budget=1,
@@ -181,7 +183,9 @@ def _run_turnstile(verifier, retries=1):
         context = _FakeContext(page)
         services = _services(verifier)
         solver = TurnstileSolver(
-            _config(retries), manager=_FakeManager(context), services=services
+            _config(retries),
+            manager=as_browser_manager(_FakeManager(context)),
+            services=services,
         )
         result = None
         error = None
@@ -204,6 +208,7 @@ def test_verified_token_returns_and_records_real_success() -> None:
     verifier = _FakeVerifier(verdict=True)
     result, error, services = _run_turnstile(verifier)
     assert error is None
+    assert result is not None
     assert result["token"].startswith("cf_")
     # Verifier was consulted with the provider + sitekey.
     assert verifier.calls and verifier.calls[0][1] == "turnstile"
@@ -227,6 +232,7 @@ def test_unknown_verdict_returns_token_without_real_record() -> None:
     verifier = _FakeVerifier(verdict=None)
     result, error, services = _run_turnstile(verifier)
     assert error is None
+    assert result is not None
     assert result["token"].startswith("cf_")
     # Unknown verdict → caller-driven loop preserved, no real outcome recorded.
     assert services.accounting.real == []
@@ -235,6 +241,7 @@ def test_unknown_verdict_returns_token_without_real_record() -> None:
 def test_no_verifier_is_unchanged_behaviour() -> None:
     result, error, services = _run_turnstile(verifier=None)
     assert error is None
+    assert result is not None
     assert result["token"].startswith("cf_")
     assert services.accounting.real == []
 

@@ -21,6 +21,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -104,7 +105,7 @@ def _make_services():
 
 
 def _make_record(task_id: str, **overrides) -> SolveRecord:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         task_id=task_id,
         sitekey="sk-1",
         task_type="RecaptchaV2TaskProxyless",

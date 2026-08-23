@@ -14,11 +14,7 @@
   "executionEnvironments": [
     {
       "root": "tests",
-      "extraPaths": ["."],
-      "reportArgumentType": "none",
-      "reportOptionalMemberAccess": "none",
-      "reportOptionalSubscript": "none",
-      "reportAttributeAccessIssue": "none"
+      "extraPaths": ["."]
     }
   ]
 }

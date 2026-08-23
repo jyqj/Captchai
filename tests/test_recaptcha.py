@@ -12,14 +12,17 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.core.config import Config  # noqa: E402
 from src.services.browser_solver import ProxyKind, SolveContext  # noqa: E402
 from src.services.recaptcha_v2 import RecaptchaV2Solver  # noqa: E402
 from src.services.recaptcha_v3 import RecaptchaV3Solver  # noqa: E402
+from tests.support.fakes import as_browser_manager, fake_config  # noqa: E402
 
 
 class FakeContext:
@@ -45,7 +48,7 @@ class FakeManager:
 class FakePage:
     """Minimal Playwright Page stand-in: token evaluate, no-op mouse/goto."""
 
-    def __init__(self, *, token="tok-" + "x" * 40):
+    def __init__(self, *, token: Optional[str] = "tok-" + "x" * 40):
         self._token = token
         self.goto_wait_untils: list = []
         self.mouse = SimpleNamespace(move=self._noop)
@@ -69,8 +72,8 @@ class FakePage:
         return self._token
 
 
-def _config():
-    return SimpleNamespace(
+def _config() -> Config:
+    return fake_config(
         captcha_retries=1,
         browser_timeout=5,
         human_mouse_enabled=False,
@@ -83,7 +86,7 @@ def test_recaptcha_v2_uses_acquire_and_release_context() -> None:
     async def run() -> None:
         page = FakePage()
         context = FakeContext(page)
-        manager = FakeManager(context)
+        manager = as_browser_manager(FakeManager(context))
         solver = RecaptchaV2Solver(_config(), manager=manager, services=None)
 
         acquired: list = []
@@ -132,7 +135,7 @@ def test_recaptcha_v2_release_called_with_solved_false_on_failure() -> None:
     async def run() -> None:
         page = FakePage(token=None)  # evaluate returns None → no token
         context = FakeContext(page)
-        manager = FakeManager(context)
+        manager = as_browser_manager(FakeManager(context))
         solver = RecaptchaV2Solver(_config(), manager=manager, services=None)
 
         released: list = []
@@ -178,7 +181,7 @@ def test_recaptcha_v2_goto_uses_domcontentloaded() -> None:
     async def run() -> None:
         page = FakePage()
         context = FakeContext(page)
-        manager = FakeManager(context)
+        manager = as_browser_manager(FakeManager(context))
         solver = RecaptchaV2Solver(_config(), manager=manager, services=None)
 
         async def fake_acquire(params):
@@ -214,7 +217,7 @@ def test_recaptcha_v3_uses_acquire_and_release_context() -> None:
     async def run() -> None:
         page = FakePage()
         context = FakeContext(page)
-        manager = FakeManager(context)
+        manager = as_browser_manager(FakeManager(context))
         solver = RecaptchaV3Solver(_config(), manager=manager, services=None)
 
         acquired: list = []
@@ -257,7 +260,7 @@ def test_recaptcha_v3_goto_uses_domcontentloaded() -> None:
     async def run() -> None:
         page = FakePage()
         context = FakeContext(page)
-        manager = FakeManager(context)
+        manager = as_browser_manager(FakeManager(context))
         solver = RecaptchaV3Solver(_config(), manager=manager, services=None)
 
         async def fake_acquire(params):
@@ -289,7 +292,7 @@ def test_recaptcha_v3_release_called_with_solved_false_on_failure() -> None:
     async def run() -> None:
         page = FakePage(token=None)
         context = FakeContext(page)
-        manager = FakeManager(context)
+        manager = as_browser_manager(FakeManager(context))
         solver = RecaptchaV3Solver(_config(), manager=manager, services=None)
 
         released: list = []
@@ -355,7 +358,7 @@ def test_v2_audio_transcription_routes_through_model_pool() -> None:
             model_pool=SimpleNamespace(cloud=_CloudClient()),
             budget=budget,
         )
-        config = SimpleNamespace(
+        config = fake_config(
             captcha_retries=1,
             cloud_audio_model="whisper-1",
             cloud_base_url="http://cloud",
@@ -364,7 +367,7 @@ def test_v2_audio_transcription_routes_through_model_pool() -> None:
         )
         solver = RecaptchaV2Solver(config, manager=None, services=services)
 
-        params = {"_clientKey": "acct-1"}
+        params: dict[str, Any] = {"_clientKey": "acct-1"}
         text = await solver._transcribe_audio(b"FAKEMP3", params)
         assert text == "3 1 4"
         assert calls["n"] == 1
@@ -394,7 +397,7 @@ def test_v2_audio_transcription_denied_by_budget_raises() -> None:
             model_pool=SimpleNamespace(cloud=_CloudClient()),
             budget=_Budget(),
         )
-        config = SimpleNamespace(
+        config = fake_config(
             cloud_audio_model="whisper-1", captcha_timeout=10
         )
         solver = RecaptchaV2Solver(config, manager=None, services=services)

@@ -17,6 +17,7 @@ from tests.conftest import (
     flush_prefix as _flush_prefix,
     redis_helper as _redis_helper,
 )
+from tests.support.fakes import as_browser_manager, fake_config
 
 
 def _rec(
@@ -314,7 +315,7 @@ def test_record_helper_produces_solve_record() -> None:
             session_pool=None,
             proxy_pool=None,
         )
-        config = SimpleNamespace(
+        config = fake_config(
             human_mouse_enabled=False,
             human_mouse_jitter_ms=0,
         )
@@ -369,7 +370,7 @@ def test_recaptcha_v2_records_to_ledger() -> None:
             session_pool=None,
             proxy_pool=None,
         )
-        config = SimpleNamespace(
+        config = fake_config(
             human_mouse_enabled=False,
             human_mouse_jitter_ms=0,
             captcha_retries=1,
@@ -384,7 +385,9 @@ def test_recaptcha_v2_records_to_ledger() -> None:
 
                 return FakeCtx(), params.get("userAgent") or "UA"
 
-        solver = RecaptchaV2Solver(config, manager=FakeManager(), services=services)
+        solver = RecaptchaV2Solver(
+            config, manager=as_browser_manager(FakeManager()), services=services
+        )
 
         async def _fake_solve_once(website_url, website_key, is_invisible, params):
             return "token-" + "x" * 30, "UA"
@@ -421,8 +424,10 @@ def test_recaptcha_v3_defaults_egress_proxyless() -> None:
 
         from src.services.recaptcha_v3 import RecaptchaV3Solver
 
-        config = SimpleNamespace(captcha_retries=1)
-        solver = RecaptchaV3Solver(config, manager=SimpleNamespace(), services=None)
+        config = fake_config(captcha_retries=1)
+        solver = RecaptchaV3Solver(
+            config, manager=as_browser_manager(SimpleNamespace()), services=None
+        )
 
         seen: list[dict] = []
 
@@ -464,8 +469,10 @@ def test_recaptcha_v2_defaults_egress_auto() -> None:
 
         from src.services.recaptcha_v2 import RecaptchaV2Solver
 
-        config = SimpleNamespace(captcha_retries=1)
-        solver = RecaptchaV2Solver(config, manager=SimpleNamespace(), services=None)
+        config = fake_config(captcha_retries=1)
+        solver = RecaptchaV2Solver(
+            config, manager=as_browser_manager(SimpleNamespace()), services=None
+        )
 
         async def _fake_solve_once(website_url, website_key, is_invisible, params):
             return "token-" + "x" * 30, "UA"

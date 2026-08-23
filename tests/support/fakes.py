@@ -18,12 +18,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any, cast
 
+from src.assets.model_pool import ModelPool
 from src.core.config import (
     _PLACEHOLDER_CLOUD_BASE_URL,
     _PLACEHOLDER_CLOUD_MODEL,
     _PLACEHOLDER_LOCAL_MODEL,
     Config,
 )
+from src.services.browser import BrowserManager
 
 # Faithful copy of the production defaults (load_config with no env set). Kept
 # here rather than calling load_config() so a test never depends on the ambient
@@ -137,3 +139,26 @@ def fake_config(**overrides: Any) -> Config:
     """
     fields = {**_CONFIG_DEFAULTS, **overrides}
     return cast(Config, SimpleNamespace(**fields))
+
+
+def as_browser_manager(double: Any) -> BrowserManager:
+    """Type a browser-manager test double as ``BrowserManager`` for call sites.
+
+    The solvers take ``manager: BrowserManager | None`` and only call
+    ``await manager.new_context(params)`` (or, for the manager's own unit tests,
+    poke ``manager._browser``). A test ``FakeManager`` with that surface is a
+    faithful stand-in; this ``cast`` lets the injection site stay typed as
+    ``BrowserManager`` so the relaxed ``reportArgumentType`` rule can be dropped.
+    """
+    return cast(BrowserManager, double)
+
+
+def as_model_pool(double: Any) -> ModelPool:
+    """Type a model-pool test double as ``ModelPool`` for call sites.
+
+    ``ModelInvoker`` and ``VisionRouter`` take ``model_pool: ModelPool`` and only
+    call ``pool.get(name)`` (plus ``pool.local`` / ``pool.cloud`` in some paths).
+    A test ``FakePool`` exposing that surface is a faithful stand-in; this
+    ``cast`` keeps the call site typed as ``ModelPool``.
+    """
+    return cast(ModelPool, double)
