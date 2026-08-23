@@ -6,6 +6,7 @@ import importlib
 import os
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -95,6 +96,25 @@ def test_health_endpoint() -> None:
     assert body["status"] == "ok"
     assert "cloud_model" in body
     assert "local_model" in body
+
+
+def test_health_endpoint_reports_js_bundle_version() -> None:
+    """/api/v1/health surfaces a well-formed, non-empty js_bundle_version.
+
+    Clients / deploy checks read this to confirm the browser-side JS assets a
+    given build ships (a 12-char sha256 fingerprint of all bundled ``.js``),
+    so it must be present and match the loader's own computation.
+    """
+    import re
+
+    from src.assets.js_loader import js_bundle_version
+
+    client = _load_app()
+    body = client.get("/api/v1/health").json()
+    version = body["js_bundle_version"]
+    assert isinstance(version, str)
+    assert re.fullmatch(r"[0-9a-f]{12}", version), version
+    assert version == js_bundle_version()
 
 
 def test_root_endpoint() -> None:
@@ -396,6 +416,7 @@ def test_get_task_result_returns_user_agent_in_solution() -> None:
             },
         ).json()
         task_id = created["taskId"]
+        result: Any = None
         for _ in range(20):
             result = client.post(
                 "/getTaskResult",

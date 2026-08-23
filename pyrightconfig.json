@@ -18,8 +18,7 @@
       "reportArgumentType": "none",
       "reportOptionalMemberAccess": "none",
       "reportOptionalSubscript": "none",
-      "reportAttributeAccessIssue": "none",
-      "reportPossiblyUnboundVariable": "none"
+      "reportAttributeAccessIssue": "none"
     }
   ]
 }
