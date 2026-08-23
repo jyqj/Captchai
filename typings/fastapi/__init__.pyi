@@ -3,8 +3,12 @@ from typing import Any, Callable, Generic, TypeVar
 T = TypeVar("T")
 
 
-class Header:
-    def __init__(self, default: Any = ...) -> None: ...
+def Header(
+    default: Any = ...,
+    *,
+    alias: str | None = ...,
+    **kwargs: Any,
+) -> Any: ...
 
 
 class HTTPException(Exception):
