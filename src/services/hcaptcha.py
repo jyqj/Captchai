@@ -38,6 +38,7 @@ from typing import Any, Optional
 
 from playwright.async_api import FrameLocator
 
+from ..assets.js_loader import load_js
 from ..assets.proxy_pool import proxy_from_params
 from ..parsing.dispatcher import (
     ChallengeClassifier,
@@ -66,29 +67,10 @@ log = logging.getLogger(__name__)
 # Camoufox (whose isolated-world evaluate can't see the page's main-world
 # ``window.__omc*`` globals), then falls back to the ``window`` global, the
 # provider's own ``h-captcha-response`` textarea, and ``hcaptcha.getResponse()``
-# for stock Chromium.
-_EXTRACT_HCAPTCHA_TOKEN_JS = (
-    "() => {\n"
-    "    let token = null;\n"
-    "    let error = null;\n"
-    "    " + InjectedWidgetSolver._omc_dom_read_js() + ""
-    "    if (!token && window.__omcToken) {\n"
-    "        token = window.__omcToken;\n"
-    "    }\n"
-    "    if (!token) {\n"
-    "        const textarea = document.querySelector('[name=\"h-captcha-response\"]')\n"
-    "            || document.querySelector('[name=\"g-recaptcha-response\"]');\n"
-    "        if (textarea && textarea.value && textarea.value.length > 20) {\n"
-    "            token = textarea.value;\n"
-    "        } else if (window.hcaptcha && typeof window.hcaptcha.getResponse === 'function') {\n"
-    "            try {\n"
-    "                const resp = window.hcaptcha.getResponse();\n"
-    "                if (resp && resp.length > 20) token = resp;\n"
-    "            } catch (e) {}\n"
-    "        }\n"
-    "    }\n"
-    "    return {token: token, error: error || window.__omcError || null};\n"
-    "}\n"
+# for stock Chromium. The DOM-read fragment is shared with Turnstile via the
+# ``__DOM_READ__`` placeholder (see ``InjectedWidgetSolver._omc_dom_read_js``).
+_EXTRACT_HCAPTCHA_TOKEN_JS = load_js("hcaptcha_token_extract.js").replace(
+    "__DOM_READ__", InjectedWidgetSolver._omc_dom_read_js()
 )
 
 # Localization-independent iframe matchers. The challenge iframe title is
@@ -180,22 +162,10 @@ class HCaptchaSolver(InjectedWidgetSolver):
         # widget id, and exposes an explicit execute trigger. For an invisible
         # widget execute() is DEFERRED (``__omcDeferExecute``) so the solver can
         # seed behaviour before the passive request; otherwise it fires inline.
-        return (
-            "window.__omcWidgetId = window.hcaptcha.render('omc-hcaptcha', opts);\n"
-            "            window.__omcExecute = function () {\n"
-            "                if (window.__omcExecuted) return;\n"
-            "                window.__omcExecuted = true;\n"
-            "                try { window.hcaptcha.execute(window.__omcWidgetId); }\n"
-            "                catch (e) { window.__omcError = String(e); __omcSet('error', e && e.message ? e.message : String(e)); }\n"
-            "            };\n"
-            # Bridge the deferred invisible execute() through the shared DOM so a
-            # Camoufox isolated-world evaluate can trigger it (it cannot call the
-            # main-world __omcExecute function directly).
-            "            __omcInstallExecBridge();\n"
-            "            if (opts.size === 'invisible' && !window.__omcDeferExecute) {\n"
-            "                window.__omcExecute();\n"
-            "            }"
-        )
+        # The body also installs the shared-DOM exec bridge so a Camoufox
+        # isolated-world evaluate can trigger the deferred execute() (it cannot
+        # call the main-world __omcExecute function directly).
+        return load_js("hcaptcha_widget_render.js")
 
     def _widget_api_js(self, options: dict[str, Any]) -> str:
         # Self-hosted enterprise hCaptcha serves its SDK from the customer's
