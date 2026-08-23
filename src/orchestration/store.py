@@ -101,6 +101,13 @@ class RedisTaskStore:
 
     _KEY = "captcha:task:{}"
     _INDEX = "captcha:tasks"
+    # Bounded retries for the optimistic update transaction. A WATCH writer
+    # loses at most (concurrent-writers − 1) rounds before it wins (each round
+    # at least one writer commits and then stops contending), so this bound
+    # only needs headroom above realistic per-task write concurrency (a
+    # handful: the solve's persist plus an expiry sweep). Kept generous so the
+    # non-atomic fallback below is effectively unreachable in practice.
+    _MAX_UPDATE_RETRIES = 64
 
     def __init__(self, url: str, ttl_seconds: int = 600) -> None:
         try:
@@ -127,20 +134,60 @@ class RedisTaskStore:
         return json.loads(raw)
 
     async def update(self, task_id: str, **fields: Any) -> None:
-        rec = await self.get(task_id)
-        if rec is None:
+        """Atomic read-merge-write via an optimistic WATCH/MULTI transaction.
+
+        The original ``get`` → merge → ``set`` had a lost-update race: two
+        writers (e.g. the solve's ``finally`` persist and a concurrent expiry
+        sweep, or two workers) could each read the record, merge only their own
+        fields, and write back — the second write clobbering the first's fields.
+
+        ``WATCH`` makes the write conditional on the key being unchanged since
+        the read: if another writer touched it in between, ``EXEC`` aborts
+        (raises ``WatchError``) and we retry the read-merge-write onto the
+        winner's value. Serialisation stays Python-side JSON (unchanged key and
+        blob format) for full backward compatibility. TTL is refreshed on write,
+        matching the previous behaviour.
+        """
+        if not fields:
             return
+        from redis.exceptions import WatchError  # optional dep, present w/ redis
+
+        key = self._KEY.format(task_id)
+        async with self._redis.pipeline() as pipe:
+            for _ in range(self._MAX_UPDATE_RETRIES):
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if raw is None:
+                        await pipe.unwatch()
+                        return
+                    rec = json.loads(raw)
+                    rec.update(fields)
+                    pipe.multi()
+                    pipe.set(key, json.dumps(rec), ex=self._ttl)
+                    await pipe.execute()
+                    return
+                except WatchError:
+                    continue  # key changed under us — re-read and re-merge
+        # Contention exhausted the retry budget (pathological). Fall back to a
+        # best-effort non-transactional merge so the update still lands rather
+        # than being silently dropped — no worse than the pre-atomic behaviour.
+        raw = await self._redis.get(key)
+        if raw is None:
+            return
+        rec = json.loads(raw)
         rec.update(fields)
-        await self._redis.set(
-            self._KEY.format(task_id), json.dumps(rec), ex=self._ttl
-        )
+        await self._redis.set(key, json.dumps(rec), ex=self._ttl)
 
     async def delete(self, task_id: str) -> None:
         await self._redis.delete(self._KEY.format(task_id))
         await self._redis.srem(self._INDEX, task_id)
 
     async def all_ids(self) -> list[str]:
-        return list(await self._redis.smembers(self._INDEX))
+        # decode_responses=True means str at runtime; the redis type stubs
+        # still surface ``bytes | str``, so normalise defensively.
+        members = await self._redis.smembers(self._INDEX)
+        return [m.decode() if isinstance(m, bytes) else m for m in members]
 
     async def claim_idempotency(
         self, key: str, task_id: str, ttl_seconds: int
@@ -157,6 +204,8 @@ class RedisTaskStore:
         if won:
             return task_id
         existing = await self._redis.get(redis_key)
+        if isinstance(existing, bytes):
+            existing = existing.decode()
         return existing or task_id
 
     async def close(self) -> None:

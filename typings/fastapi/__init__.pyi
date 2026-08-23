@@ -1,10 +1,14 @@
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Callable, Coroutine, Generic, TypeVar
 
 T = TypeVar("T")
 
 
-class Header:
-    def __init__(self, default: Any = ...) -> None: ...
+def Header(
+    default: Any = ...,
+    *,
+    alias: str | None = ...,
+    **kwargs: Any,
+) -> Any: ...
 
 
 class HTTPException(Exception):
@@ -36,3 +40,5 @@ class FastAPI:
     def __init__(self, *, title: str = ..., version: str = ..., description: str = ..., lifespan: Any = ...) -> None: ...
     def include_router(self, router: APIRouter) -> None: ...
     def get(self, path: str) -> Callable[[Callable[..., T]], Callable[..., T]]: ...
+    # ASGI entrypoint so the app satisfies httpx.ASGITransport's _ASGIApp.
+    def __call__(self, scope: Any, receive: Any, send: Any) -> Coroutine[None, None, None]: ...

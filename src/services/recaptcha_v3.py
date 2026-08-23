@@ -5,35 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ..assets.js_loader import load_js
 from .browser_solver import BaseBrowserSolver, has_task_proxy
 
 log = logging.getLogger(__name__)
 
-# JS executed inside the browser to obtain a reCAPTCHA v3 token.
-# Handles both standard and enterprise reCAPTCHA libraries.
-_EXECUTE_JS = """
-([key, action]) => new Promise((resolve, reject) => {
-    const gr = window.grecaptcha?.enterprise || window.grecaptcha;
-    if (gr && typeof gr.execute === 'function') {
-        gr.ready(() => {
-            gr.execute(key, {action}).then(resolve).catch(reject);
-        });
-        return;
-    }
-    // grecaptcha not loaded yet — inject the script ourselves
-    const script = document.createElement('script');
-    script.src = 'https://www.google.com/recaptcha/api.js?render=' + key;
-    script.onerror = () => reject(new Error('Failed to load reCAPTCHA script'));
-    script.onload = () => {
-        const g = window.grecaptcha;
-        if (!g) { reject(new Error('grecaptcha still undefined after script load')); return; }
-        g.ready(() => {
-            g.execute(key, {action}).then(resolve).catch(reject);
-        });
-    };
-    document.head.appendChild(script);
-})
-"""
+_EXECUTE_JS = load_js("recaptcha_v3_execute.js")
 
 class RecaptchaV3Solver(BaseBrowserSolver):
     """Solves RecaptchaV3TaskProxyless tasks via a shared headless Chromium.

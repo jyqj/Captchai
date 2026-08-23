@@ -19,6 +19,27 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+_TRUTHY = {"1", "true", "yes"}
+
+# Placeholder values shipped as defaults so the service boots without config,
+# but which point at nothing real. ``config_warnings`` flags them so an operator
+# who forgot to set the corresponding env var sees it at startup instead of
+# discovering it via a confusing connection failure mid-solve.
+_PLACEHOLDER_CLOUD_BASE_URL = "https://your-openai-compatible-endpoint/v1"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var (``1``/``true``/``yes`` → True).
+
+    Consolidates the ~20 repeated ``os.environ.get(...).strip().lower() in
+    {...}`` expressions that used to litter :func:`load_config`. An unset
+    variable yields ``default``; a set-but-empty value is falsy.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUTHY
+
 
 @dataclass(frozen=True)
 class Config:
@@ -27,6 +48,11 @@ class Config:
 
     # Auth: YesCaptcha clientKey
     client_key: str | None
+    # Optional dedicated key for the /admin/* endpoints. Falls back to
+    # ``client_key`` when unset so existing single-key deployments keep working;
+    # set it to gate admin/introspection behind a secret separate from the
+    # caller-facing clientKey.
+    admin_key: str | None
 
     # ── Cloud model (remote API) ──
     cloud_base_url: str
@@ -284,10 +310,11 @@ def load_config() -> Config:
         server_host=os.environ.get("SERVER_HOST", "0.0.0.0"),
         server_port=int(os.environ.get("SERVER_PORT", "8000")),
         client_key=os.environ.get("CLIENT_KEY", "").strip() or None,
+        admin_key=os.environ.get("ADMIN_KEY", "").strip() or None,
         # Cloud model
         cloud_base_url=os.environ.get(
             "CLOUD_BASE_URL",
-            os.environ.get("CAPTCHA_BASE_URL", "https://your-openai-compatible-endpoint/v1"),
+            os.environ.get("CAPTCHA_BASE_URL", _PLACEHOLDER_CLOUD_BASE_URL),
         ),
         cloud_api_key=os.environ.get(
             "CLOUD_API_KEY",
@@ -313,18 +340,12 @@ def load_config() -> Config:
         ),
         cloud_max_concurrency=int(os.environ.get("CLOUD_MAX_CONCURRENCY", "4")),
         local_max_concurrency=int(os.environ.get("LOCAL_MAX_CONCURRENCY", "0")),
-        model_connection_fallback=os.environ.get(
-            "MODEL_CONNECTION_FALLBACK", "true"
-        )
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
+        model_connection_fallback=_env_bool("MODEL_CONNECTION_FALLBACK", True),
         captcha_retries=int(os.environ.get("CAPTCHA_RETRIES", "3")),
         captcha_timeout=int(os.environ.get("CAPTCHA_TIMEOUT", "30")),
         retry_backoff_base=float(os.environ.get("RETRY_BACKOFF_BASE", "1.0")),
         retry_backoff_max=float(os.environ.get("RETRY_BACKOFF_MAX", "8.0")),
-        browser_headless=os.environ.get("BROWSER_HEADLESS", "true").strip().lower()
-        in {"1", "true", "yes"},
+        browser_headless=_env_bool("BROWSER_HEADLESS", True),
         browser_timeout=int(os.environ.get("BROWSER_TIMEOUT", "30")),
         # Runtime / concurrency
         browser_concurrency=int(os.environ.get("BROWSER_CONCURRENCY", "4")),
@@ -360,39 +381,19 @@ def load_config() -> Config:
             os.environ.get("POLL_BUDGET_CHALLENGE_READY", "4.0")
         ),
         # Vision routing
-        vision_cloud_enabled=os.environ.get("VISION_CLOUD_ENABLED", "true")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
+        vision_cloud_enabled=_env_bool("VISION_CLOUD_ENABLED", True),
         vision_vote_samples=int(os.environ.get("VISION_VOTE_SAMPLES", "3")),
         vision_confidence_threshold=float(
             os.environ.get("VISION_CONFIDENCE_THRESHOLD", "0.6")
         ),
         vision_tier2_detail=os.environ.get("VISION_TIER2_DETAIL", "high"),
         # WP4: vision performance — concurrent voting + inline tier-1→tier-2 escalation.
-        vision_vote_concurrent=os.environ.get("VISION_VOTE_CONCURRENT", "true")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        vision_inline_escalate=os.environ.get("VISION_INLINE_ESCALATE", "true")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        vision_stitch_grid=os.environ.get("VISION_STITCH_GRID", "true")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        vision_trust_self_confidence=os.environ.get(
-            "VISION_TRUST_SELF_CONFIDENCE", "false"
-        )
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
+        vision_vote_concurrent=_env_bool("VISION_VOTE_CONCURRENT", True),
+        vision_inline_escalate=_env_bool("VISION_INLINE_ESCALATE", True),
+        vision_stitch_grid=_env_bool("VISION_STITCH_GRID", True),
+        vision_trust_self_confidence=_env_bool("VISION_TRUST_SELF_CONFIDENCE", False),
         # WP4: resource interception — per-context bandwidth shaping.
-        resource_block_enabled=os.environ.get("RESOURCE_BLOCK_ENABLED", "true")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
+        resource_block_enabled=_env_bool("RESOURCE_BLOCK_ENABLED", True),
         resource_block_types=os.environ.get(
             "RESOURCE_BLOCK_TYPES", "image,media,font,stylesheet"
         ),
@@ -404,78 +405,42 @@ def load_config() -> Config:
         # Asset pools
         session_pool_size=int(os.environ.get("SESSION_POOL_SIZE", "4")),
         session_max_solves=int(os.environ.get("SESSION_MAX_SOLVES", "8")),
-        session_prewarm=os.environ.get("SESSION_PREWARM", "false").strip().lower()
-        in {"1", "true", "yes"},
+        session_prewarm=_env_bool("SESSION_PREWARM", False),
         proxy_cooldown=int(os.environ.get("PROXY_COOLDOWN", "120")),
         proxy_max_consecutive_fails=int(
             os.environ.get("PROXY_MAX_CONSECUTIVE_FAILS", "3")
         ),
         proxy_max_gb=_optional_float(os.environ.get("PROXY_MAX_GB")) or 0.0,
-        proxy_geo_probe=os.environ.get("PROXY_GEO_PROBE", "true").strip().lower()
-        in {"1", "true", "yes"},
+        proxy_geo_probe=_env_bool("PROXY_GEO_PROBE", True),
         proxy_geo_probe_url=os.environ.get(
             "PROXY_GEO_PROBE_URL", "http://ip-api.com/json"
         ),
         browser_runtime=os.environ.get("BROWSER_RUNTIME", "chromium").strip().lower(),
-        browser_runtime_strict=os.environ.get("BROWSER_RUNTIME_STRICT", "false")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        camoufox_humanize=os.environ.get("CAMOUFOX_HUMANIZE", "true").strip().lower()
-        in {"1", "true", "yes"},
-        camoufox_block_webrtc=os.environ.get("CAMOUFOX_BLOCK_WEBRTC", "true")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
+        browser_runtime_strict=_env_bool("BROWSER_RUNTIME_STRICT", False),
+        camoufox_humanize=_env_bool("CAMOUFOX_HUMANIZE", True),
+        camoufox_block_webrtc=_env_bool("CAMOUFOX_BLOCK_WEBRTC", True),
         camoufox_os=os.environ.get("CAMOUFOX_OS", "").strip(),
         # WP5: enterprise residential-proxy enforcement (default on; set to
         # "false"/"0" to relax for tests / dev).
-        enterprise_require_residential=os.environ.get(
-            "ENTERPRISE_REQUIRE_RESIDENTIAL", "true"
-        )
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        enterprise_fresh_context=os.environ.get(
-            "ENTERPRISE_FRESH_CONTEXT", "true"
-        )
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        enterprise_require_hardened_runtime=os.environ.get(
-            "ENTERPRISE_REQUIRE_HARDENED_RUNTIME", "false"
-        )
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        enterprise_require_residential_on_task=os.environ.get(
-            "ENTERPRISE_REQUIRE_RESIDENTIAL_ON_TASK", "false"
-        )
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        pool_egress_expose_credentials=os.environ.get(
-            "POOL_EGRESS_EXPOSE_CREDENTIALS", "false"
-        )
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
+        enterprise_require_residential=_env_bool("ENTERPRISE_REQUIRE_RESIDENTIAL", True),
+        enterprise_fresh_context=_env_bool("ENTERPRISE_FRESH_CONTEXT", True),
+        enterprise_require_hardened_runtime=_env_bool(
+            "ENTERPRISE_REQUIRE_HARDENED_RUNTIME", False
+        ),
+        enterprise_require_residential_on_task=_env_bool(
+            "ENTERPRISE_REQUIRE_RESIDENTIAL_ON_TASK", False
+        ),
+        pool_egress_expose_credentials=_env_bool(
+            "POOL_EGRESS_EXPOSE_CREDENTIALS", False
+        ),
         # Token-trust verification (opt-in)
-        token_verify_enabled=os.environ.get("TOKEN_VERIFY_ENABLED", "false")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
+        token_verify_enabled=_env_bool("TOKEN_VERIFY_ENABLED", False),
         token_verify_secrets=os.environ.get("TOKEN_VERIFY_SECRETS", ""),
         token_verify_timeout=float(os.environ.get("TOKEN_VERIFY_TIMEOUT", "10.0")),
         # Human behavior / real-page mode
-        hcaptcha_real_page=os.environ.get("HCAPTCHA_REAL_PAGE", "false").strip().lower()
-        in {"1", "true", "yes"},
-        turnstile_real_page=os.environ.get("TURNSTILE_REAL_PAGE", "false")
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
-        human_mouse_enabled=os.environ.get("HUMAN_MOUSE_ENABLED", "true").strip().lower()
-        in {"1", "true", "yes"},
+        hcaptcha_real_page=_env_bool("HCAPTCHA_REAL_PAGE", False),
+        turnstile_real_page=_env_bool("TURNSTILE_REAL_PAGE", False),
+        human_mouse_enabled=_env_bool("HUMAN_MOUSE_ENABLED", True),
         human_mouse_jitter_ms=int(os.environ.get("HUMAN_MOUSE_JITTER_MS", "80")),
         human_passive_motion_seconds=float(
             os.environ.get("HUMAN_PASSIVE_MOTION_SECONDS", "1.4")
@@ -487,12 +452,7 @@ def load_config() -> Config:
             os.environ.get("HCAPTCHA_INVISIBLE_PASSIVE_BUDGET", "4.0")
         ),
         hcaptcha_rqdata_ttl=float(os.environ.get("HCAPTCHA_RQDATA_TTL", "30.0")),
-        hcaptcha_device_persistence=os.environ.get(
-            "HCAPTCHA_DEVICE_PERSISTENCE", "false"
-        )
-        .strip()
-        .lower()
-        in {"1", "true", "yes"},
+        hcaptcha_device_persistence=_env_bool("HCAPTCHA_DEVICE_PERSISTENCE", False),
         # State backend
         redis_url=os.environ.get("REDIS_URL", "").strip() or None,
         # Billing / budget
@@ -503,6 +463,40 @@ def load_config() -> Config:
         ),
         accounting_window=int(os.environ.get("ACCOUNTING_WINDOW", "100")),
     )
+
+
+def config_warnings(cfg: Config) -> list[str]:
+    """Return operator-facing warnings about a suspicious / unconfigured setup.
+
+    Emitted once at startup (see ``src/main.py``) rather than raised, so the
+    service still boots with defaults but an operator is told when a default is
+    a placeholder that will fail at solve time, or when the service is wide
+    open with a large advertised balance.
+    """
+    warnings: list[str] = []
+
+    if cfg.cloud_base_url == _PLACEHOLDER_CLOUD_BASE_URL:
+        warnings.append(
+            "CLOUD_BASE_URL is unset and still points at the placeholder "
+            f"'{_PLACEHOLDER_CLOUD_BASE_URL}'; cloud model calls will fail. "
+            "Set CLOUD_BASE_URL (or CAPTCHA_BASE_URL)."
+        )
+    if not cfg.cloud_api_key:
+        warnings.append(
+            "CLOUD_API_KEY is empty; authenticated cloud model calls will fail. "
+            "Set CLOUD_API_KEY (or CAPTCHA_API_KEY)."
+        )
+
+    # Fully-open service (no CLIENT_KEY) advertising a large balance is a
+    # footgun: anyone can spend against it. Warn loudly.
+    if cfg.client_key is None and cfg.account_balance_usd >= 1000.0:
+        warnings.append(
+            "CLIENT_KEY is unset — the service is FULLY OPEN (no auth) while "
+            f"getBalance advertises ${cfg.account_balance_usd:,.0f}. Set "
+            "CLIENT_KEY to require a key, or lower ACCOUNT_BALANCE_USD."
+        )
+
+    return warnings
 
 
 def _optional_float(value: str | None) -> float | None:

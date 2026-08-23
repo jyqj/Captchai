@@ -9,7 +9,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from .api.routes import router
-from .core.config import config
+from .core.config import config, config_warnings
 from .core.services import SolverServices, set_services
 from .core.task_types import Provider, types_for_provider
 from .services.browser import BrowserManager
@@ -41,6 +41,11 @@ _IMAGE_TEXT_TYPES = types_for_provider(Provider.IMAGE_TO_TEXT)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── startup ──
+    # Surface suspicious configuration (placeholder model endpoint, open service
+    # advertising a large balance) once, loudly, rather than failing mid-solve.
+    for warning in config_warnings(config):
+        log.warning("CONFIG: %s", warning)
+
     # One Chromium process shared by every browser-based solver. Each solve
     # still gets an isolated context (with its own proxy/UA), but we avoid
     # launching four separate browsers.
