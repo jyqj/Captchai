@@ -41,11 +41,12 @@ jobs:
       - name: Check docs bilingual parity
         run: python scripts/check_docs_parity.py
 
-      # Type check — src/ at standard mode; tests relax fake-object rules via
-      # executionEnvironments in pyrightconfig.json.
+      # Type check — src/ and tests at standard mode. The pyright version is
+      # pinned so a new release tightening a check can't turn CI red without a
+      # deliberate bump here (reproducible type-check gate).
       - name: Type check (pyright)
         run: |
-          pip install pyright
+          pip install pyright==1.1.411
           pyright
 
       - name: Build docs (strict)
