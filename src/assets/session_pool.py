@@ -66,6 +66,22 @@ async def _maybe_await_close(context: Any) -> None:
         pass
 
 
+async def _run_cleanup_uninterruptibly(cleanup: Awaitable[Any]) -> Any:
+    """Finish ownership cleanup before propagating caller cancellation.
+
+    Browser-context close operations update pool capacity only after the real
+    resource is gone. Shielding the cleanup task prevents a cancelled request
+    or shutdown from leaking a context or leaving ``_closing`` permanently
+    non-zero. Cancellation is still propagated once cleanup has completed.
+    """
+    task = asyncio.ensure_future(cleanup)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
 class SessionPool:
     """Bounded, cancellation-safe pool of reusable browser sessions.
 
@@ -162,7 +178,9 @@ class SessionPool:
 
         try:
             if evicted is not None:
-                await _maybe_await_close(evicted.context)
+                await _run_cleanup_uninterruptibly(
+                    _maybe_await_close(evicted.context)
+                )
                 evicted.warm = False
 
             fingerprint = generate_fingerprint(
@@ -196,12 +214,14 @@ class SessionPool:
 
         # Shutdown raced with context construction. Keep the reservation counted
         # until the context is actually closed so close_all() can wait for it.
-        await _maybe_await_close(context)
-        session.warm = False
-        async with self._condition:
-            self._creating -= 1
-            self._live -= 1
-            self._condition.notify_all()
+        try:
+            await _run_cleanup_uninterruptibly(_maybe_await_close(context))
+        finally:
+            session.warm = False
+            async with self._condition:
+                self._creating -= 1
+                self._live -= 1
+                self._condition.notify_all()
         raise RuntimeError("session pool is closed")
 
     async def _abandon_reservation(self) -> None:
@@ -301,11 +321,15 @@ class SessionPool:
             self._condition.notify_all()
 
         if retire:
-            await _maybe_await_close(session.context)
-            async with self._condition:
-                self._closing -= 1
-                self._live -= 1
-                self._condition.notify_all()
+            try:
+                await _run_cleanup_uninterruptibly(
+                    _maybe_await_close(session.context)
+                )
+            finally:
+                async with self._condition:
+                    self._closing -= 1
+                    self._live -= 1
+                    self._condition.notify_all()
 
     async def close_all(self) -> None:
         """Permanently close the pool and every context it owns.
@@ -322,17 +346,24 @@ class SessionPool:
                 sessions.extend(bucket)
             self._idle.clear()
             self._in_use.clear()
-            self._live -= len(sessions)
             self._closing += len(sessions)
             self._condition.notify_all()
 
-        for session in sessions:
-            await _maybe_await_close(session.context)
-            session.warm = False
+        try:
+            await _run_cleanup_uninterruptibly(
+                asyncio.gather(
+                    *(_maybe_await_close(session.context) for session in sessions)
+                )
+            )
+        finally:
+            for session in sessions:
+                session.warm = False
+            async with self._condition:
+                self._closing -= len(sessions)
+                self._live -= len(sessions)
+                self._condition.notify_all()
 
         async with self._condition:
-            self._closing -= len(sessions)
-            self._condition.notify_all()
             while self._creating > 0 or self._closing > 0:
                 await self._condition.wait()
 

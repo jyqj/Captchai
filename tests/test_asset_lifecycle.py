@@ -169,6 +169,52 @@ def test_retirement_releases_capacity_only_after_context_closes() -> None:
     asyncio.run(run())
 
 
+def test_cancelled_retirement_finishes_cleanup_and_restores_capacity() -> None:
+    """Cancellation cannot strand a closing context or its capacity slot."""
+
+    async def run() -> None:
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        calls = 0
+
+        class SlowContext(_Context):
+            async def close(self) -> None:
+                close_started.set()
+                await allow_close.wait()
+                await super().close()
+
+        async def factory(fingerprint, proxy):
+            nonlocal calls
+            calls += 1
+            context = SlowContext() if calls == 1 else _Context()
+            return context, fingerprint.user_agent
+
+        pool = SessionPool(factory, size=1, max_solves=1)
+        first = await pool.checkout(key="proxyless")
+        retiring = asyncio.create_task(pool.release(first, success=True))
+        await close_started.wait()
+        retiring.cancel()
+        await asyncio.sleep(0)
+        assert not retiring.done()
+        assert pool.stats()["live"] == 1
+        assert pool.stats()["closing"] == 1
+
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await retiring
+        assert first.context.closed
+        assert pool.stats()["live"] == 0
+        assert pool.stats()["closing"] == 0
+
+        replacement = await asyncio.wait_for(
+            pool.checkout(key="proxyless"), timeout=0.25
+        )
+        await pool.close_all()
+        assert replacement.context.closed
+
+    asyncio.run(run())
+
+
 def test_configured_proxy_identity_is_stable_and_secret_safe() -> None:
     first = proxy_from_params(
         {"proxy": "http://user:pass@gateway.example:8080|kind=residential"}
