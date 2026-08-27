@@ -1,14 +1,14 @@
-"""Model pool: lazily-built local + cloud OpenAI-compatible clients.
+"""Lazily-built local and cloud OpenAI-compatible model clients.
 
-Wraps ``openai.AsyncOpenAI`` behind a small ``ModelClient`` so the parsing /
-routing layer never touches the SDK directly.  A ``client_factory`` seam lets
-tests inject a fake ``AsyncOpenAI`` whose ``.chat.completions.create(...)`` is
-awaitable, keeping the whole stack off the network.
+The pool owns the SDK clients and their underlying HTTP connection pools. It is
+therefore also responsible for closing them during application shutdown; model
+callers only depend on the small ``ModelClient`` surface.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -27,45 +27,48 @@ class ModelUsage:
         )
 
 
-# A client factory takes (base_url, api_key) and returns an object exposing
-# ``.chat.completions.create(...)`` as an awaitable — i.e. openai.AsyncOpenAI.
 ClientFactory = Callable[[str, str], Any]
 
 
 def _default_client_factory(base_url: str, api_key: str) -> Any:
-    # Imported lazily so importing this module (e.g. in tests) never requires
-    # the openai package or valid credentials.
+    # Imported lazily so importing this module in tests does not require a live
+    # endpoint or valid credentials.
     from openai import AsyncOpenAI
 
     return AsyncOpenAI(base_url=base_url, api_key=api_key)
 
 
+async def _close_client(client: Any) -> None:
+    """Close an async/sync SDK client using its supported close convention."""
+    closer = getattr(client, "aclose", None)
+    if closer is None:
+        closer = getattr(client, "close", None)
+    if closer is None:
+        return
+    result = closer()
+    if inspect.isawaitable(result):
+        await result
+
+
 @dataclass
 class ModelClient:
-    """A single logical backend (``local`` or ``cloud``).
-
-    The underlying AsyncOpenAI-compatible client is created lazily on first use
-    via ``client_factory`` and cached on the instance.
-    """
+    """One logical model backend (``local`` or ``cloud``)."""
 
     name: str
     model: str
     base_url: str
     api_key: str
     client_factory: ClientFactory = field(default=_default_client_factory, repr=False)
-    # Max concurrent in-flight calls to this backend (0 = unlimited). Bounds the
-    # ``browser_concurrency × vote_samples`` fan-out so a burst of solves (each
-    # voting several samples concurrently) can't overrun a rate-limited cloud
-    # provider. The semaphore is created lazily so a ModelClient can be built
-    # outside a running event loop (Python 3.9 binds Semaphore to the loop at
-    # construction).
     max_concurrency: int = 0
     _client: Optional[Any] = field(default=None, repr=False, compare=False)
     _sem: Optional[asyncio.Semaphore] = field(
         default=None, repr=False, compare=False
     )
+    _closed: bool = field(default=False, repr=False, compare=False)
 
     def _raw(self) -> Any:
+        if self._closed:
+            raise RuntimeError(f"model client {self.name!r} is closed")
         if self._client is None:
             self._client = self.client_factory(self.base_url, self.api_key)
         return self._client
@@ -85,13 +88,7 @@ class ModelClient:
         max_tokens: int = 512,
         timeout: "float | None" = None,
     ) -> "tuple[str, ModelUsage]":
-        """Run a chat completion and return ``(content_text, usage)``.
-
-        Reads ``response.usage.prompt_tokens`` / ``completion_tokens`` when the
-        backend reports them; otherwise falls back to zeros. Concurrency is
-        bounded by ``max_concurrency`` (via a lazily-created semaphore) so a
-        voting fan-out can't overrun a rate-limited backend.
-        """
+        """Run a chat completion and return ``(content_text, usage)``."""
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -108,9 +105,7 @@ class ModelClient:
         else:
             response = await self._raw().chat.completions.create(**kwargs)
 
-        content = _extract_content(response)
-        usage = _extract_usage(response)
-        return content, usage
+        return _extract_content(response), _extract_usage(response)
 
     async def transcribe_audio(
         self,
@@ -120,15 +115,7 @@ class ModelClient:
         filename: str = "audio.mp3",
         timeout: "float | None" = None,
     ) -> "tuple[str, ModelUsage]":
-        """Transcribe audio via the OpenAI-compatible ``audio.transcriptions`` API.
-
-        Uses the dedicated speech-to-text endpoint (Whisper-family), NOT a chat
-        completion with the mp3 stuffed into an ``image_url`` (which the prior
-        reCAPTCHA path did — a text/vision model can't decode audio that way).
-        ``model`` overrides the client's default so a chat backend can still be
-        pointed at a transcription model. Bounded by the same concurrency
-        semaphore as ``chat``. Returns ``(text, usage)``.
-        """
+        """Transcribe audio via the OpenAI-compatible transcription endpoint."""
         kwargs: dict = {
             "model": model or self.model,
             "file": (filename, audio_bytes),
@@ -148,6 +135,16 @@ class ModelClient:
             text = response.get("text")
         return (text or "").strip(), _extract_usage(response)
 
+    async def close(self) -> None:
+        """Close the underlying SDK/HTTP client exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        client, self._client = self._client, None
+        self._sem = None
+        if client is not None:
+            await _close_client(client)
+
 
 def _extract_content(response: Any) -> str:
     try:
@@ -165,7 +162,6 @@ def _extract_usage(response: Any) -> ModelUsage:
         return ModelUsage()
     prompt = getattr(usage, "prompt_tokens", None)
     completion = getattr(usage, "completion_tokens", None)
-    # Some backends expose usage as a mapping.
     if prompt is None and isinstance(usage, dict):
         prompt = usage.get("prompt_tokens")
     if completion is None and isinstance(usage, dict):
@@ -177,12 +173,12 @@ def _extract_usage(response: Any) -> ModelUsage:
 
 
 class ModelPool:
-    """Holds the local + cloud ``ModelClient`` instances built from ``Config``."""
+    """Own the local and cloud ``ModelClient`` instances built from ``Config``."""
 
     def __init__(self, config, client_factory: "ClientFactory | None" = None) -> None:
         self._config = config
         factory = client_factory if client_factory is not None else _default_client_factory
-        self._clients: dict = {
+        self._clients: dict[str, ModelClient] = {
             "local": ModelClient(
                 name="local",
                 model=config.local_model,
@@ -216,3 +212,16 @@ class ModelPool:
     @property
     def cloud(self) -> ModelClient:
         return self._clients["cloud"]
+
+    async def close(self) -> None:
+        """Close both backends, attempting every client even if one fails."""
+        results = await asyncio.gather(
+            *(client.close() for client in self._clients.values()),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise RuntimeError(
+                "one or more model clients failed to close: "
+                + "; ".join(str(exc) for exc in failures)
+            )
