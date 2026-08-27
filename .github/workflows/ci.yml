@@ -34,10 +34,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -54,15 +54,38 @@ jobs:
         run: python -m compileall -q src
 
       - name: Run tests
-        env:
-          TEST_REDIS_URL: redis://localhost:6379/15
         run: pytest -q
 
       - name: Type-check changed asset surfaces
+        if: ${{ matrix.python-version == '3.12' }}
         run: >-
           pyright
           src/assets/session_pool.py
           src/assets/model_pool.py
           src/assets/inventory.py
           src/core/services.py
+          src/consumption/budget.py
           src/consumption/token_verify.py
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: Install docs dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-docs.txt
+
+      - name: Build docs
+        run: mkdocs build --strict

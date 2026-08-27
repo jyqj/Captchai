@@ -7,9 +7,13 @@ Thanks for contributing to CaptchAI.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 playwright install --with-deps chromium
 ```
+
+`requirements.txt` is intentionally runtime-only. Development and documentation
+tooling live in `requirements-dev.txt` and `requirements-docs.txt` so production
+images do not carry test or MkDocs dependency trees.
 
 ## Run the project locally
 
@@ -19,21 +23,24 @@ python main.py
 
 ## Validate changes
 
-Run tests:
+The full suite includes Redis-backed persistence tests. Start a disposable Redis
+instance before running it locally:
 
 ```bash
-pytest tests/
+docker run --rm -p 6379:6379 redis:7.4-alpine
+pytest -q
 ```
 
 Run type checks:
 
 ```bash
-npx pyright
+pyright
 ```
 
-Build docs:
+Build docs in an environment with the documentation dependency set installed:
 
 ```bash
+pip install -r requirements-docs.txt
 mkdocs build --strict
 ```
 

@@ -70,11 +70,12 @@ class SessionPool:
     """Bounded, cancellation-safe pool of reusable browser sessions.
 
     ``_live`` counts all capacity already reserved by the pool: idle sessions,
-    checked-out sessions, and contexts currently being constructed. A waiter is
-    notified whenever an idle session appears or capacity is freed. This is the
-    key invariant that the previous semaphore-only implementation could not
-    express: returning a reusable session does not reduce ``_live``, but it must
-    still wake a waiter so that waiter can claim the newly-idle asset.
+    checked-out sessions, contexts currently being constructed, and contexts
+    still closing. A waiter is notified whenever an idle session appears or
+    capacity is truly freed. This is the key invariant that the previous
+    semaphore-only implementation could not express: returning a reusable
+    session does not reduce ``_live``, but it must still wake a waiter so that
+    waiter can claim the newly-idle asset.
     """
 
     def __init__(
@@ -151,8 +152,8 @@ class SessionPool:
                     self._creating += 1
                     break
 
-                # Full and all assets are checked out. Wait for either a normal
-                # release (idle hand-off), a retirement (capacity), or shutdown.
+                # Full and all assets are checked out or closing. Wait for an
+                # idle hand-off, genuinely-freed capacity, or shutdown.
                 self._waiters += 1
                 try:
                     await self._condition.wait()
@@ -265,8 +266,10 @@ class SessionPool:
 
         Duplicate or late releases are harmless: only the exact object currently
         recorded in ``_in_use`` can mutate pool state. A reusable release wakes
-        checkout waiters even though live capacity is unchanged; retirement
-        decrements ``_live`` and also wakes them.
+        checkout waiters even though live capacity is unchanged. Retirement
+        keeps its slot reserved until the browser context has actually closed,
+        then frees capacity and wakes waiters; this prevents transient
+        oversubscription of expensive browser contexts.
         """
         del burned  # reputation/max-solves policy is authoritative
         retire = False
@@ -290,7 +293,6 @@ class SessionPool:
             )
             if retire:
                 session.warm = False
-                self._live -= 1
                 self._closing += 1
             else:
                 session.warm = True
@@ -302,6 +304,7 @@ class SessionPool:
             await _maybe_await_close(session.context)
             async with self._condition:
                 self._closing -= 1
+                self._live -= 1
                 self._condition.notify_all()
 
     async def close_all(self) -> None:

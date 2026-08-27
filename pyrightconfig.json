@@ -8,7 +8,5 @@
     "."
   ],
   "stubPath": "typings",
-  "venvPath": ".",
-  "venv": ".venv",
   "typeCheckingMode": "standard"
 }

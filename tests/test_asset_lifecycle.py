@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
@@ -124,6 +123,48 @@ def test_duplicate_release_is_idempotent() -> None:
         assert session.solves == 1
         assert pool.stats()["idle"] == 1
         await pool.close_all()
+
+    asyncio.run(run())
+
+
+def test_retirement_releases_capacity_only_after_context_closes() -> None:
+    """A slow browser close must not let the pool transiently exceed its cap."""
+
+    async def run() -> None:
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        calls = 0
+
+        class SlowContext(_Context):
+            async def close(self) -> None:
+                close_started.set()
+                await allow_close.wait()
+                await super().close()
+
+        async def factory(fingerprint, proxy):
+            nonlocal calls
+            calls += 1
+            context = SlowContext() if calls == 1 else _Context()
+            return context, fingerprint.user_agent
+
+        pool = SessionPool(factory, size=1, max_solves=1)
+        first = await pool.checkout(key="proxyless")
+        retiring = asyncio.create_task(pool.release(first, success=True))
+        await close_started.wait()
+
+        assert pool.stats()["live"] == 1
+        assert pool.stats()["closing"] == 1
+        waiter = asyncio.create_task(pool.checkout(key="proxyless"))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert calls == 1
+
+        allow_close.set()
+        await retiring
+        second = await asyncio.wait_for(waiter, timeout=0.25)
+        assert calls == 2
+        await pool.close_all()
+        assert second.context.closed
 
     asyncio.run(run())
 
