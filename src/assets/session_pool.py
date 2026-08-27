@@ -71,8 +71,8 @@ async def _run_cleanup_uninterruptibly(cleanup: Awaitable[Any]) -> Any:
 
     Browser-context close operations update pool capacity only after the real
     resource is gone. Shielding the cleanup task prevents a cancelled request
-    or shutdown from leaking a context or leaving ``_closing`` permanently
-    non-zero. Cancellation is still propagated once cleanup has completed.
+    or shutdown from leaking a context or leaving lifecycle counters stuck.
+    Cancellation is still propagated once cleanup has completed.
     """
     task = asyncio.ensure_future(cleanup)
     try:
@@ -136,9 +136,9 @@ class SessionPool:
         an idle session, the least-valuable idle asset is retired and replaced
         in-place, preserving the global size bound.
 
-        Context construction is cancellation-safe: capacity is reserved before
-        leaving the lock, and any factory error or cancellation gives that
-        reservation back and wakes another waiter.
+        Context construction and publication are cancellation-safe: capacity is
+        reserved before leaving the lock, and a context that cannot be published
+        to ``_in_use`` is closed before its reservation is returned.
         """
         del sitekey  # accepted for call-site compatibility; not used for selection
         bucket_key = key or (proxy.id if proxy is not None else PROXYLESS_KEY)
@@ -190,59 +190,120 @@ class SessionPool:
                 mobile=bool(proxy and getattr(proxy, "kind", None) == "mobile"),
             )
             context, user_agent = await self._factory(fingerprint, proxy)
+            session = BrowserSession(
+                id=str(uuid.uuid4()),
+                context=context,
+                fingerprint=fingerprint,
+                proxy=proxy,
+                user_agent=user_agent,
+                created_at=time.monotonic(),
+                warm=True,
+                bucket_key=bucket_key,
+            )
         except BaseException:
-            await self._abandon_reservation()
+            await _run_cleanup_uninterruptibly(self._rollback_creation())
             raise
 
-        session = BrowserSession(
-            id=str(uuid.uuid4()),
-            context=context,
-            fingerprint=fingerprint,
-            proxy=proxy,
-            user_agent=user_agent,
-            created_at=time.monotonic(),
-            warm=True,
-            bucket_key=bucket_key,
-        )
+        return await self._publish_created_session(session)
 
-        async with self._condition:
+    async def _publish_created_session(
+        self, session: BrowserSession
+    ) -> BrowserSession:
+        """Atomically publish a built context or dispose of it on cancellation.
+
+        The condition is acquired manually rather than with ``async with`` so
+        there is no cancellation point after the session is inserted into
+        ``_in_use`` and before it is returned to the caller.
+        """
+        try:
+            await self._condition.acquire()
+        except BaseException:
+            session.warm = False
+            await _run_cleanup_uninterruptibly(
+                self._rollback_creation(session.context)
+            )
+            raise
+
+        try:
             if not self._closed:
                 self._creating -= 1
                 self._in_use[session.id] = session
                 self._condition.notify_all()
                 return session
-
-        # Shutdown raced with context construction. Keep the reservation counted
-        # until the context is actually closed so close_all() can wait for it.
-        try:
-            await _run_cleanup_uninterruptibly(_maybe_await_close(context))
         finally:
-            session.warm = False
-            async with self._condition:
-                self._creating -= 1
-                self._live -= 1
-                self._condition.notify_all()
+            self._condition.release()
+
+        # Shutdown raced with publication. Dispose of the unpublished context
+        # and return its live reservation before reporting the terminal state.
+        session.warm = False
+        await _run_cleanup_uninterruptibly(
+            self._rollback_creation(session.context)
+        )
         raise RuntimeError("session pool is closed")
 
-    async def _abandon_reservation(self) -> None:
-        """Return a failed/cancelled construction reservation to the pool."""
+    async def _rollback_creation(self, context: Any = None) -> None:
+        """Close an unpublished context and return its creation reservation."""
+        if context is not None:
+            await _maybe_await_close(context)
         async with self._condition:
             self._creating -= 1
             self._live -= 1
             self._condition.notify_all()
 
     async def prewarm(self, *, sitekey: Optional[str] = None) -> int:
-        """Create idle proxyless sessions up to the configured pool size."""
+        """Create idle proxyless sessions without consuming solve lifetime."""
         del sitekey  # accepted for call-site compatibility
-        sessions = await asyncio.gather(
-            *[
-                self.checkout(key=PROXYLESS_KEY, proxy=None)
-                for _ in range(self._size)
-            ]
+        tasks = [
+            asyncio.create_task(self.checkout(key=PROXYLESS_KEY, proxy=None))
+            for _ in range(self._size)
+        ]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            # ``gather`` cancellation can leave some children already completed
+            # with live leases. Reclaim every successful result before
+            # propagating the startup cancellation/failure.
+            await _run_cleanup_uninterruptibly(
+                self._cancel_and_reclaim_prewarm(tasks)
+            )
+            raise
+
+        sessions = [r for r in results if isinstance(r, BrowserSession)]
+        await asyncio.gather(
+            *(
+                self._release(
+                    session,
+                    success=True,
+                    count_solve=False,
+                )
+                for session in sessions
+            )
         )
-        for session in sessions:
-            await self.release(session, success=True)
+
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures:
+            raise failures[0]
         return len(sessions)
+
+    async def _cancel_and_reclaim_prewarm(
+        self, tasks: List["asyncio.Task[BrowserSession]"]
+    ) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        sessions = [r for r in results if isinstance(r, BrowserSession)]
+        if sessions:
+            await asyncio.gather(
+                *(
+                    self._release(
+                        session,
+                        success=True,
+                        count_solve=False,
+                    )
+                    for session in sessions
+                )
+            )
 
     def _ensure_open_locked(self) -> None:
         if self._closed:
@@ -282,7 +343,18 @@ class SessionPool:
     async def release(
         self, session: BrowserSession, *, success: bool, burned: bool = False
     ) -> None:
-        """Return a checked-out session, or retire it when policy requires.
+        """Return a checked-out session, or retire it when policy requires."""
+        del burned  # reputation/max-solves policy is authoritative
+        await self._release(session, success=success, count_solve=True)
+
+    async def _release(
+        self,
+        session: BrowserSession,
+        *,
+        success: bool,
+        count_solve: bool,
+    ) -> None:
+        """Internal release with a prewarm path that does not count as a solve.
 
         Duplicate or late releases are harmless: only the exact object currently
         recorded in ``_in_use`` can mutate pool state. A reusable release wakes
@@ -291,7 +363,6 @@ class SessionPool:
         then frees capacity and wakes waiters; this prevents transient
         oversubscription of expensive browser contexts.
         """
-        del burned  # reputation/max-solves policy is authoritative
         retire = False
 
         async with self._condition:
@@ -300,11 +371,12 @@ class SessionPool:
                 return
             self._in_use.pop(session.id, None)
 
-            session.solves += 1
-            if success:
-                session.reputation = min(1.0, session.reputation + 0.05)
-            else:
-                session.reputation = max(0.0, session.reputation - 0.4)
+            if count_solve:
+                session.solves += 1
+                if success:
+                    session.reputation = min(1.0, session.reputation + 0.05)
+                else:
+                    session.reputation = max(0.0, session.reputation - 0.4)
 
             retire = (
                 self._closed
@@ -321,22 +393,23 @@ class SessionPool:
             self._condition.notify_all()
 
         if retire:
-            try:
-                await _run_cleanup_uninterruptibly(
-                    _maybe_await_close(session.context)
-                )
-            finally:
-                async with self._condition:
-                    self._closing -= 1
-                    self._live -= 1
-                    self._condition.notify_all()
+            await _run_cleanup_uninterruptibly(
+                self._finish_retirement(session)
+            )
+
+    async def _finish_retirement(self, session: BrowserSession) -> None:
+        await _maybe_await_close(session.context)
+        async with self._condition:
+            self._closing -= 1
+            self._live -= 1
+            self._condition.notify_all()
 
     async def close_all(self) -> None:
         """Permanently close the pool and every context it owns.
 
         Blocked checkouts are woken and fail with ``RuntimeError``. Contexts that
         are still being constructed are allowed to finish their cancellation/
-        cleanup path; this method waits until all creation and retirement work
+        cleanup path. This method waits until all creation and retirement work
         has released its reservation, making shutdown deterministic.
         """
         async with self._condition:
@@ -349,21 +422,23 @@ class SessionPool:
             self._closing += len(sessions)
             self._condition.notify_all()
 
-        try:
-            await _run_cleanup_uninterruptibly(
-                asyncio.gather(
-                    *(_maybe_await_close(session.context) for session in sessions)
-                )
-            )
-        finally:
-            for session in sessions:
-                session.warm = False
-            async with self._condition:
-                self._closing -= len(sessions)
-                self._live -= len(sessions)
-                self._condition.notify_all()
+        await _run_cleanup_uninterruptibly(
+            self._close_sessions_and_wait(sessions)
+        )
+
+    async def _close_sessions_and_wait(
+        self, sessions: List[BrowserSession]
+    ) -> None:
+        await asyncio.gather(
+            *(_maybe_await_close(session.context) for session in sessions)
+        )
+        for session in sessions:
+            session.warm = False
 
         async with self._condition:
+            self._closing -= len(sessions)
+            self._live -= len(sessions)
+            self._condition.notify_all()
             while self._creating > 0 or self._closing > 0:
                 await self._condition.wait()
 
