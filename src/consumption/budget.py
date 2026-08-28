@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
-from src.consumption.ledger import CostLedger
+
+class CostReader(Protocol):
+    """Minimal ledger surface needed for budget decisions.
+
+    Both the in-memory and Redis ledgers satisfy this protocol. Depending on
+    behavior rather than the concrete in-memory implementation keeps backend
+    selection type-safe and avoids casts at the application composition root.
+    """
+
+    async def total_cost_usd(self, client_key: str | None = None) -> float: ...
 
 
 @dataclass
@@ -19,7 +29,7 @@ class BudgetGuard:
 
     def __init__(
         self,
-        ledger: CostLedger,
+        ledger: CostReader,
         *,
         global_cap_usd: float | None = None,
         per_client_cap_usd: float | None = None,

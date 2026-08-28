@@ -1,19 +1,15 @@
+# Runtime dependencies only. Development and documentation tooling live in
+# requirements-dev.txt and requirements-docs.txt so production images do not
+# carry pytest/MkDocs and their transitive dependency trees.
 fastapi==0.119.0
 uvicorn[standard]==0.32.1
 httpx==0.28.1
 pydantic==2.10.4
-pytest==8.3.5
 playwright==1.61.0
 openai==1.82.0
 Pillow==11.1.0
-mkdocs==1.6.1
-mkdocs-material==9.6.7
-mkdocs-redirects==1.2.2
-mkdocs-static-i18n==1.3.0
-pymdown-extensions==10.14.3
+redis==8.1.0
 
-# ── Optional hardened runtime (BROWSER_RUNTIME=camoufox) ──
-# Camoufox is a large, optional dependency (pulls a patched Firefox build).
-# Install only when you need it for enterprise hCaptcha / tough anti-bot:
+# Optional hardened runtime (BROWSER_RUNTIME=camoufox):
 #   pip install camoufox==0.4.11 && python -m camoufox fetch
 # camoufox==0.4.11

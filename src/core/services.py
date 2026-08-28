@@ -1,17 +1,21 @@
-"""Composition root: build and hold the shared asset / consumption / vision layers.
+"""Composition root for shared asset, consumption, and vision services.
 
-Solvers no longer own their model client or build their own pools. Instead a
-single :class:`SolverServices` is constructed at startup and injected into the
-solvers, so the ledger, budget guard, success accounting, model/vision router,
-proxy pool and warm session pool are shared process-wide and can be surfaced
-by admin/metrics endpoints.
+``SolverServices`` is the owner of process-wide clients, pools, and ledgers.
+Production startup goes through :meth:`SolverServices.create`, which makes
+construction transactional: if a late backend or inventory step fails, every
+resource acquired earlier is still reachable and is closed before the original
+exception is re-raised.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
-from typing import Optional
+import os
+from typing import Any, Optional
 
+from ..assets.inventory import inventory_proxy_id
 from ..assets.model_pool import ModelPool
 from ..assets.proxy_pool import build_proxy_pool, proxy_from_params
 from ..assets.session_pool import SessionPool
@@ -25,48 +29,97 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 
+async def _close_owned_resource(name: str, resource: Any) -> None:
+    """Best-effort close for resources exposing ``aclose`` or ``close``.
+
+    One backend failure must not prevent later resources from being drained.
+    """
+
+    if resource is None:
+        return
+    closer = getattr(resource, "aclose", None)
+    if closer is None:
+        closer = getattr(resource, "close", None)
+    if closer is None:
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:  # noqa: BLE001 - shutdown must drain the full graph
+        log.exception("Failed to close owned resource %s", name)
+
+
 class SolverServices:
-    """Container for every shared cross-cutting service."""
+    """Container and lifecycle owner for cross-cutting solver services."""
 
     def __init__(self, config: Config) -> None:
-        self.config = config
+        """Build synchronously for tests and compatibility.
 
-        # Consumption plane. Each backend uses build_* so a Redis backend is
-        # selected when REDIS_URL is set — otherwise a restart zeroes spend,
-        # routing stats, and proxy health. The in-memory path is byte-for-byte
-        # equivalent to the pre-WP7 behavior (default when REDIS_URL unset).
-        self.ledger = build_ledger(config)
+        Application startup should use :meth:`create` so a constructor failure
+        can be followed by asynchronous cleanup of already-created resources.
+        """
+
+        self._initialize_state(config)
+        self._build_components()
+        self._load_proxy_inventory()
+
+    def _initialize_state(self, config: Config) -> None:
+        """Install close-safe defaults before constructing any component."""
+
+        self.config = config
+        self.ledger: Any = None
+        self.budget: Any = None
+        self.accounting: Any = None
+        self.token_verifier: Any = None
+        self.model_pool: Any = None
+        self.vision_router: Any = None
+        self.proxy_pool: Any = None
+        self.session_pool: Optional[SessionPool] = None
+        # BrowserManager is attached but owned/stopped by main.lifespan.
+        self.browser_manager: Any = None
+        self._close_task: Optional[asyncio.Task[None]] = None
+
+    def _build_components(self) -> None:
+        """Construct the process-wide dependency graph in ownership order."""
+
+        self.ledger = build_ledger(self.config)
         self.budget = BudgetGuard(
             self.ledger,
-            global_cap_usd=config.budget_global_cap_usd,
-            per_client_cap_usd=config.budget_per_client_cap_usd,
+            global_cap_usd=self.config.budget_global_cap_usd,
+            per_client_cap_usd=self.config.budget_per_client_cap_usd,
         )
-        self.accounting = build_accounting(config)
-        # Optional token-trust verification (off unless TOKEN_VERIFY_ENABLED +
-        # secrets are configured). When present, the browser solvers verify a
-        # minted token against the provider's siteverify endpoint and close the
-        # real-outcome loop automatically instead of waiting on the caller's
-        # /reportCorrect. ``None`` = the pre-existing caller-driven behaviour.
-        self.token_verifier = build_token_verifier(config)
+        self.accounting = build_accounting(self.config)
+        self.token_verifier = build_token_verifier(self.config)
 
-        # Parsing / model plane.
-        self.model_pool = ModelPool(config)
+        self.model_pool = ModelPool(self.config)
         self.vision_router = VisionRouter(
-            self.model_pool, config, ledger=self.ledger, budget=self.budget,
+            self.model_pool,
+            self.config,
+            ledger=self.ledger,
+            budget=self.budget,
             accounting=self.accounting,
         )
 
-        # Asset plane.
-        self.proxy_pool = build_proxy_pool(config)
-        self.session_pool: Optional[SessionPool] = None
-        # Set by ``attach_browser`` so admin/health can surface the actual
-        # browser runtime (post-fallback) without reaching into module globals.
-        self.browser_manager = None
+        self.proxy_pool = build_proxy_pool(self.config)
 
-        self._load_proxy_inventory()
+    @classmethod
+    async def create(cls, config: Config) -> "SolverServices":
+        """Build the graph and close partial ownership when startup fails."""
 
-    def attach_browser(self, manager) -> None:
-        """Wire the warm session pool once the browser manager is available."""
+        services = cls.__new__(cls)
+        services._initialize_state(config)
+        try:
+            services._build_components()
+            services._load_proxy_inventory()
+        except BaseException:
+            await services.close()
+            raise
+        return services
+
+    def attach_browser(self, manager: Any) -> None:
+        """Wire the warm-session pool once the browser manager is available."""
+
         self.browser_manager = manager
         if self.config.session_pool_size <= 0:
             self.session_pool = None
@@ -88,41 +141,104 @@ class SolverServices:
         return count
 
     def _load_proxy_inventory(self) -> None:
-        """Seed the proxy pool from PROXY_POOL env (one proxy per line/comma)."""
-        import os
+        """Seed durable proxy inventory from ``PROXY_POOL`` idempotently.
+
+        Configured proxies receive deterministic ids. Existing backend rows are
+        preserved so health, cooldown, bandwidth, and sitekey history survive
+        restarts; duplicate entries in one boot are collapsed.
+        """
 
         raw = os.environ.get("PROXY_POOL", "").strip()
-        if not raw:
+        if not raw or self.proxy_pool is None:
             return
-        entries = [e.strip() for e in raw.replace(",", "\n").splitlines() if e.strip()]
-        count = 0
+
+        existing_ids: set[str] = set()
+        snapshot = getattr(self.proxy_pool, "snapshot", None)
+        if snapshot is not None:
+            try:
+                existing_ids = {
+                    str(row["id"])
+                    for row in snapshot()
+                    if isinstance(row, dict) and row.get("id")
+                }
+            except Exception:  # noqa: BLE001 - add() remains fail-loud
+                log.exception("Could not inspect existing proxy inventory")
+
+        entries = [
+            entry.strip()
+            for entry in raw.replace(",", "\n").splitlines()
+            if entry.strip()
+        ]
+        seen: set[str] = set()
+        loaded = 0
+        reused = 0
+        duplicates = 0
+
         for entry in entries:
             asset = proxy_from_params({"proxy": entry})
-            if asset is not None:
-                self.proxy_pool.add(asset)
-                count += 1
-        if count:
-            log.info("Loaded %d proxies into the proxy pool", count)
+            if asset is None:
+                continue
+            asset.id = inventory_proxy_id(asset)
+            if asset.id in seen:
+                duplicates += 1
+                continue
+            seen.add(asset.id)
+            if asset.id in existing_ids:
+                reused += 1
+                continue
+            self.proxy_pool.add(asset)
+            existing_ids.add(asset.id)
+            loaded += 1
+
+        if loaded or reused or duplicates:
+            log.info(
+                "Proxy inventory reconciled "
+                "(added=%d, preserved=%d, duplicates=%d)",
+                loaded,
+                reused,
+                duplicates,
+            )
+
+    async def _close_resources(self) -> None:
+        """Drain the complete owned-resource graph in dependency order."""
+
+        resources = (
+            ("session_pool", getattr(self, "session_pool", None)),
+            ("token_verifier", getattr(self, "token_verifier", None)),
+            ("model_pool", getattr(self, "model_pool", None)),
+            ("accounting", getattr(self, "accounting", None)),
+            ("proxy_pool", getattr(self, "proxy_pool", None)),
+            ("ledger", getattr(self, "ledger", None)),
+        )
+        for name, resource in resources:
+            await _close_owned_resource(name, resource)
 
     async def close(self) -> None:
-        if self.session_pool is not None:
-            await self.session_pool.close_all()
-        # Redis backends hold connection pools that must be released on
-        # shutdown. The in-memory backends don't define ``close`` — the
-        # getattr guard keeps this path a no-op for them.
-        close_ledger = getattr(self.ledger, "close", None)
-        if close_ledger is not None:
-            await close_ledger()
-        close_proxy = getattr(self.proxy_pool, "close", None)
-        if close_proxy is not None:
-            await close_proxy()
-        close_acc = getattr(self.accounting, "close", None)
-        if close_acc is not None:
-            await close_acc()
+        """Close exactly once and finish cleanup despite caller cancellation.
+
+        Concurrent callers share one close task. A completed task is consumed
+        directly so repeated calls from a fresh event loop are safe as well.
+        """
+
+        task = getattr(self, "_close_task", None)
+        if task is not None and task.done():
+            task.result()
+            return
+        if task is None:
+            task = asyncio.create_task(
+                self._close_resources(),
+                name="captchai-services-close",
+            )
+            self._close_task = task
+
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Resource ownership must settle before cancellation propagates.
+            await task
+            raise
 
 
-# Process-wide singleton, set at startup so API routes (getBalance, admin) can
-# read the shared ledger / pools without threading the object through every call.
 _services: Optional[SolverServices] = None
 
 

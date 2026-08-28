@@ -1,25 +1,22 @@
 """Warm browser-session pool bucketed by egress identity.
 
-Launching a fresh Playwright context per solve is slow and throws away the
-"warmed up" browser state (cookies, JS JIT, TLS session) that makes a session
-look human. ``SessionPool`` keeps a bounded set of live sessions, hands out a
-warm idle one when available, and only creates a new one — via an injected
-async ``context_factory`` — when it must. Sessions accrue a reputation and are
-retired (context closed) when their reputation drops below a threshold or they
-exceed ``max_solves``; a single solve failure no longer forces retirement.
+``SessionPool`` owns a bounded number of live browser contexts and reuses them
+across solves. Sessions are isolated by egress identity: proxyless sessions use
+one bucket and pool-proxy sessions use the proxy id, so a context never changes
+its network identity during its lifetime.
 
-Idle sessions are bucketed by **egress identity**: pool-proxy-bound sessions
-are keyed by ``proxy.id``; server-IP (proxyless) sessions are keyed by the
-literal ``"proxyless"``. A session owns its proxy for its whole lifetime —
-``checkout`` for a given key only reuses sessions bound to that exact key, so
-a pool-proxy session is never reused for a proxyless solve (or vice versa).
-The factory is injected rather than importing ``browser.py`` directly so the
-pool is fully testable with fakes and has no hard Playwright dependency.
+The pool deliberately uses an :class:`asyncio.Condition` rather than a
+``Semaphore``. A semaphore is a poor fit when permits represent *live assets*
+(in-use plus idle): returning a healthy session to the idle set must wake a
+checkout waiter without releasing the live-asset permit. The condition makes
+that hand-off explicit and prevents a full pool from deadlocking when every
+session is temporarily in use.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 import uuid
 from dataclasses import dataclass
@@ -50,6 +47,10 @@ class BrowserSession:
     solves: int = 0
     reputation: float = 1.0
     warm: bool = False
+    # The checkout bucket is stored on the lease itself. This avoids rebuilding
+    # it from mutable proxy metadata during release and makes mismatched caller
+    # keys harmless: the session always returns to the bucket it came from.
+    bucket_key: str = PROXYLESS_KEY
 
 
 async def _maybe_await_close(context: Any) -> None:
@@ -59,18 +60,39 @@ async def _maybe_await_close(context: Any) -> None:
         if closer is None:
             return
         result = closer()
-        if asyncio.iscoroutine(result):
+        if inspect.isawaitable(result):
             await result
     except Exception:  # noqa: BLE001 - retirement must never propagate
         pass
 
 
-def _bucket_key(proxy: Optional[ProxyAsset]) -> str:
-    return proxy.id if proxy is not None else PROXYLESS_KEY
+async def _run_cleanup_uninterruptibly(cleanup: Awaitable[Any]) -> Any:
+    """Finish ownership cleanup before propagating caller cancellation.
+
+    Browser-context close operations update pool capacity only after the real
+    resource is gone. Shielding the cleanup task prevents a cancelled request
+    or shutdown from leaking a context or leaving lifecycle counters stuck.
+    Cancellation is still propagated once cleanup has completed.
+    """
+    task = asyncio.ensure_future(cleanup)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
 class SessionPool:
-    """Bounded pool of reusable browser sessions, bucketed by egress identity."""
+    """Bounded, cancellation-safe pool of reusable browser sessions.
+
+    ``_live`` counts all capacity already reserved by the pool: idle sessions,
+    checked-out sessions, contexts currently being constructed, and contexts
+    still closing. A waiter is notified whenever an idle session appears or
+    capacity is truly freed. This is the key invariant that the previous
+    semaphore-only implementation could not express: returning a reusable
+    session does not reduce ``_live``, but it must still wake a waiter so that
+    waiter can claim the newly-idle asset.
+    """
 
     def __init__(
         self,
@@ -79,20 +101,25 @@ class SessionPool:
         size: int = 4,
         max_solves: int = 8,
     ) -> None:
+        if size <= 0:
+            raise ValueError("session pool size must be greater than zero")
+        if max_solves <= 0:
+            raise ValueError("session max_solves must be greater than zero")
+
         self._factory = context_factory
         self._size = size
         self._max_solves = max_solves
-        # Semaphore permits == number of live sessions allowed at once. A permit
-        # is held for a session's whole lifetime (in-use *and* idle) and only
-        # returned on retirement.
-        self._slots = asyncio.Semaphore(size)
-        # Idle sessions bucketed by egress key: ``proxy.id`` for pool-proxy
-        # sessions, ``"proxyless"`` for server-IP sessions. A checkout for a
-        # given key only reuses sessions from that bucket, so a sticky proxy
-        # identity is preserved across solves.
         self._idle: Dict[str, List[BrowserSession]] = {}
         self._in_use: Dict[str, BrowserSession] = {}
-        self._lock = asyncio.Lock()
+
+        # Condition protects every mutable pool-state field. It is also the
+        # hand-off mechanism between release/retirement and blocked checkouts.
+        self._condition = asyncio.Condition()
+        self._live = 0
+        self._creating = 0
+        self._closing = 0
+        self._waiters = 0
+        self._closed = False
 
     async def checkout(
         self,
@@ -101,131 +128,198 @@ class SessionPool:
         proxy: Optional[ProxyAsset] = None,
         sitekey: Optional[str] = None,
     ) -> BrowserSession:
-        """Return a warm idle session for ``key``, or create one (bounded by ``size``).
+        """Return an idle session for ``key`` or reserve/build a new one.
 
-        Reuses the most recently idled session in the requested bucket when
-        possible. When none is idle it waits for a free slot and builds a new
-        session via the factory, so the number of concurrently live sessions
-        never exceeds ``size``. The fingerprint is seeded by ``proxy.id`` when
-        a proxy is given (so a sticky proxy keeps a stable coherent identity
-        across re-warms); proxyless sessions draw from entropy.
+        When the pool is full and every asset is in use, the caller waits on the
+        condition. A normal release wakes it and it reuses the returned session;
+        no live-capacity permit needs to be released. If only another bucket has
+        an idle session, the least-valuable idle asset is retired and replaced
+        in-place, preserving the global size bound.
+
+        Context construction and publication are cancellation-safe: capacity is
+        reserved before leaving the lock, and a context that cannot be published
+        to ``_in_use`` is closed before its reservation is returned.
         """
         del sitekey  # accepted for call-site compatibility; not used for selection
-        # Claim a slot for a NEW session in this bucket. A free slot is used
-        # directly; otherwise an idle session from ANOTHER bucket is retired to
-        # free its slot (buckets share the global size bound, so warming a new
-        # egress identity may evict a stale one). Only when every slot is held
-        # by an *in-use* session — nothing is evictable — do we block until one
-        # is released.
+        bucket_key = key or (proxy.id if proxy is not None else PROXYLESS_KEY)
+
         while True:
-            async with self._lock:
-                session = self._pop_idle(key)
+            evicted: Optional[BrowserSession] = None
+            async with self._condition:
+                self._ensure_open_locked()
+
+                session = self._pop_idle_locked(bucket_key)
                 if session is not None:
+                    session.warm = True
                     self._in_use[session.id] = session
                     return session
-                if not self._slots.locked():
-                    # A slot is free (value > 0): acquiring is synchronous and
-                    # won't yield, so it's safe under the lock. Build below.
-                    await self._slots.acquire()
-                    break
-                evicted = self._evict_one_idle()
-            if evicted is not None:
-                # Retire the evicted session and free its slot, then retry. The
-                # freed slot may be taken by another coroutine, in which case we
-                # evict again or finally block.
-                await _maybe_await_close(evicted.context)
-                evicted.warm = False
-                self._slots.release()
-                continue
-            # Nothing evictable: all slots are held by in-use sessions. Block
-            # until one is released, then re-check idle / build below.
-            await self._slots.acquire()
-            break
 
-        async with self._lock:
-            session = self._pop_idle(key)
-            if session is not None:
-                self._slots.release()  # reusing instead of creating; give slot back
-                self._in_use[session.id] = session
-                return session
+                if self._live < self._size:
+                    # Reserve capacity before releasing the condition so no two
+                    # builders can oversubscribe the pool.
+                    self._live += 1
+                    self._creating += 1
+                    break
+
+                evicted = self._evict_one_idle_locked()
+                if evicted is not None:
+                    # Replacement reuses the evicted session's live slot. The
+                    # count stays unchanged while construction is in progress.
+                    self._creating += 1
+                    break
+
+                # Full and all assets are checked out or closing. Wait for an
+                # idle hand-off, genuinely-freed capacity, or shutdown.
+                self._waiters += 1
+                try:
+                    await self._condition.wait()
+                finally:
+                    self._waiters -= 1
 
         try:
-            # Seed by proxy id when given so a sticky proxy keeps a stable
-            # coherent identity; proxyless sessions draw from entropy. The
-            # proxy's exit-IP geo (timezone / locale) drives the fingerprint
-            # so a German residential IP presents Europe/Berlin + de-DE
-            # rather than en-US/New_York; ``None`` falls back to a random
-            # coherent identity (current behavior, no regression).
+            if evicted is not None:
+                await _run_cleanup_uninterruptibly(
+                    _maybe_await_close(evicted.context)
+                )
+                evicted.warm = False
+
             fingerprint = generate_fingerprint(
                 seed=proxy.id if proxy else None,
                 timezone_id=proxy.timezone if proxy else None,
                 locale=proxy.locale if proxy else None,
-                # P1-4: a mobile pool proxy gets an Android Chrome fingerprint.
                 mobile=bool(proxy and getattr(proxy, "kind", None) == "mobile"),
             )
             context, user_agent = await self._factory(fingerprint, proxy)
+            session = BrowserSession(
+                id=str(uuid.uuid4()),
+                context=context,
+                fingerprint=fingerprint,
+                proxy=proxy,
+                user_agent=user_agent,
+                created_at=time.monotonic(),
+                warm=True,
+                bucket_key=bucket_key,
+            )
         except BaseException:
-            self._slots.release()
+            await _run_cleanup_uninterruptibly(self._rollback_creation())
             raise
 
-        session = BrowserSession(
-            id=str(uuid.uuid4()),
-            context=context,
-            fingerprint=fingerprint,
-            proxy=proxy,
-            user_agent=user_agent,
-            created_at=time.monotonic(),
-            warm=True,
+        return await self._publish_created_session(session)
+
+    async def _publish_created_session(
+        self, session: BrowserSession
+    ) -> BrowserSession:
+        """Atomically publish a built context or dispose of it on cancellation.
+
+        The condition is acquired manually rather than with ``async with`` so
+        there is no cancellation point after the session is inserted into
+        ``_in_use`` and before it is returned to the caller.
+        """
+        try:
+            await self._condition.acquire()
+        except BaseException:
+            session.warm = False
+            await _run_cleanup_uninterruptibly(
+                self._rollback_creation(session.context)
+            )
+            raise
+
+        try:
+            if not self._closed:
+                self._creating -= 1
+                self._in_use[session.id] = session
+                self._condition.notify_all()
+                return session
+        finally:
+            self._condition.release()
+
+        # Shutdown raced with publication. Dispose of the unpublished context
+        # and return its live reservation before reporting the terminal state.
+        session.warm = False
+        await _run_cleanup_uninterruptibly(
+            self._rollback_creation(session.context)
         )
-        async with self._lock:
-            self._in_use[session.id] = session
-        return session
+        raise RuntimeError("session pool is closed")
+
+    async def _rollback_creation(self, context: Any = None) -> None:
+        """Close an unpublished context and return its creation reservation."""
+        if context is not None:
+            await _maybe_await_close(context)
+        async with self._condition:
+            self._creating -= 1
+            self._live -= 1
+            self._condition.notify_all()
 
     async def prewarm(self, *, sitekey: Optional[str] = None) -> int:
-        """Create idle proxyless sessions up to the configured pool size.
+        """Create idle proxyless sessions without consuming solve lifetime."""
+        del sitekey  # accepted for call-site compatibility
+        tasks = [
+            asyncio.create_task(self.checkout(key=PROXYLESS_KEY, proxy=None))
+            for _ in range(self._size)
+        ]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            # ``gather`` cancellation can leave some children already completed
+            # with live leases. Reclaim every successful result before
+            # propagating the startup cancellation/failure.
+            await _run_cleanup_uninterruptibly(
+                self._cancel_and_reclaim_prewarm(tasks)
+            )
+            raise
 
-        Matches the legacy prewarm behaviour: only the ``"proxyless"`` bucket
-        is prewarmed, since pool-proxy sessions are created lazily on first
-        solve for a given proxy.
-        """
-        del sitekey  # accepted for call-site compatibility; not used for prewarm
-        if self._size <= 0:
-            return 0
-        sessions = await asyncio.gather(
-            *[
-                self.checkout(key=PROXYLESS_KEY, proxy=None)
-                for _ in range(self._size)
-            ]
+        sessions = [r for r in results if isinstance(r, BrowserSession)]
+        await asyncio.gather(
+            *(
+                self._release(
+                    session,
+                    success=True,
+                    count_solve=False,
+                )
+                for session in sessions
+            )
         )
-        for session in sessions:
-            await self.release(session, success=True)
+
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures:
+            raise failures[0]
         return len(sessions)
 
-    def _pop_idle(self, key: str) -> Optional[BrowserSession]:
+    async def _cancel_and_reclaim_prewarm(
+        self, tasks: List["asyncio.Task[BrowserSession]"]
+    ) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        sessions = [r for r in results if isinstance(r, BrowserSession)]
+        if sessions:
+            await asyncio.gather(
+                *(
+                    self._release(
+                        session,
+                        success=True,
+                        count_solve=False,
+                    )
+                    for session in sessions
+                )
+            )
+
+    def _ensure_open_locked(self) -> None:
+        if self._closed:
+            raise RuntimeError("session pool is closed")
+
+    def _pop_idle_locked(self, key: str) -> Optional[BrowserSession]:
         bucket = self._idle.get(key)
-        while bucket:
-            session = bucket.pop()
-            if not bucket:
-                del self._idle[key]
-            return session
-        return None
+        if not bucket:
+            return None
+        session = bucket.pop()
+        if not bucket:
+            del self._idle[key]
+        return session
 
-    def _evict_one_idle(self) -> Optional[BrowserSession]:
-        """Pop the *least valuable* idle session to free its slot for a new one.
-
-        Buckets share the global ``size`` bound, so warming a new egress
-        identity when every slot is held may require retiring an idle session
-        bound to a different identity. Rather than evicting an arbitrary bucket
-        (which could throw away a high-reputation, freshly-warmed session and
-        keep a nearly-exhausted low-reputation one), pick the worst idle session
-        across all buckets: lowest reputation first, then most solves (closest
-        to ``max_solves``), then oldest. This preserves the warmest, most
-        trusted sessions — the ones most likely to keep passing enterprise
-        risk checks — under slot pressure.
-
-        Returns ``None`` when nothing is idle (all slots held by in-use
-        sessions). Must be called under ``self._lock``.
-        """
+    def _evict_one_idle_locked(self) -> Optional[BrowserSession]:
+        """Remove the least-valuable idle session for cross-bucket replacement."""
         worst_key: Optional[str] = None
         worst: Optional[BrowserSession] = None
         for key, bucket in self._idle.items():
@@ -249,87 +343,117 @@ class SessionPool:
     async def release(
         self, session: BrowserSession, *, success: bool, burned: bool = False
     ) -> None:
-        """Return a session to its bucket, updating its reputation.
+        """Return a checked-out session, or retire it when policy requires."""
+        del burned  # reputation/max-solves policy is authoritative
+        await self._release(session, success=success, count_solve=True)
 
-        Each release counts as one completed solve. A session is retired (its
-        context closed and its slot freed so a replacement can be created lazily
-        on the next ``checkout``) when it has reached ``max_solves`` OR its
-        reputation has dropped below the eviction threshold (0.3). A single
-        solve failure no longer forces retirement: a fresh session (rep=1.0)
-        survives one failure (1.0→0.6) and is only evicted after a second
-        consecutive failure (0.6→0.2). Otherwise the session goes back to its
-        egress-keyed warm idle bucket.
+    async def _release(
+        self,
+        session: BrowserSession,
+        *,
+        success: bool,
+        count_solve: bool,
+    ) -> None:
+        """Internal release with a prewarm path that does not count as a solve.
 
-        ``burned`` is accepted for backward compat (callers such as
-        ``browser_solver`` still pass ``burned=not solved``) but no longer
-        forces retirement; reputation decay handles eviction.
-
-        The session keeps its ``ProxyAsset`` reference for its whole lifetime;
-        the caller (``browser_solver``) is responsible for ``proxy_pool.report``
-        on each solve. This method does NOT release the proxy back to the
-        proxy pool — only when the session retires does its slot come back.
+        Duplicate or late releases are harmless: only the exact object currently
+        recorded in ``_in_use`` can mutate pool state. A reusable release wakes
+        checkout waiters even though live capacity is unchanged. Retirement
+        keeps its slot reserved until the browser context has actually closed,
+        then frees capacity and wakes waiters; this prevents transient
+        oversubscription of expensive browser contexts.
         """
-        async with self._lock:
+        retire = False
+
+        async with self._condition:
+            current = self._in_use.get(session.id)
+            if current is not session:
+                return
             self._in_use.pop(session.id, None)
 
-        session.solves += 1
-        if success:
-            session.reputation = min(1.0, session.reputation + 0.05)
-        else:
-            session.reputation = max(0.0, session.reputation - 0.4)
+            if count_solve:
+                session.solves += 1
+                if success:
+                    session.reputation = min(1.0, session.reputation + 0.05)
+                else:
+                    session.reputation = max(0.0, session.reputation - 0.4)
 
-        retire = session.solves >= self._max_solves or session.reputation < 0.3
+            retire = (
+                self._closed
+                or session.solves >= self._max_solves
+                or session.reputation < 0.3
+            )
+            if retire:
+                session.warm = False
+                self._closing += 1
+            else:
+                session.warm = True
+                self._idle.setdefault(session.bucket_key, []).append(session)
+
+            self._condition.notify_all()
+
         if retire:
-            await _maybe_await_close(session.context)
-            session.warm = False
-            self._slots.release()
-            return
+            await _run_cleanup_uninterruptibly(
+                self._finish_retirement(session)
+            )
 
-        session.warm = True
-        key = _bucket_key(session.proxy)
-        async with self._lock:
-            self._idle.setdefault(key, []).append(session)
+    async def _finish_retirement(self, session: BrowserSession) -> None:
+        await _maybe_await_close(session.context)
+        async with self._condition:
+            self._closing -= 1
+            self._live -= 1
+            self._condition.notify_all()
 
     async def close_all(self) -> None:
-        """Retire every session (idle and in-use) and free all slots."""
-        async with self._lock:
+        """Permanently close the pool and every context it owns.
+
+        Blocked checkouts are woken and fail with ``RuntimeError``. Contexts that
+        are still being constructed are allowed to finish their cancellation/
+        cleanup path. This method waits until all creation and retirement work
+        has released its reservation, making shutdown deterministic.
+        """
+        async with self._condition:
+            self._closed = True
             sessions = list(self._in_use.values())
             for bucket in self._idle.values():
                 sessions.extend(bucket)
             self._idle.clear()
             self._in_use.clear()
+            self._closing += len(sessions)
+            self._condition.notify_all()
+
+        await _run_cleanup_uninterruptibly(
+            self._close_sessions_and_wait(sessions)
+        )
+
+    async def _close_sessions_and_wait(
+        self, sessions: List[BrowserSession]
+    ) -> None:
+        await asyncio.gather(
+            *(_maybe_await_close(session.context) for session in sessions)
+        )
         for session in sessions:
-            await _maybe_await_close(session.context)
             session.warm = False
-            self._slots.release()
+
+        async with self._condition:
+            self._closing -= len(sessions)
+            self._live -= len(sessions)
+            self._condition.notify_all()
+            while self._creating > 0 or self._closing > 0:
+                await self._condition.wait()
+
+    async def close(self) -> None:
+        """Lifecycle alias used by the application composition root."""
+        await self.close_all()
 
     async def report_outcome(self, session_id: str, *, success: bool) -> bool:
-        """Nudge a session's reputation by id after a real-outcome report.
-
-        Called by /reportCorrect / /reportIncorrect to feed the token-actually-
-        accepted signal back into session selection. Searches both the idle
-        buckets and the in-use map for the session and applies the same
-        reputation delta as ``release`` (``+0.05`` on success, ``-0.4`` on
-        failure, clamped to ``[0, 1]``). Does NOT retire or close the session
-        — eviction still happens via the normal ``release`` path when the
-        reputation drops below ``0.3``.
-
-        Returns ``True`` if the session was found and nudged, ``False`` if it
-        was already retired / gone (a non-fatal no-op for the caller).
-        """
-        async with self._lock:
-            target: Optional[BrowserSession] = None
-            for bucket in self._idle.values():
-                for s in bucket:
-                    if s.id == session_id:
-                        target = s
-                        break
-                if target is not None:
-                    break
+        """Nudge a live session's reputation after a real downstream outcome."""
+        async with self._condition:
+            target: Optional[BrowserSession] = self._in_use.get(session_id)
             if target is None:
-                for s in self._in_use.values():
-                    if s.id == session_id:
-                        target = s
+                for bucket in self._idle.values():
+                    target = next((s for s in bucket if s.id == session_id), None)
+                    if target is not None:
                         break
             if target is None:
                 return False
@@ -339,8 +463,21 @@ class SessionPool:
                 target.reputation = max(0.0, target.reputation - 0.4)
             return True
 
+    def stats(self) -> Dict[str, Any]:
+        """Cheap operational counters for diagnostics and tests."""
+        return {
+            "capacity": self._size,
+            "live": self._live,
+            "idle": sum(len(bucket) for bucket in self._idle.values()),
+            "in_use": len(self._in_use),
+            "creating": self._creating,
+            "closing": self._closing,
+            "waiters": self._waiters,
+            "closed": self._closed,
+        }
+
     def snapshot(self) -> List[Dict[str, Any]]:
-        """Serialisable view of live sessions for an admin endpoint."""
+        """Serialisable view of live sessions for the admin endpoint."""
         result: List[Dict[str, Any]] = []
         idle_rows: List[Tuple[BrowserSession, bool]] = []
         for bucket in self._idle.values():

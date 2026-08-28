@@ -1,32 +1,19 @@
-"""Optional token-trust verification — auto-close the real-outcome loop.
+"""Optional provider-side token verification.
 
-The browser solvers mint a token and only *structurally* check it
-(``len(token) > 20``). Whether the provider actually *accepts* that token is
-otherwise learned only if the caller later hits ``/reportCorrect`` /
-``/reportIncorrect`` — which is optional, and many callers never do. So the
-proxy-health / routing ``real``-outcome buckets (which exist precisely to
-distinguish "we obtained a token" from "the token was accepted downstream")
-stay empty and the optimistic token-obtained signal is all selection has.
-
-When the operator can supply a sitekey's *secret* (they own the target, or hold
-a test key), this module verifies a freshly minted token against the provider's
-``siteverify`` endpoint and returns a verdict the solver feeds straight into the
-same real-outcome accounting the report endpoints use — closing the trust loop
-from ground truth without waiting on the caller.
-
-Entirely opt-in: with no secret configured (the default), :func:`build_token_verifier`
-returns ``None`` and solving behaves exactly as before.
+When an operator owns a sitekey and can configure its secret, a freshly minted
+token can be checked against the provider's verification endpoint. The verifier
+owns one reusable ``httpx.AsyncClient`` so repeated checks share connection
+pools instead of paying DNS/TLS/client construction on every solve.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
-from typing import Any, Dict, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
 
-# Well-known provider siteverify endpoints, keyed by the normalized provider
-# string the solvers pass (``hcaptcha`` / ``turnstile`` / ``recaptcha``).
 _SITEVERIFY_ENDPOINTS: Dict[str, str] = {
     "hcaptcha": "https://api.hcaptcha.com/siteverify",
     "turnstile": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
@@ -36,14 +23,7 @@ _SITEVERIFY_ENDPOINTS: Dict[str, str] = {
 
 @runtime_checkable
 class TokenVerifier(Protocol):
-    """Verifies a minted token against the provider. Returns a tri-state verdict.
-
-    ``True``  — provider accepted the token (real success).
-    ``False`` — provider rejected the token (real failure).
-    ``None``  — verdict unknown (no secret for this sitekey, verification
-                disabled, or a transient error): the caller keeps the existing
-                caller-driven report loop and never fails the solve on this.
-    """
+    """Verify a minted token and return ``True`` / ``False`` / unknown ``None``."""
 
     async def verify(
         self,
@@ -55,14 +35,21 @@ class TokenVerifier(Protocol):
     ) -> Optional[bool]: ...
 
 
-class HttpTokenVerifier:
-    """Verify tokens by POSTing to the provider's ``siteverify`` endpoint.
+HttpClientFactory = Callable[[float], Any]
 
-    Configured with a ``{sitekey: secret}`` map; a token for a sitekey with no
-    configured secret verifies to ``None`` (unknown), so partial configuration
-    (verify the sitekeys you own, leave the rest caller-driven) is fine. Any
-    network / parse error also returns ``None`` — verification must never turn a
-    successful solve into a failure on its own.
+
+def _default_http_client_factory(timeout: float) -> Any:
+    import httpx
+
+    return httpx.AsyncClient(timeout=timeout)
+
+
+class HttpTokenVerifier:
+    """Verify tokens through provider ``siteverify`` endpoints.
+
+    A network/parse failure returns ``None`` and never turns a successful solve
+    into an application failure. The HTTP client is lazy, shared, injectable for
+    tests, and closed by :class:`src.core.services.SolverServices`.
     """
 
     def __init__(
@@ -71,13 +58,24 @@ class HttpTokenVerifier:
         *,
         endpoints: Optional[Dict[str, str]] = None,
         timeout: float = 10.0,
+        client_factory: Optional[HttpClientFactory] = None,
     ) -> None:
         self._secrets = dict(secrets)
         self._endpoints = {**_SITEVERIFY_ENDPOINTS, **(endpoints or {})}
         self._timeout = timeout
+        self._client_factory = client_factory or _default_http_client_factory
+        self._client: Any = None
+        self._closed = False
 
     def has_secret(self, sitekey: str) -> bool:
         return sitekey in self._secrets
+
+    def _raw_client(self) -> Any:
+        if self._closed:
+            raise RuntimeError("token verifier is closed")
+        if self._client is None:
+            self._client = self._client_factory(self._timeout)
+        return self._client
 
     async def verify(
         self,
@@ -91,16 +89,14 @@ class HttpTokenVerifier:
         endpoint = self._endpoints.get(provider)
         if not secret or not endpoint:
             return None
-        import httpx  # local import: keeps this module import-light for tests
 
         data: Dict[str, Any] = {"secret": secret, "response": token}
         if remote_ip:
             data["remoteip"] = remote_ip
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(endpoint, data=data)
-                resp.raise_for_status()
-                body = resp.json()
+            resp = await self._raw_client().post(endpoint, data=data)
+            resp.raise_for_status()
+            body = resp.json()
         except Exception as exc:  # noqa: BLE001 - never fail a solve on verify
             log.debug("token siteverify call failed (%s): %s", provider, exc)
             return None
@@ -109,13 +105,26 @@ class HttpTokenVerifier:
             return success
         return None
 
+    async def close(self) -> None:
+        """Close the shared HTTP client exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        client, self._client = self._client, None
+        if client is None:
+            return
+        closer = getattr(client, "aclose", None)
+        if closer is None:
+            closer = getattr(client, "close", None)
+        if closer is None:
+            return
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+
 
 def parse_secret_map(raw: str) -> Dict[str, str]:
-    """Parse ``"sitekey1:secret1,sitekey2:secret2"`` into a ``{sitekey: secret}``.
-
-    Blank / malformed entries are skipped. Secrets may themselves contain ``:``
-    (split only on the first), so URL-ish secrets survive.
-    """
+    """Parse ``sitekey:secret`` comma pairs, skipping malformed entries."""
     out: Dict[str, str] = {}
     for entry in (raw or "").split(","):
         entry = entry.strip()
@@ -129,12 +138,7 @@ def parse_secret_map(raw: str) -> Dict[str, str]:
 
 
 def build_token_verifier(config: Any) -> Optional[TokenVerifier]:
-    """Return a configured verifier, or ``None`` when token verification is off.
-
-    Off by default: requires ``TOKEN_VERIFY_ENABLED=true`` *and* at least one
-    ``sitekey:secret`` pair in ``TOKEN_VERIFY_SECRETS``. Without both, returns
-    ``None`` and the solvers skip verification entirely.
-    """
+    """Build the opt-in verifier, or ``None`` when disabled/unconfigured."""
     if not getattr(config, "token_verify_enabled", False):
         return None
     secrets = parse_secret_map(getattr(config, "token_verify_secrets", ""))
