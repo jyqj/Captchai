@@ -255,6 +255,68 @@ def test_atomic_checkout_repairs_corrupt_candidate_inside_script() -> None:
     asyncio.run(run())
 
 
+def test_atomic_checkout_rehabilitates_expired_cooldown_with_active_peer() -> None:
+    url = _redis_helper()
+    prefix = "test:atomic:rehabilitate:"
+
+    async def run() -> None:
+        import time
+
+        _flush_prefix(prefix)
+        pool = AtomicRedisProxyPool(
+            url,
+            key_prefix=prefix,
+            candidate_window=4,
+        )
+        try:
+            pool.add(
+                ProxyAsset(
+                    id="active",
+                    server="http://active:1",
+                    success_count=1,
+                    fail_count=9,
+                    sitekey_stats={"site": [1, 9]},
+                )
+            )
+            pool.add(
+                ProxyAsset(
+                    id="recovering",
+                    server="http://recovering:1",
+                    state="cooldown",
+                    cooldown_until=time.time() + 60,
+                    success_count=10,
+                    sitekey_stats={"site": [10, 0]},
+                )
+            )
+
+            blob = await pool._redis.hget(
+                pool._proxies_key, "recovering"
+            )
+            assert blob is not None
+            recovering = pool._deserialize(blob)
+            recovering.cooldown_until = time.time() - 1
+            await pool._redis.hset(
+                pool._proxies_key,
+                "recovering",
+                pool._serialize(recovering),
+            )
+            await pool._redis.zadd(
+                pool._cooldown_index_key,
+                {"recovering": recovering.cooldown_until},
+            )
+
+            # The active index is deliberately non-empty. Checkout must still
+            # reserve a bounded rehabilitation slot for the expired asset.
+            chosen = await pool.checkout(sitekey="site")
+            assert chosen is not None and chosen.id == "recovering"
+            await pool.report(chosen.id, success=True)
+        finally:
+            await pool.close()
+            _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
 def test_async_snapshot_uses_hscan_and_never_sync_hgetall() -> None:
     url = _redis_helper()
     prefix = "test:atomic:snapshot:"

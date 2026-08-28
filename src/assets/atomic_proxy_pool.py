@@ -17,7 +17,7 @@ import inspect
 import logging
 import secrets
 import time
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Awaitable, Dict, Iterable, List, Optional, Union, cast
 
 from .indexed_proxy_pool import (
     IndexedRedisProxyPool,
@@ -519,8 +519,21 @@ class AtomicRedisProxyPool(IndexedRedisProxyPool):
         while True:
             now = time.time()
             candidate_ids = await self._bounded_candidate_ids(kinds, sitekey)
-            if not candidate_ids:
-                candidate_ids = await self._expired_cooldown_ids(now)
+            expired_ids = await self._expired_cooldown_ids(now)
+            if expired_ids:
+                # Reserve one slot for rehabilitation even while the active
+                # index is non-empty. Without this, an expired cooldown proxy
+                # can remain stranded forever behind a continuously available
+                # incumbent. When no active candidates exist, the full bounded
+                # window is available for cooldown recovery.
+                recovery_budget = (
+                    self._candidate_window if not candidate_ids else 1
+                )
+                candidate_ids = list(
+                    dict.fromkeys(
+                        [*expired_ids[:recovery_budget], *candidate_ids]
+                    )
+                )[: self._candidate_window]
             if not candidate_ids:
                 return None
 
@@ -609,9 +622,9 @@ async def snapshot_proxy_pool(pool: Any) -> List[Dict[str, Any]]:
     snapshot_async = getattr(pool, "snapshot_async", None)
     if callable(snapshot_async):
         result = snapshot_async()
-        if inspect.isawaitable(result):
-            return await result
-        return list(result)
+        if not inspect.isawaitable(result):
+            raise TypeError("snapshot_async must return an awaitable")
+        return await cast(Awaitable[List[Dict[str, Any]]], result)
     return await asyncio.to_thread(pool.snapshot)
 
 
