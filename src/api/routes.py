@@ -191,7 +191,7 @@ async def admin_proxies(clientKey: str = "") -> dict[str, object]:
     )
     return {
         "errorId": 0,
-        "proxies": services.proxy_pool.snapshot(),
+        "proxies": await services.proxy_snapshot(),
         "sessions": sessions,
     }
 
