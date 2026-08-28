@@ -90,6 +90,7 @@ class SolveContext:
     session: Any | None = None
     proxy_id: str | None = None
     session_id: str | None = None
+    proxy_lease_token: str | None = None
 
 
 class BaseBrowserSolver:
@@ -253,6 +254,10 @@ class BaseBrowserSolver:
                 "egress=pool requires a server-side proxy but the pool is empty"
             )
         params["_pool_proxy_id"] = pool_proxy.id
+        proxy_lease_token = getattr(
+            pool_proxy, "_captchai_proxy_lease_token", None
+        )
+        params["_pool_proxy_lease_token"] = proxy_lease_token
         params["_proxyKind"] = ProxyKind.POOL_PROXY.value
         # Gateway of the checked-out pool proxy surfaced so the caller can route
         # their downstream (IP-bound) submit through the same egress. Default is
@@ -312,6 +317,7 @@ class BaseBrowserSolver:
                 session=session,
                 proxy_id=pool_proxy.id,
                 session_id=session.id,
+                proxy_lease_token=proxy_lease_token,
             )
 
         # No session pool: fall back to a fresh context bound to the proxy.
@@ -324,6 +330,7 @@ class BaseBrowserSolver:
             user_agent=user_agent,
             proxy_kind=ProxyKind.POOL_PROXY,
             proxy_id=pool_proxy.id,
+            proxy_lease_token=proxy_lease_token,
         )
 
     async def _maybe_probe_geo(self, proxy_pool: Any, pool_proxy: Any) -> None:
@@ -428,14 +435,35 @@ class BaseBrowserSolver:
                     solve_context.session, success=solved, burned=not solved
                 )
 
-        proxy_id = solve_context.proxy_id or params.pop("_pool_proxy_id", None)
+        stored_proxy_id = params.pop("_pool_proxy_id", None)
+        stored_lease_token = params.pop("_pool_proxy_lease_token", None)
+        proxy_id = solve_context.proxy_id or stored_proxy_id
+        lease_token = solve_context.proxy_lease_token or stored_lease_token
         if proxy_id and self._services is not None:
             proxy_pool = getattr(self._services, "proxy_pool", None)
             if proxy_pool is not None:
-                await proxy_pool.report(proxy_id, success=solved, bytes_used=bytes_used)
-                sitekey = params.get("websiteKey")
-                if sitekey:
-                    await proxy_pool.report_sitekey(proxy_id, sitekey, success=solved)
+                sitekey = str(params.get("websiteKey") or "")
+                report_solve = getattr(proxy_pool, "report_solve", None)
+                if lease_token and callable(report_solve):
+                    await report_solve(
+                        proxy_id,
+                        lease_token=str(lease_token),
+                        success=solved,
+                        bytes_used=bytes_used,
+                        sitekey=sitekey,
+                    )
+                else:
+                    await proxy_pool.report(
+                        proxy_id,
+                        success=solved,
+                        bytes_used=bytes_used,
+                    )
+                    if sitekey:
+                        await proxy_pool.report_sitekey(
+                            proxy_id,
+                            sitekey,
+                            success=solved,
+                        )
 
     async def _solve_with_retries(
         self,
