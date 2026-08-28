@@ -15,8 +15,9 @@ import logging
 import os
 from typing import Any, Optional
 
-from ..assets.indexed_proxy_pool import (
-    build_managed_proxy_pool as build_proxy_pool,
+from ..assets.atomic_proxy_pool import (
+    build_atomic_proxy_pool as build_proxy_pool,
+    snapshot_proxy_pool,
 )
 from ..assets.inventory import inventory_proxy_id
 from ..assets.model_pool import ModelPool
@@ -142,6 +143,11 @@ class SolverServices:
         if count:
             log.info("Prewarmed %d proxyless browser sessions", count)
         return count
+
+    async def proxy_snapshot(self) -> list[dict[str, Any]]:
+        """Return the proxy inventory without blocking the application loop."""
+
+        return await snapshot_proxy_pool(self.proxy_pool)
 
     def _load_proxy_inventory(self) -> None:
         """Seed durable proxy inventory from ``PROXY_POOL`` idempotently.
