@@ -63,6 +63,7 @@ jobs:
           src/assets/session_pool.py
           src/assets/model_pool.py
           src/assets/inventory.py
+          src/assets/indexed_proxy_pool.py
           src/core/services.py
           src/consumption/budget.py
           src/consumption/token_verify.py
