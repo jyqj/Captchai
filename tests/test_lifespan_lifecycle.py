@@ -128,6 +128,8 @@ def test_lifespan_normal_shutdown_is_dependency_ordered(monkeypatch):
             events.append("browser.stop")
 
     class _Services:
+        proxy_pool = object()
+
         @classmethod
         async def create(cls, config):
             events.append("services.create")
@@ -144,57 +146,49 @@ def test_lifespan_normal_shutdown_is_dependency_ordered(monkeypatch):
             events.append("services.close")
 
     class _TaskManager:
-        def configure(self, **kwargs) -> None:
+        def configure(self, *args, **kwargs) -> None:
             events.append("tasks.configure")
 
-        def register_solver(self, task_type, solver) -> None:
+        def register_solver(self, task_type, solver, category) -> None:
             return None
 
         async def shutdown(self) -> None:
             events.append("tasks.shutdown")
-
-    class _Registry:
-        hcaptcha = ()
-        turnstile = ()
-        recaptcha_v2 = ()
-        recaptcha_v3 = ()
-        classification = ()
-        recognition = ()
-        image_recognition = ()
-        recaptcha_classification = ()
-        all_types = ()
-
-    class _RegistryFactory:
-        @staticmethod
-        def default():
-            return _Registry()
 
     class _Solver:
         def __init__(self, *args, **kwargs) -> None:
             return None
 
         async def solve(self, params):
-            return None
+            return {}
 
     def _set_services(value) -> None:
-        events.append("services.set" if value is not None else "services.clear")
+        events.append(
+            "services.set" if value is not None else "services.clear"
+        )
 
     monkeypatch.setattr(main_module, "BrowserManager", _Browser)
     monkeypatch.setattr(main_module, "SolverServices", _Services)
     monkeypatch.setattr(main_module, "task_manager", _TaskManager())
-    monkeypatch.setattr(main_module, "TaskTypeRegistry", _RegistryFactory)
     monkeypatch.setattr(main_module, "set_services", _set_services)
     for name in (
+        "RecaptchaV3Solver",
+        "RecaptchaV2Solver",
         "HCaptchaSolver",
         "TurnstileSolver",
-        "RecaptchaV2Solver",
-        "RecaptchaV3Solver",
-        "ClassificationSolver",
         "CaptchaRecognizer",
-        "ImageRecognitionSolver",
-        "RecaptchaClassificationSolver",
+        "ClassificationSolver",
     ):
         monkeypatch.setattr(main_module, name, _Solver)
+    for name in (
+        "_RECAPTCHA_V3_TYPES",
+        "_RECAPTCHA_V2_TYPES",
+        "_HCAPTCHA_TYPES",
+        "_TURNSTILE_TYPES",
+        "_CLASSIFICATION_TYPES",
+        "_IMAGE_TEXT_TYPES",
+    ):
+        monkeypatch.setattr(main_module, name, ())
 
     async def scenario():
         async with main_module.lifespan(SimpleNamespace()):
