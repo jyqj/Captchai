@@ -1,0 +1,177 @@
+name: One-shot PR7 boundary fix
+
+on:
+  push:
+    branches:
+      - refactor/atomic-proxy-transactions
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: refactor/atomic-proxy-transactions
+          fetch-depth: 0
+
+      - name: Patch cooldown rehabilitation and typed snapshot boundary
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path("src/assets/atomic_proxy_pool.py")
+          source = source_path.read_text(encoding="utf-8")
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          source = replace_once(
+              source,
+              "from typing import Any, Dict, Iterable, List, Optional, Union",
+              "from typing import Any, Awaitable, Dict, Iterable, List, Optional, Union, cast",
+              "typing imports",
+          )
+          source = replace_once(
+              source,
+              '''            candidate_ids = await self._bounded_candidate_ids(kinds, sitekey)
+            if not candidate_ids:
+                candidate_ids = await self._expired_cooldown_ids(now)
+            if not candidate_ids:
+                return None
+''',
+              '''            candidate_ids = await self._bounded_candidate_ids(kinds, sitekey)
+            expired_ids = await self._expired_cooldown_ids(now)
+            if expired_ids:
+                # Reserve one slot for rehabilitation even while the active
+                # index is non-empty. Without this, an expired cooldown proxy
+                # can remain stranded forever behind a continuously available
+                # incumbent. When no active candidates exist, the full bounded
+                # window is available for cooldown recovery.
+                recovery_budget = (
+                    self._candidate_window if not candidate_ids else 1
+                )
+                candidate_ids = list(
+                    dict.fromkeys(
+                        [*expired_ids[:recovery_budget], *candidate_ids]
+                    )
+                )[: self._candidate_window]
+            if not candidate_ids:
+                return None
+''',
+              "cooldown recovery slot",
+          )
+          source = replace_once(
+              source,
+              '''    if callable(snapshot_async):
+        result = snapshot_async()
+        if inspect.isawaitable(result):
+            return await result
+        return list(result)
+    return await asyncio.to_thread(pool.snapshot)
+''',
+              '''    if callable(snapshot_async):
+        result = snapshot_async()
+        if not inspect.isawaitable(result):
+            raise TypeError("snapshot_async must return an awaitable")
+        return await cast(Awaitable[List[Dict[str, Any]]], result)
+    return await asyncio.to_thread(pool.snapshot)
+''',
+              "typed snapshot boundary",
+          )
+          compile(source, str(source_path), "exec")
+          source_path.write_text(source, encoding="utf-8")
+
+          test_path = Path("tests/test_atomic_proxy_pool.py")
+          tests = test_path.read_text(encoding="utf-8")
+          marker = '''def test_async_snapshot_uses_hscan_and_never_sync_hgetall() -> None:
+'''
+          addition = '''def test_atomic_checkout_rehabilitates_expired_cooldown_with_active_peer() -> None:
+    url = _redis_helper()
+    prefix = "test:atomic:rehabilitate:"
+
+    async def run() -> None:
+        import time
+
+        _flush_prefix(prefix)
+        pool = AtomicRedisProxyPool(
+            url,
+            key_prefix=prefix,
+            candidate_window=4,
+        )
+        try:
+            pool.add(
+                ProxyAsset(
+                    id="active",
+                    server="http://active:1",
+                    success_count=1,
+                    fail_count=9,
+                    sitekey_stats={"site": [1, 9]},
+                )
+            )
+            pool.add(
+                ProxyAsset(
+                    id="recovering",
+                    server="http://recovering:1",
+                    state="cooldown",
+                    cooldown_until=time.time() + 60,
+                    success_count=10,
+                    sitekey_stats={"site": [10, 0]},
+                )
+            )
+
+            blob = await pool._redis.hget(
+                pool._proxies_key, "recovering"
+            )
+            assert blob is not None
+            recovering = pool._deserialize(blob)
+            recovering.cooldown_until = time.time() - 1
+            await pool._redis.hset(
+                pool._proxies_key,
+                "recovering",
+                pool._serialize(recovering),
+            )
+            await pool._redis.zadd(
+                pool._cooldown_index_key,
+                {"recovering": recovering.cooldown_until},
+            )
+
+            # The active index is deliberately non-empty. Checkout must still
+            # reserve a bounded rehabilitation slot for the expired asset.
+            chosen = await pool.checkout(sitekey="site")
+            assert chosen is not None and chosen.id == "recovering"
+            await pool.report(chosen.id, success=True)
+        finally:
+            await pool.close()
+            _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+'''
+          tests = replace_once(
+              tests,
+              marker,
+              addition + marker,
+              "cooldown regression test",
+          )
+          compile(tests, str(test_path), "exec")
+          test_path.write_text(tests, encoding="utf-8")
+          PY
+
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/assets/atomic_proxy_pool.py tests/test_atomic_proxy_pool.py
+          git diff --cached --check
+          git commit -m "fix(proxy): rehabilitate cooldown assets and tighten typing"
+          git push origin HEAD:refactor/atomic-proxy-transactions
