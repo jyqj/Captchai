@@ -1,9 +1,9 @@
-"""FastAPI application with Playwright lifecycle management."""
+"""FastAPI application with transactional runtime lifecycle management."""
 
 from __future__ import annotations
 
 import logging
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 
 # Type lists derive from the single registry in ``core.task_types`` so solver
 # registration here, request validation in ``api/routes.py``, and the test
-# roster can't drift apart.
+# roster cannot drift apart.
 _RECAPTCHA_V3_TYPES = types_for_provider(Provider.RECAPTCHA_V3)
 _RECAPTCHA_V2_TYPES = types_for_provider(Provider.RECAPTCHA_V2)
 _HCAPTCHA_TYPES = types_for_provider(Provider.HCAPTCHA)
@@ -40,62 +40,101 @@ _IMAGE_TEXT_TYPES = types_for_provider(Provider.IMAGE_TO_TEXT)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # ── startup ──
-    # One Chromium process shared by every browser-based solver. Each solve
-    # still gets an isolated context (with its own proxy/UA), but we avoid
-    # launching four separate browsers.
-    browser = BrowserManager(config)
-    await browser.start()
+    """Build the runtime transactionally and unwind it in dependency order.
 
-    # Shared asset / consumption / vision layers, injected into the solvers.
-    services = SolverServices(config)
-    services.attach_browser(browser)
-    await services.prewarm_sessions()
-    set_services(services)
+    Cleanup callbacks are registered as soon as a resource becomes owned. A
+    failure before ``yield`` therefore cannot strand a partially-started
+    browser, a half-built shared service graph, or a configured task manager.
+    """
 
-    # Configure the task manager after services exist so the scheduler can peek
-    # the proxy pool for best-effort pool-proxy routing on egress="auto" tasks.
-    task_manager.configure(config, proxy_pool=services.proxy_pool)
+    del app
+    async with AsyncExitStack() as stack:
+        # ``BrowserManager.stop`` tolerates partial startup, so register it
+        # before launch. This covers driver/browser failures inside start().
+        browser = BrowserManager(config)
+        stack.push_async_callback(browser.stop)
+        await browser.start()
 
-    v3_solver = RecaptchaV3Solver(config, manager=browser, services=services)
-    for task_type in _RECAPTCHA_V3_TYPES:
-        task_manager.register_solver(task_type, v3_solver, TaskCategory.BROWSER)
-    log.info("Registered reCAPTCHA v3 solver for types: %s", _RECAPTCHA_V3_TYPES)
+        # Production construction is exception-safe: if a late Redis/backend
+        # step fails, ``create`` closes whatever was already allocated.
+        services = await SolverServices.create(config)
+        stack.push_async_callback(services.close)
+        services.attach_browser(browser)
+        await services.prewarm_sessions()
 
-    v2_solver = RecaptchaV2Solver(config, manager=browser, services=services)
-    for task_type in _RECAPTCHA_V2_TYPES:
-        task_manager.register_solver(task_type, v2_solver, TaskCategory.BROWSER)
-    log.info("Registered reCAPTCHA v2 solver for types: %s", _RECAPTCHA_V2_TYPES)
+        set_services(services)
+        stack.callback(set_services, None)
 
-    hcaptcha_solver = HCaptchaSolver(config, manager=browser, services=services)
-    for task_type in _HCAPTCHA_TYPES:
-        task_manager.register_solver(task_type, hcaptcha_solver, TaskCategory.BROWSER)
-    log.info("Registered hCaptcha solver for types: %s", _HCAPTCHA_TYPES)
+        # Register shutdown before configure/solver construction so failures in
+        # either phase still cancel runners and close the task store.
+        stack.push_async_callback(task_manager.shutdown)
+        task_manager.configure(config, proxy_pool=services.proxy_pool)
 
-    turnstile_solver = TurnstileSolver(config, manager=browser, services=services)
-    for task_type in _TURNSTILE_TYPES:
-        task_manager.register_solver(task_type, turnstile_solver, TaskCategory.BROWSER)
-    log.info("Registered Turnstile solver for types: %s", _TURNSTILE_TYPES)
+        v3_solver = RecaptchaV3Solver(config, manager=browser, services=services)
+        for task_type in _RECAPTCHA_V3_TYPES:
+            task_manager.register_solver(
+                task_type, v3_solver, TaskCategory.BROWSER
+            )
+        log.info(
+            "Registered reCAPTCHA v3 solver for types: %s",
+            _RECAPTCHA_V3_TYPES,
+        )
 
-    # Pure-vision tasks draw from a separate concurrency pool so a burst of image
-    # requests can't starve the browser solvers. Both share the model-call seam
-    # (via ``services``) so their spend is budget-gated and reaches the ledger.
-    recognizer = CaptchaRecognizer(config, services=services)
-    for task_type in _IMAGE_TEXT_TYPES:
-        task_manager.register_solver(task_type, recognizer, TaskCategory.VISION)
-    log.info("Registered image captcha recognizer for types: %s", _IMAGE_TEXT_TYPES)
+        v2_solver = RecaptchaV2Solver(config, manager=browser, services=services)
+        for task_type in _RECAPTCHA_V2_TYPES:
+            task_manager.register_solver(
+                task_type, v2_solver, TaskCategory.BROWSER
+            )
+        log.info(
+            "Registered reCAPTCHA v2 solver for types: %s",
+            _RECAPTCHA_V2_TYPES,
+        )
 
-    classifier = ClassificationSolver(config, services=services)
-    for task_type in _CLASSIFICATION_TYPES:
-        task_manager.register_solver(task_type, classifier, TaskCategory.VISION)
-    log.info("Registered classification solver for types: %s", _CLASSIFICATION_TYPES)
+        hcaptcha_solver = HCaptchaSolver(
+            config, manager=browser, services=services
+        )
+        for task_type in _HCAPTCHA_TYPES:
+            task_manager.register_solver(
+                task_type, hcaptcha_solver, TaskCategory.BROWSER
+            )
+        log.info(
+            "Registered hCaptcha solver for types: %s", _HCAPTCHA_TYPES
+        )
 
-    yield
-    # ── shutdown ──
-    await task_manager.shutdown()
-    await services.close()
-    set_services(None)
-    await browser.stop()
+        turnstile_solver = TurnstileSolver(
+            config, manager=browser, services=services
+        )
+        for task_type in _TURNSTILE_TYPES:
+            task_manager.register_solver(
+                task_type, turnstile_solver, TaskCategory.BROWSER
+            )
+        log.info(
+            "Registered Turnstile solver for types: %s", _TURNSTILE_TYPES
+        )
+
+        # Pure-vision tasks draw from a separate concurrency pool. Both share
+        # the model-call seam and therefore the same budget/ledger lifecycle.
+        recognizer = CaptchaRecognizer(config, services=services)
+        for task_type in _IMAGE_TEXT_TYPES:
+            task_manager.register_solver(
+                task_type, recognizer, TaskCategory.VISION
+            )
+        log.info(
+            "Registered image captcha recognizer for types: %s",
+            _IMAGE_TEXT_TYPES,
+        )
+
+        classifier = ClassificationSolver(config, services=services)
+        for task_type in _CLASSIFICATION_TYPES:
+            task_manager.register_solver(
+                task_type, classifier, TaskCategory.VISION
+            )
+        log.info(
+            "Registered classification solver for types: %s",
+            _CLASSIFICATION_TYPES,
+        )
+
+        yield
 
 
 app = FastAPI(
