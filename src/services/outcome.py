@@ -75,17 +75,28 @@ async def record_real_outcome(
 
     proxy_pool = getattr(services, "proxy_pool", None)
     if proxy_id and proxy_pool is not None:
-        try:
-            await proxy_pool.report(proxy_id, success=success)
-        except Exception:  # noqa: BLE001 - feedback must never 500 / fail a solve
-            log.debug("proxy_pool.report (real outcome) failed", exc_info=True)
-        if sitekey:
+        combined_feedback = getattr(proxy_pool, "report_real_outcome", None)
+        if callable(combined_feedback):
             try:
-                await proxy_pool.report_sitekey_real(
+                await combined_feedback(
                     proxy_id, sitekey, success=success
                 )
-            except Exception:  # noqa: BLE001
-                log.debug("proxy_pool.report_sitekey_real failed", exc_info=True)
+            except Exception:  # noqa: BLE001 - feedback is non-fatal
+                log.debug("proxy_pool.report_real_outcome failed", exc_info=True)
+        else:
+            try:
+                await proxy_pool.report(proxy_id, success=success)
+            except Exception:  # noqa: BLE001 - feedback must never fail a solve
+                log.debug("proxy_pool.report (real outcome) failed", exc_info=True)
+            if sitekey:
+                try:
+                    await proxy_pool.report_sitekey_real(
+                        proxy_id, sitekey, success=success
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug(
+                        "proxy_pool.report_sitekey_real failed", exc_info=True
+                    )
 
     accounting = getattr(services, "accounting", None)
     if accounting is not None:

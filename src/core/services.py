@@ -15,8 +15,8 @@ import logging
 import os
 from typing import Any, Optional
 
-from ..assets.atomic_proxy_pool import (
-    build_atomic_proxy_pool as build_proxy_pool,
+from ..assets.feedback_proxy_pool import (
+    build_feedback_proxy_pool as build_proxy_pool,
     snapshot_proxy_pool,
 )
 from ..assets.inventory import inventory_proxy_id
