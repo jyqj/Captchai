@@ -60,10 +60,12 @@ jobs:
         if: ${{ matrix.python-version == '3.12' }}
         run: >-
           pyright
+          src/api/routes.py
           src/assets/session_pool.py
           src/assets/model_pool.py
           src/assets/inventory.py
           src/assets/indexed_proxy_pool.py
+          src/assets/atomic_proxy_pool.py
           src/core/services.py
           src/consumption/budget.py
           src/consumption/token_verify.py
