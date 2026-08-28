@@ -15,9 +15,12 @@ import logging
 import os
 from typing import Any, Optional
 
+from ..assets.indexed_proxy_pool import (
+    build_managed_proxy_pool as build_proxy_pool,
+)
 from ..assets.inventory import inventory_proxy_id
 from ..assets.model_pool import ModelPool
-from ..assets.proxy_pool import build_proxy_pool, proxy_from_params
+from ..assets.proxy_pool import proxy_from_params
 from ..assets.session_pool import SessionPool
 from ..consumption.accounting import build_accounting
 from ..consumption.budget import BudgetGuard
