@@ -52,6 +52,33 @@ def _normalise_kinds(kind: KindFilter) -> Optional[frozenset[str]]:
     return values or None
 
 
+def _redis_text(value: Any) -> str:
+    """Normalise a decoded or byte Redis scalar into text."""
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _redis_members(values: Any) -> List[str]:
+    """Normalise Redis range responses across redis-py overloads."""
+
+    if values is None:
+        return []
+    if isinstance(values, (bytes, str)):
+        return [_redis_text(values)]
+
+    members: List[str] = []
+    for value in values:
+        # The redis-py union also includes withscores=True responses even
+        # though this scheduler never requests scores from range commands.
+        if isinstance(value, (list, tuple)) and value:
+            members.append(_redis_text(value[0]))
+        else:
+            members.append(_redis_text(value))
+    return members
+
+
 def _ordered_sitekeys(proxy: ProxyAsset) -> List[str]:
     """Return sitekeys in stable insertion order across both outcome buckets."""
 
@@ -484,9 +511,10 @@ class IndexedRedisProxyPool(RedisProxyPool):
             return
 
         pipe = self._sync_redis.pipeline(transaction=False)
-        for proxy_id, blob in raw.items():
+        for raw_proxy_id, blob in raw.items():
+            proxy_id = _redis_text(raw_proxy_id)
             try:
-                proxy = self._deserialize(blob)
+                proxy = self._deserialize(_redis_text(blob))
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 continue
             evicted = _prune_sitekey_history(
@@ -511,13 +539,15 @@ class IndexedRedisProxyPool(RedisProxyPool):
 
         # Remove stale ids from the finite availability indexes. Sitekey
         # indexes are cleaned lazily through their per-proxy reverse LRU.
-        existing_ids = set(raw)
+        existing_ids = {_redis_text(proxy_id) for proxy_id in raw}
         for key in (
             self._active_all_key,
             self._cooldown_index_key,
             *(self._active_kind_key(kind) for kind in _KNOWN_KINDS),
         ):
-            indexed = set(self._sync_redis.zrange(key, 0, -1))
+            indexed = set(
+                _redis_members(self._sync_redis.zrange(key, 0, -1))
+            )
             stale = indexed - existing_ids
             if stale:
                 pipe.zrem(key, *stale)
@@ -587,13 +617,14 @@ class IndexedRedisProxyPool(RedisProxyPool):
         )
 
     async def _promote_expired_locked(self, now: float) -> None:
-        ids = await self._redis.zrangebyscore(
+        raw_ids = await self._redis.zrangebyscore(
             self._cooldown_index_key,
             "-inf",
             now,
             start=0,
             num=self._candidate_window,
         )
+        ids = _redis_members(raw_ids)
         if not ids:
             return
 
@@ -605,7 +636,7 @@ class IndexedRedisProxyPool(RedisProxyPool):
                 pipe.delete(self._lease_key(str(proxy_id)))
                 continue
             try:
-                proxy = self._deserialize(blob)
+                proxy = self._deserialize(_redis_text(blob))
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 pipe.zrem(self._cooldown_index_key, proxy_id)
                 continue
@@ -641,19 +672,23 @@ class IndexedRedisProxyPool(RedisProxyPool):
         ids: List[str] = []
         if sitekey:
             ids.extend(
-                await self._redis.zrevrange(
-                    self._sitekey_index_key(sitekey),
-                    0,
-                    self._candidate_window - 1,
+                _redis_members(
+                    await self._redis.zrevrange(
+                        self._sitekey_index_key(sitekey),
+                        0,
+                        self._candidate_window - 1,
+                    )
                 )
             )
 
         if kinds is None:
             ids.extend(
-                await self._redis.zrevrange(
-                    self._active_all_key,
-                    0,
-                    self._candidate_window - 1,
+                _redis_members(
+                    await self._redis.zrevrange(
+                        self._active_all_key,
+                        0,
+                        self._candidate_window - 1,
+                    )
                 )
             )
         else:
@@ -665,10 +700,10 @@ class IndexedRedisProxyPool(RedisProxyPool):
                     self._candidate_window - 1,
                 )
             for chunk in await pipe.execute():
-                ids.extend(chunk)
+                ids.extend(_redis_members(chunk))
 
         # Preserve quality-index priority while removing duplicates.
-        return list(dict.fromkeys(str(proxy_id) for proxy_id in ids))
+        return list(dict.fromkeys(ids))
 
     async def _lease_counts_locked(
         self,
@@ -695,7 +730,9 @@ class IndexedRedisProxyPool(RedisProxyPool):
         delete_hash: bool,
     ) -> None:
         lru_key = self._sitekey_lru_key(proxy_id)
-        sitekeys = await self._redis.zrange(lru_key, 0, -1)
+        sitekeys = _redis_members(
+            await self._redis.zrange(lru_key, 0, -1)
+        )
         pipe = self._redis.pipeline(transaction=False)
         pipe.zrem(self._active_all_key, proxy_id)
         pipe.zrem(self._cooldown_index_key, proxy_id)
@@ -703,7 +740,7 @@ class IndexedRedisProxyPool(RedisProxyPool):
             pipe.zrem(self._active_kind_key(kind), proxy_id)
         for sitekey in sitekeys:
             pipe.zrem(
-                self._sitekey_index_key(str(sitekey)),
+                self._sitekey_index_key(sitekey),
                 proxy_id,
             )
         pipe.delete(self._lease_key(proxy_id))
@@ -740,7 +777,7 @@ class IndexedRedisProxyPool(RedisProxyPool):
                     )
                     continue
                 try:
-                    proxy = self._deserialize(blob)
+                    proxy = self._deserialize(_redis_text(blob))
                 except (
                     json.JSONDecodeError,
                     KeyError,
@@ -836,7 +873,7 @@ class IndexedRedisProxyPool(RedisProxyPool):
             if blob is None:
                 return
             try:
-                proxy = self._deserialize(blob)
+                proxy = self._deserialize(_redis_text(blob))
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 return
 
@@ -899,7 +936,7 @@ class IndexedRedisProxyPool(RedisProxyPool):
             if blob is None:
                 return
             try:
-                proxy = self._deserialize(blob)
+                proxy = self._deserialize(_redis_text(blob))
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 return
 
@@ -919,7 +956,7 @@ class IndexedRedisProxyPool(RedisProxyPool):
                     lru_key,
                     count - self._sitekey_limit,
                 )
-                evicted = [str(item[0]) for item in raw_evicted]
+                evicted = [_redis_text(item[0]) for item in raw_evicted]
                 for stale in evicted:
                     proxy.sitekey_stats.pop(stale, None)
                     proxy.real_sitekey_stats.pop(stale, None)
@@ -1004,23 +1041,23 @@ def build_managed_proxy_pool(
         60,
         int(getattr(config, "solve_timeout", 180)) + 30,
     )
-    common = {
-        "cooldown_seconds": int(
-            getattr(config, "proxy_cooldown", 120)
-        ),
-        "max_consecutive_fails": int(
-            getattr(config, "proxy_max_consecutive_fails", 3)
-        ),
-        "max_bytes_per_proxy": max_bytes,
-        "sitekey_limit": int(
-            getattr(config, "proxy_sitekey_limit", 128)
-        ),
-    }
+    cooldown_seconds = int(
+        getattr(config, "proxy_cooldown", 120)
+    )
+    max_consecutive_fails = int(
+        getattr(config, "proxy_max_consecutive_fails", 3)
+    )
+    sitekey_limit = int(
+        getattr(config, "proxy_sitekey_limit", 128)
+    )
     redis_url = getattr(config, "redis_url", None)
     if redis_url:
         return IndexedRedisProxyPool(
             redis_url,
-            **common,
+            cooldown_seconds=cooldown_seconds,
+            max_consecutive_fails=max_consecutive_fails,
+            max_bytes_per_proxy=max_bytes,
+            sitekey_limit=sitekey_limit,
             lock_wait_seconds=float(
                 getattr(config, "proxy_lock_wait_seconds", 2.0)
             ),
@@ -1030,6 +1067,9 @@ def build_managed_proxy_pool(
             lease_ttl_seconds=lease_ttl,
         )
     return ManagedProxyPool(
-        **common,
+        cooldown_seconds=cooldown_seconds,
+        max_consecutive_fails=max_consecutive_fails,
+        max_bytes_per_proxy=max_bytes,
+        sitekey_limit=sitekey_limit,
         lease_ttl_seconds=lease_ttl,
     )
