@@ -93,6 +93,21 @@ def all_task_type_names() -> list[str]:
     return [t.name for t in TASK_TYPES]
 
 
+def category_for(name: str) -> str | None:
+    """Concurrency category declared for ``name``, or ``None`` if unregistered.
+
+    ``task_manager`` consults this first, so a task type's pool assignment
+    comes from the same registry that drives solver wiring and request
+    validation — not from a second, hand-maintained map. ``None`` (a type the
+    registry does not know, e.g. a test double or a dynamically registered
+    solver) lets the manager fall back to its registration-time category.
+    """
+    for task_type in TASK_TYPES:
+        if task_type.name == name:
+            return task_type.category
+    return None
+
+
 def types_for_provider(provider: Provider) -> list[str]:
     """Task-type names handled by one provider, in declaration order."""
     return [t.name for t in TASK_TYPES if t.provider == provider]

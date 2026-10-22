@@ -19,12 +19,13 @@ import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     _ = sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.assets.model_pool import ModelUsage  # noqa: E402
+from src.assets.model_pool import ModelPool, ModelUsage  # noqa: E402
 from src.parsing.model_call import (  # noqa: E402
     ModelCallRequest,
     ModelInvoker,
@@ -64,6 +65,11 @@ class FakePool:
 
     def get(self, name):
         return self._clients[name]
+
+
+def _model_pool(local, cloud=None) -> ModelPool:
+    """Tests inject a duck-typed pool; cast it to the seam's declared type."""
+    return cast(ModelPool, FakePool(local, cloud))
 
 
 class FakeBudget:
@@ -111,7 +117,7 @@ def _png_b64() -> str:
 
 
 def _req(**over):
-    base = dict(
+    base: dict[str, Any] = dict(
         system_prompt="sys",
         user_text="hi",
         image_urls=["data:image/png;base64,AAAA"],
@@ -128,15 +134,15 @@ def _req(**over):
 
 
 def test_route_maps_tier_to_backend():
-    inv = ModelInvoker(FakePool(FakeClient("local")), _cfg(vision_cloud_enabled=True))
+    inv = ModelInvoker(_model_pool(FakeClient("local")), _cfg(vision_cloud_enabled=True))
     assert inv.route(1) == "local"
     assert inv.route(2) == "cloud"
-    inv2 = ModelInvoker(FakePool(FakeClient("local")), _cfg(vision_cloud_enabled=False))
+    inv2 = ModelInvoker(_model_pool(FakeClient("local")), _cfg(vision_cloud_enabled=False))
     assert inv2.route(2) == "local"  # cloud disabled → stay local
 
 
 def test_invoke_returns_content_usage_and_served_model():
-    pool = FakePool(FakeClient("local", '{"ok":1}', usage=(9, 3)))
+    pool = _model_pool(FakeClient("local", '{"ok":1}', usage=(9, 3)))
     inv = ModelInvoker(pool, _cfg())
     result = asyncio.run(inv.invoke(_req(tier=1)))
     assert result.content == '{"ok":1}'
@@ -147,7 +153,7 @@ def test_invoke_returns_content_usage_and_served_model():
 def test_invoke_connection_error_falls_back_to_cloud():
     local = FakeClient("local", error=ConnectionError("local down"))
     cloud = FakeClient("cloud", '{"via":"cloud"}', usage=(4, 2))
-    inv = ModelInvoker(FakePool(local, cloud), _cfg())
+    inv = ModelInvoker(_model_pool(local, cloud), _cfg())
     result = asyncio.run(inv.invoke(_req(tier=1)))
     assert result.model == "cloud"
     assert result.content == '{"via":"cloud"}'
@@ -158,7 +164,7 @@ def test_invoke_cloud_fallback_blocked_by_budget_denial():
     local = FakeClient("local", error=ConnectionError("down"))
     cloud = FakeClient("cloud", '{"via":"cloud"}')
     budget = FakeBudget(allowed=False)  # deny the local→cloud fallback
-    inv = ModelInvoker(FakePool(local, cloud), _cfg(), budget=budget)
+    inv = ModelInvoker(_model_pool(local, cloud), _cfg(), budget=budget)
     try:
         asyncio.run(inv.invoke(_req(tier=1)))
         raise AssertionError("expected the connection error to propagate")
@@ -169,7 +175,7 @@ def test_invoke_cloud_fallback_blocked_by_budget_denial():
 
 def test_guard_budget_downgrades_cloud_to_local():
     budget = FakeBudget(allowed=False, downgrade_to="local")
-    inv = ModelInvoker(FakePool(FakeClient("local")), _cfg(), budget=budget)
+    inv = ModelInvoker(_model_pool(FakeClient("local")), _cfg(), budget=budget)
     chosen = asyncio.run(inv.guard_budget("cloud", 0.01, "ck"))
     assert chosen == "local"
     assert budget.calls[0][2] == "cloud"
@@ -177,7 +183,7 @@ def test_guard_budget_downgrades_cloud_to_local():
 
 def test_guard_budget_ignores_local_calls():
     budget = FakeBudget(allowed=False)
-    inv = ModelInvoker(FakePool(FakeClient("local")), _cfg(), budget=budget)
+    inv = ModelInvoker(_model_pool(FakeClient("local")), _cfg(), budget=budget)
     # A local (free) call must never consult the budget.
     assert asyncio.run(inv.guard_budget("local", 0.01, "ck")) == "local"
     assert budget.calls == []

@@ -2,10 +2,6 @@
 
 <div class="hero hero--light" markdown>
 
-<div class="hero__visual">
-  <img src="assets/captchai-hero.png" alt="CaptchAI — self-hostable captcha solving service">
-</div>
-
 <div class="hero__copy" markdown>
 
 ## ⚡ Self-hostable captcha solving with a clean YesCaptcha-style API
@@ -16,7 +12,7 @@ CaptchAI combines **FastAPI**, **Playwright**, and **OpenAI-compatible multimoda
 
 [Get started](getting-started.md){ .md-button .md-button--primary }
 [API reference](api-reference.md){ .md-button }
-[GitHub](https://github.com/captchai-org/captchai){ .md-button }
+[GitHub](https://github.com/jyqj/Captchai){ .md-button }
 
 </div>
 

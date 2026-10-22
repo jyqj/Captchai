@@ -157,7 +157,8 @@ curl -s -X POST http://localhost:8000/getTaskResult \
 
 ## Operational notes
 
-- All classification tasks are **synchronous from the model's perspective** — the `asyncio.create_task` wrapper means the HTTP response is immediate, but the actual model call happens in the background.
-- Model accuracy depends entirely on the vision model configured via `CAPTCHA_MULTIMODAL_MODEL` (default: `qwen3.5-2b`).
-- For best results with classification, the `CAPTCHA_MODEL` (`gpt-5.4`) can be substituted by setting `CAPTCHA_MULTIMODAL_MODEL=gpt-5.4`.
-- Images should not be pre-resized — the solver handles normalization internally.
+- Classification runs asynchronously through the task manager: `createTask` returns immediately and the model call happens in the background; poll `getTaskResult`.
+- Classification is a tier-1 (local-backend) call. The local vision model is configured by `LOCAL_BASE_URL`, `LOCAL_API_KEY`, and `LOCAL_MODEL` (default `Qwen/Qwen3.5-2B`). Accuracy depends on that model.
+- There is no automatic substitution of the cloud chat model for classification. The cloud model is used only when `MODEL_CONNECTION_FALLBACK=true` (default) and the local call fails with a connection error, and only if `VISION_CLOUD_ENABLED=true` and the budget allows a paid call. Set `CLOUD_BASE_URL` / `CLOUD_API_KEY` / `CLOUD_MODEL` for that path.
+- Images are passed through as supplied: a missing `data:image/...;base64,` prefix is added (the mime type is sniffed with Pillow), but the solver does **not** resize or otherwise normalize the pixels. Pre-scale your images if the model benefits from it.
+- Each attempt is retried (`CAPTCHA_RETRIES`) on transient failures, including an unparseable model reply, and each attempt is recorded in the cost ledger.

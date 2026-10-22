@@ -35,19 +35,25 @@ In Hugging Face:
 
 In the Space settings, add the following secrets:
 
-- `CLIENT_KEY`
-- `CAPTCHA_API_KEY`
+- `CLIENT_KEY` — **required** for a public Space. Without it the service refuses to start (fail-closed) unless `ALLOW_ANONYMOUS=true`.
+- `CLOUD_API_KEY` — if you use the cloud model.
 
 Add or override variables as needed:
 
-- `CAPTCHA_BASE_URL`
-- `CAPTCHA_MODEL`
-- `CAPTCHA_MULTIMODAL_MODEL`
+- `CLOUD_BASE_URL`
+- `CLOUD_MODEL=gpt-5.4`
+- `CLOUD_AUDIO_MODEL=whisper-1`
+- `LOCAL_BASE_URL` / `LOCAL_MODEL` (if a local vision model is reachable)
+- `ADMIN_KEY` (protects `/admin/*`)
+- `RATE_LIMIT_RPM=60`
+- `SSRF_PROTECT=true`
 - `BROWSER_HEADLESS=true`
 - `BROWSER_TIMEOUT=30`
 - `SERVER_PORT=7860`
 
 Hugging Face Spaces typically expose applications on port `7860`, so set `SERVER_PORT=7860`.
+
+Legacy `CAPTCHA_*` variables are still accepted as fallbacks for the `CLOUD_*` / `LOCAL_*` values, but the split names are preferred.
 
 ## 4. Confirm the startup command
 
@@ -78,11 +84,19 @@ Once the Space is live, verify:
 curl https://<your-space-subdomain>.hf.space/
 ```
 
-### Health endpoint
+### Liveness endpoint
 
 ```bash
 curl https://<your-space-subdomain>.hf.space/api/v1/health
 ```
+
+### Readiness endpoint
+
+```bash
+curl -i https://<your-space-subdomain>.hf.space/ready
+```
+
+HTTP 200 means ready; HTTP 503 means a required subsystem (browser when browser task types are registered, or Redis when `REDIS_URL` is set) is unavailable.
 
 ### Create a detector task
 

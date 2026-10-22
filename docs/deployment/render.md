@@ -42,18 +42,29 @@ You can also import the included `render.yaml` blueprint.
 
 Set these as protected environment variables in the Render dashboard:
 
-- `CLIENT_KEY`
-- `CAPTCHA_API_KEY`
+- `CLIENT_KEY` — **required** for a public Render URL. Without it the service refuses to start (fail-closed) unless `ALLOW_ANONYMOUS=true`.
+- `CLOUD_API_KEY` — if you use the cloud model (audio transcription / hard-grid escalation).
 
 ### Recommended variables
 
-- `CAPTCHA_BASE_URL=https://your-openai-compatible-endpoint/v1`
-- `CAPTCHA_MODEL=gpt-5.4`
-- `CAPTCHA_MULTIMODAL_MODEL=qwen3.5-2b`
+- `CLOUD_BASE_URL=https://your-openai-compatible-endpoint/v1`
+- `CLOUD_MODEL=gpt-5.4`
+- `CLOUD_AUDIO_MODEL=whisper-1`
+- `LOCAL_BASE_URL=http://<your-model-host>:30000/v1` (only if you run a local vision model reachable from Render)
+- `LOCAL_MODEL=Qwen/Qwen3.5-2B`
+- `ADMIN_KEY=<strong-random-value>` (protects `/admin/*`)
+- `RATE_LIMIT_RPM=60`
+- `SSRF_PROTECT=true`
 - `CAPTCHA_RETRIES=3`
 - `CAPTCHA_TIMEOUT=30`
 - `BROWSER_HEADLESS=true`
 - `BROWSER_TIMEOUT=30`
+- `BROWSER_DISABLE_SANDBOX=true` — the bundled Dockerfile runs as a non-root user, so the sandbox is enabled by default. Set this only if Render's container cannot provide the user-namespace support Chromium's sandbox needs.
+- `REDIS_URL` — recommended for multi-instance deploys and restart persistence (Render Redis add-on). See `docs/getting-started.md` for what is shared vs per-process.
+
+The bundled `render.yaml` still lists legacy `CAPTCHA_*` variables; they remain accepted as fallbacks for the `CLOUD_*` / `LOCAL_*` values. Prefer overriding with the split names above.
+
+The Render health check is `GET /ready` (HTTP 200 ready / 503 not ready), not the detailed `/api/v1/health` endpoint.
 
 ## 4. Trigger the first deploy
 

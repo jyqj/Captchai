@@ -8,6 +8,14 @@ async ``context_factory`` — when it must. Sessions accrue a reputation and are
 retired (context closed) when their reputation drops below a threshold or they
 exceed ``max_solves``; a single solve failure no longer forces retirement.
 
+Permits bound only *in-use* sessions: a permit is held from ``checkout`` until
+``release``, so warm idle sessions never occupy a slot. Total live sessions are
+still bounded by ``size`` (idle sessions are evicted when a new egress identity
+needs room). Idle sessions are validated before reuse — a context whose browser
+disconnected, that was closed underneath us, or that exceeded the idle TTL /
+max age (``idle_ttl_seconds`` / ``max_age_seconds``, config-overridable) is
+retired rather than handed out.
+
 Idle sessions are bucketed by **egress identity**: pool-proxy-bound sessions
 are keyed by ``proxy.id``; server-IP (proxyless) sessions are keyed by the
 literal ``"proxyless"``. A session owns its proxy for its whole lifetime —
@@ -22,8 +30,9 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Sized
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, cast
 
 from .fingerprint import FingerprintProfile, generate_fingerprint
 from .proxy_pool import ProxyAsset
@@ -38,6 +47,32 @@ ContextFactory = Callable[
 # ``proxy.id`` as their bucket key.
 PROXYLESS_KEY = "proxyless"
 
+# Idle-session hygiene defaults (overridable via constructor / config):
+# a session that has sat idle longer than ``idle_ttl`` or that is older than
+# ``max_age`` is retired on the next checkout instead of being handed out.
+DEFAULT_IDLE_TTL_SECONDS = 300.0
+DEFAULT_MAX_AGE_SECONDS = 1800.0
+
+
+def _seconds_setting(
+    explicit: Optional[float],
+    config: Any,
+    attr: str,
+    default: float,
+) -> float:
+    """Resolve a duration setting: explicit arg > ``getattr(config, attr)`` > default.
+
+    Non-positive / unparsable values disable the bound (returned as ``0.0``).
+    """
+    value = explicit
+    if value is None:
+        value = getattr(config, attr, default) if config is not None else default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    return seconds if seconds > 0 else 0.0
+
 
 @dataclass
 class BrowserSession:
@@ -50,6 +85,9 @@ class BrowserSession:
     solves: int = 0
     reputation: float = 1.0
     warm: bool = False
+    # Monotonic timestamp of the last ``release`` into the idle buckets (0.0
+    # while in use). Drives the idle-TTL check at checkout.
+    idle_since: float = 0.0
 
 
 async def _maybe_await_close(context: Any) -> None:
@@ -78,13 +116,18 @@ class SessionPool:
         *,
         size: int = 4,
         max_solves: int = 8,
+        idle_ttl_seconds: Optional[float] = None,
+        max_age_seconds: Optional[float] = None,
+        config: Any = None,
     ) -> None:
         self._factory = context_factory
         self._size = size
         self._max_solves = max_solves
-        # Semaphore permits == number of live sessions allowed at once. A permit
-        # is held for a session's whole lifetime (in-use *and* idle) and only
-        # returned on retirement.
+        # Idle sessions must not hold permits: a permit is held only between
+        # ``checkout`` and ``release`` (i.e. while a session is in use), so an
+        # idle warm pool cannot starve new checkouts. Total live sessions
+        # (in-use + idle + in-flight creations) is still bounded by ``size``
+        # via the ``_creating`` / eviction accounting below.
         self._slots = asyncio.Semaphore(size)
         # Idle sessions bucketed by egress key: ``proxy.id`` for pool-proxy
         # sessions, ``"proxyless"`` for server-IP sessions. A checkout for a
@@ -92,7 +135,23 @@ class SessionPool:
         # identity is preserved across solves.
         self._idle: Dict[str, List[BrowserSession]] = {}
         self._in_use: Dict[str, BrowserSession] = {}
+        # Sessions currently holding a semaphore permit (exactly-once release
+        # guard, including cancellation during checkout).
+        self._permit_holders: set = set()
+        # Sessions whose context factory is currently running (they hold a
+        # permit but are not registered in ``_in_use`` yet).
+        self._creating = 0
         self._lock = asyncio.Lock()
+        # Stale-session hygiene (read from config via ``getattr`` when a config
+        # object is supplied; constructor kwargs win).
+        self._idle_ttl_seconds = _seconds_setting(
+            idle_ttl_seconds, config, "session_idle_ttl_seconds",
+            DEFAULT_IDLE_TTL_SECONDS,
+        )
+        self._max_age_seconds = _seconds_setting(
+            max_age_seconds, config, "session_max_age_seconds",
+            DEFAULT_MAX_AGE_SECONDS,
+        )
 
     async def checkout(
         self,
@@ -104,82 +163,127 @@ class SessionPool:
         """Return a warm idle session for ``key``, or create one (bounded by ``size``).
 
         Reuses the most recently idled session in the requested bucket when
-        possible. When none is idle it waits for a free slot and builds a new
+        possible. When none is idle it waits for a free permit and builds a new
         session via the factory, so the number of concurrently live sessions
         never exceeds ``size``. The fingerprint is seeded by ``proxy.id`` when
         a proxy is given (so a sticky proxy keeps a stable coherent identity
         across re-warms); proxyless sessions draw from entropy.
         """
         del sitekey  # accepted for call-site compatibility; not used for selection
-        # Claim a slot for a NEW session in this bucket. A free slot is used
-        # directly; otherwise an idle session from ANOTHER bucket is retired to
-        # free its slot (buckets share the global size bound, so warming a new
-        # egress identity may evict a stale one). Only when every slot is held
-        # by an *in-use* session — nothing is evictable — do we block until one
-        # is released.
-        while True:
-            async with self._lock:
-                session = self._pop_idle(key)
-                if session is not None:
-                    self._in_use[session.id] = session
-                    return session
-                if not self._slots.locked():
-                    # A slot is free (value > 0): acquiring is synchronous and
-                    # won't yield, so it's safe under the lock. Build below.
-                    await self._slots.acquire()
-                    break
-                evicted = self._evict_one_idle()
-            if evicted is not None:
-                # Retire the evicted session and free its slot, then retry. The
-                # freed slot may be taken by another coroutine, in which case we
-                # evict again or finally block.
-                await _maybe_await_close(evicted.context)
-                evicted.warm = False
-                self._slots.release()
-                continue
-            # Nothing evictable: all slots are held by in-use sessions. Block
-            # until one is released, then re-check idle / build below.
-            await self._slots.acquire()
-            break
-
-        async with self._lock:
-            session = self._pop_idle(key)
-            if session is not None:
-                self._slots.release()  # reusing instead of creating; give slot back
-                self._in_use[session.id] = session
-                return session
-
+        # A permit is held only for the checkout→release lifetime. Acquiring it
+        # first makes the cancellation window explicit: if this coroutine is
+        # cancelled after the permit is granted but before the session is
+        # handed off, the guard below releases the permit exactly once and
+        # closes any context the factory already opened.
+        await self._slots.acquire()
+        permit_held = True
+        created_context: Any = None
+        creating = False
         try:
-            # Seed by proxy id when given so a sticky proxy keeps a stable
-            # coherent identity; proxyless sessions draw from entropy. The
-            # proxy's exit-IP geo (timezone / locale) drives the fingerprint
-            # so a German residential IP presents Europe/Berlin + de-DE
-            # rather than en-US/New_York; ``None`` falls back to a random
-            # coherent identity (current behavior, no regression).
-            fingerprint = generate_fingerprint(
-                seed=proxy.id if proxy else None,
-                timezone_id=proxy.timezone if proxy else None,
-                locale=proxy.locale if proxy else None,
-                # P1-4: a mobile pool proxy gets an Android Chrome fingerprint.
-                mobile=bool(proxy and getattr(proxy, "kind", None) == "mobile"),
-            )
-            context, user_agent = await self._factory(fingerprint, proxy)
-        except BaseException:
-            self._slots.release()
-            raise
+            while True:
+                evicted: Optional[BrowserSession] = None
+                create = False
+                async with self._lock:
+                    now = time.monotonic()
+                    session = self._pop_idle(key)
+                    if session is not None:
+                        if self._session_usable(session, now):
+                            # Reusing a warm idle session: the permit stays held
+                            # until the caller releases it. Clear the idle clock
+                            # at checkout so the time the session spends in use
+                            # (a long solve) is never counted against the idle
+                            # TTL — it restarts at the next release.
+                            session.idle_since = 0.0
+                            self._in_use[session.id] = session
+                            self._permit_holders.add(session.id)
+                            permit_held = False
+                            return session
+                        # Stale / disconnected / over-age: retire, don't hand out.
+                        evicted = session
+                    else:
+                        live = (
+                            len(self._in_use)
+                            + self._creating
+                            + self._idle_count()
+                        )
+                        if live < self._size:
+                            # Room for a new session under the global bound.
+                            self._creating += 1
+                            creating = True
+                            create = True
+                        else:
+                            # Buckets share the global size bound, so warming a
+                            # new egress identity may retire an idle session
+                            # from another bucket. With a permit in hand there
+                            # is always one evictable unless accounting drifted;
+                            # in that case the permit is the authoritative
+                            # bound, so build rather than spin.
+                            evicted = self._evict_one_idle()
+                            if evicted is None:
+                                self._creating += 1
+                                creating = True
+                                create = True
+                if evicted is not None:
+                    await _maybe_await_close(evicted.context)
+                    evicted.warm = False
+                    continue
+                if not create:
+                    continue
 
-        session = BrowserSession(
-            id=str(uuid.uuid4()),
-            context=context,
-            fingerprint=fingerprint,
-            proxy=proxy,
-            user_agent=user_agent,
-            created_at=time.monotonic(),
-            warm=True,
-        )
-        async with self._lock:
-            self._in_use[session.id] = session
-        return session
+                # Build outside the lock: the factory is slow and must not
+                # stall other checkouts.
+                try:
+                    # Seed by proxy id when given so a sticky proxy keeps a
+                    # stable coherent identity; proxyless sessions draw from
+                    # entropy. The proxy's exit-IP geo (timezone / locale)
+                    # drives the fingerprint so a German residential IP presents
+                    # Europe/Berlin + de-DE rather than en-US/New_York; ``None``
+                    # falls back to a random coherent identity (no regression).
+                    fingerprint = generate_fingerprint(
+                        seed=proxy.id if proxy else None,
+                        timezone_id=proxy.timezone if proxy else None,
+                        locale=proxy.locale if proxy else None,
+                        # P1-4: a mobile pool proxy gets an Android Chrome
+                        # fingerprint.
+                        mobile=bool(
+                            proxy and getattr(proxy, "kind", None) == "mobile"
+                        ),
+                    )
+                    context, user_agent = await self._factory(fingerprint, proxy)
+                except BaseException:
+                    self._creating = max(0, self._creating - 1)
+                    creating = False
+                    raise
+                created_context = context
+                session = BrowserSession(
+                    id=str(uuid.uuid4()),
+                    context=context,
+                    fingerprint=fingerprint,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                    created_at=time.monotonic(),
+                    warm=True,
+                )
+                async with self._lock:
+                    self._creating = max(0, self._creating - 1)
+                    creating = False
+                    self._in_use[session.id] = session
+                    self._permit_holders.add(session.id)
+                # Handoff complete: ownership of the permit (and context) has
+                # moved to the caller / session.
+                permit_held = False
+                created_context = None
+                return session
+        except BaseException:
+            # CancelledError (or any failure) after acquiring the permit but
+            # before handoff. Clean up without double-releasing.
+            if creating:
+                self._creating = max(0, self._creating - 1)
+            if created_context is not None:
+                await _maybe_await_close(created_context)
+            if permit_held:
+                self._slots.release()
+            raise
 
     async def prewarm(self, *, sitekey: Optional[str] = None) -> int:
         """Create idle proxyless sessions up to the configured pool size.
@@ -209,6 +313,68 @@ class SessionPool:
                 del self._idle[key]
             return session
         return None
+
+    def _idle_count(self) -> int:
+        """Number of live idle sessions across all buckets."""
+        return sum(len(bucket) for bucket in self._idle.values())
+
+    def _session_expired(self, session: BrowserSession, now: float) -> bool:
+        """True when contiguous idle time or absolute max age has lapsed.
+
+        ``idle_since`` is cleared at checkout and re-stamped at release, so the
+        idle-TTL arm measures only time spent *continuously idle*. In-use time
+        (a long solve) is never counted against the idle TTL; ``max_age``
+        remains anchored to ``created_at``.
+        """
+        if (
+            self._idle_ttl_seconds
+            and session.idle_since
+            and now - session.idle_since > self._idle_ttl_seconds
+        ):
+            return True
+        if (
+            self._max_age_seconds
+            and now - session.created_at > self._max_age_seconds
+        ):
+            return True
+        return False
+
+    def _session_usable(self, session: BrowserSession, now: float) -> bool:
+        """Validate an idle session before handing it out.
+
+        Cheap synchronous checks only (this runs under ``self._lock``): TTL /
+        max age, then a liveness probe of the Playwright context. A closed
+        context raises on property access (``pages``) or reports a disconnected
+        browser (``browser.is_connected()``); either way the session is
+        considered dead and is retired by the caller instead of handed out.
+        Fakes without these attributes are treated as usable.
+        """
+        if self._session_expired(session, now):
+            return False
+        context = session.context
+        if context is None:
+            return False
+        try:
+            # ``pages`` is a property on a live Playwright context and raises
+            # once the context has been closed.
+            pages = getattr(context, "pages", None)
+            if callable(pages):
+                pages = pages()
+            if pages is not None:
+                # ``pages`` is a duck-typed Playwright reply; ``len`` is only
+                # here to touch the property so a closed context raises.
+                len(cast(Sized, pages))
+        except Exception:  # noqa: BLE001 - a probe failure means "not usable"
+            return False
+        try:
+            browser = getattr(context, "browser", None)
+            if browser is not None:
+                is_connected = getattr(browser, "is_connected", None)
+                if callable(is_connected) and not is_connected():
+                    return False
+        except Exception:  # noqa: BLE001
+            return False
+        return True
 
     def _evict_one_idle(self) -> Optional[BrowserSession]:
         """Pop the *least valuable* idle session to free its slot for a new one.
@@ -252,13 +418,15 @@ class SessionPool:
         """Return a session to its bucket, updating its reputation.
 
         Each release counts as one completed solve. A session is retired (its
-        context closed and its slot freed so a replacement can be created lazily
-        on the next ``checkout``) when it has reached ``max_solves`` OR its
-        reputation has dropped below the eviction threshold (0.3). A single
+        context closed and its checkout permit freed so a replacement can be
+        created lazily on the next ``checkout``) when it has reached
+        ``max_solves`` OR its reputation has dropped below the eviction
+        threshold (0.3) OR it has outlived the idle TTL / max age. A single
         solve failure no longer forces retirement: a fresh session (rep=1.0)
         survives one failure (1.0→0.6) and is only evicted after a second
         consecutive failure (0.6→0.2). Otherwise the session goes back to its
-        egress-keyed warm idle bucket.
+        egress-keyed warm idle bucket **without holding a permit** — permits
+        bound only concurrent in-use sessions.
 
         ``burned`` is accepted for backward compat (callers such as
         ``browser_solver`` still pass ``burned=not solved``) but no longer
@@ -266,11 +434,17 @@ class SessionPool:
 
         The session keeps its ``ProxyAsset`` reference for its whole lifetime;
         the caller (``browser_solver``) is responsible for ``proxy_pool.report``
-        on each solve. This method does NOT release the proxy back to the
-        proxy pool — only when the session retires does its slot come back.
+        on each solve. This method releases the checkout permit exactly once
+        (guarded by ``_permit_holders``) even if called twice.
         """
         async with self._lock:
-            self._in_use.pop(session.id, None)
+            known = self._in_use.pop(session.id, None) is not None
+            held = session.id in self._permit_holders
+            if held:
+                self._permit_holders.discard(session.id)
+        if not known and not held:
+            # Already retired / released: never double-release the permit.
+            return
 
         session.solves += 1
         if success:
@@ -278,29 +452,64 @@ class SessionPool:
         else:
             session.reputation = max(0.0, session.reputation - 0.4)
 
-        retire = session.solves >= self._max_solves or session.reputation < 0.3
+        now = time.monotonic()
+        # ``idle_since`` is 0 while the session is in use (cleared at
+        # checkout), so this expiry check only sees contiguous idle time plus
+        # the absolute max age from ``created_at`` — a long solve is not
+        # mistaken for a long idle period.
+        retire = (
+            session.solves >= self._max_solves
+            or session.reputation < 0.3
+            or self._session_expired(session, now)
+        )
         if retire:
-            await _maybe_await_close(session.context)
-            session.warm = False
-            self._slots.release()
+            try:
+                await _maybe_await_close(session.context)
+            finally:
+                session.warm = False
+                if held:
+                    self._slots.release()
             return
 
         session.warm = True
+        session.idle_since = now
         key = _bucket_key(session.proxy)
-        async with self._lock:
+        try:
+            async with self._lock:
+                self._idle.setdefault(key, []).append(session)
+                # Idle sessions hold no permit: hand it back once the session
+                # is safely in the idle bucket (so a waiting checkout sees it).
+                if held:
+                    self._slots.release()
+                    held = False
+        except BaseException:
+            # Cancelled while returning the session to idle: never leak the
+            # permit, and keep the session tracked so close_all can retire its
+            # context (it is no longer in ``_in_use``).
+            if held:
+                self._slots.release()
+                held = False
             self._idle.setdefault(key, []).append(session)
+            raise
 
     async def close_all(self) -> None:
-        """Retire every session (idle and in-use) and free all slots."""
+        """Retire every session (idle and in-use) and free all permits.
+
+        Only in-use sessions hold permits now; idle sessions are closed
+        without touching the semaphore.
+        """
         async with self._lock:
             sessions = list(self._in_use.values())
             for bucket in self._idle.values():
                 sessions.extend(bucket)
             self._idle.clear()
             self._in_use.clear()
+            permits = len(self._permit_holders)
+            self._permit_holders.clear()
         for session in sessions:
             await _maybe_await_close(session.context)
             session.warm = False
+        for _ in range(permits):
             self._slots.release()
 
     async def report_outcome(self, session_id: str, *, success: bool) -> bool:

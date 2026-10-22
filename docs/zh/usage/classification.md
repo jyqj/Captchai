@@ -65,6 +65,8 @@
 
 ## 注意事项
 
-- 所有分类任务均通过 `CAPTCHA_MULTIMODAL_MODEL`（默认：`qwen3.5-2b`）指定的视觉模型处理。
-- 模型准确性取决于所配置的视觉模型质量。
-- 图片无需预先缩放，求解器内部会处理归一化。
+- 分类通过任务管理器异步执行：`createTask` 立即返回，模型调用在后台进行；请轮询 `getTaskResult`。
+- 分类属于 tier-1（本地后端）调用。本地视觉模型由 `LOCAL_BASE_URL`、`LOCAL_API_KEY`、`LOCAL_MODEL`（默认 `Qwen/Qwen3.5-2B`）配置，准确性取决于该模型。
+- 不会自动用云端聊天模型替代分类模型。仅当 `MODEL_CONNECTION_FALLBACK=true`（默认）且本地调用出现连接错误，同时 `VISION_CLOUD_ENABLED=true` 且预算允许付费调用时，才会使用云端模型；该路径需要配置 `CLOUD_BASE_URL` / `CLOUD_API_KEY` / `CLOUD_MODEL`。
+- 图片按原样传入：仅当缺少 `data:image/...;base64,` 前缀时补上（用 Pillow 嗅探 mime 类型），求解器**不会**缩放或做像素级归一化。若模型需要，请自行预先缩放。
+- 每次尝试（`CAPTCHA_RETRIES`）在瞬时失败（包括模型回复无法解析）时会重试，且每次尝试都会记入成本账本。

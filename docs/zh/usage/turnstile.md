@@ -2,6 +2,8 @@
 
 Cloudflare Turnstile 是一种无感或组件式验证码替代方案。求解器使用 Chromium 访问目标页面，与 Turnstile 组件交互，并从隐藏的 `cf-turnstile-response` 输入字段中提取令牌。
 
+导航前，当 `SSRF_PROTECT=true`（默认）时会校验 `websiteURL`：仅 http(s)，主机必须可解析，且所有解析地址必须为公网。DNS 解析失败为放行（记录日志）；解析到回环/私有/链路本地/保留/多播/未指定地址则拒绝。
+
 ## 支持的任务类型
 
 | 任务类型 | 说明 |

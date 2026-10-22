@@ -42,18 +42,29 @@
 
 请在 Render 控制台中配置以下受保护变量：
 
-- `CLIENT_KEY`
-- `CAPTCHA_API_KEY`
+- `CLIENT_KEY` — 公网 Render 地址**必需**。未设置时服务会拒绝启动（默认拒绝），除非 `ALLOW_ANONYMOUS=true`。
+- `CLOUD_API_KEY` — 使用云端模型（音频转写 / 困难网格升级）时需要。
 
 ### 建议变量
 
-- `CAPTCHA_BASE_URL=https://your-openai-compatible-endpoint/v1`
-- `CAPTCHA_MODEL=gpt-5.4`
-- `CAPTCHA_MULTIMODAL_MODEL=qwen3.5-2b`
+- `CLOUD_BASE_URL=https://your-openai-compatible-endpoint/v1`
+- `CLOUD_MODEL=gpt-5.4`
+- `CLOUD_AUDIO_MODEL=whisper-1`
+- `LOCAL_BASE_URL=http://<your-model-host>:30000/v1`（仅当有可从 Render 访问的本地视觉模型）
+- `LOCAL_MODEL=Qwen/Qwen3.5-2B`
+- `ADMIN_KEY=<强随机值>`（保护 `/admin/*`）
+- `RATE_LIMIT_RPM=60`
+- `SSRF_PROTECT=true`
 - `CAPTCHA_RETRIES=3`
 - `CAPTCHA_TIMEOUT=30`
 - `BROWSER_HEADLESS=true`
 - `BROWSER_TIMEOUT=30`
+- `BROWSER_DISABLE_SANDBOX=true` — 仓库 Dockerfile 以非 root 用户运行，因此默认启用沙箱。仅当 Render 容器无法提供 Chromium 沙箱所需的 user-namespace 支持时才设置该项。
+- `REDIS_URL` — 多实例部署与重启保留推荐使用（Render Redis 附加服务）。共享与每进程状态的说明见 `docs/zh/getting-started.md`。
+
+仓库自带的 `render.yaml` 仍列出旧版 `CAPTCHA_*` 变量；它们仍作为 `CLOUD_*` / `LOCAL_*` 的回退被接受。建议用上面的拆分名称覆盖。
+
+Render 健康检查使用 `GET /ready`（HTTP 200 就绪 / 503 未就绪），而不是详细状态端点 `/api/v1/health`。
 
 ## 4. 触发首次部署
 

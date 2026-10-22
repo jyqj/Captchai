@@ -15,12 +15,15 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.consumption.ledger import CostLedger  # noqa: E402
+from src.core.config import Config  # noqa: E402
+from src.services.browser import BrowserManager  # noqa: E402
 from src.services.turnstile import TurnstileSolver  # noqa: E402
 
 
@@ -55,7 +58,7 @@ class FakeRoute:
 
     def __init__(self, resource_type="document"):
         self.request = SimpleNamespace(resource_type=resource_type)
-        self.fulfilled = None
+        self.fulfilled: dict | None = None
         self.continued = False
 
     async def fulfill(self, *, status=200, content_type=None, body=None):
@@ -66,7 +69,9 @@ class FakeRoute:
 
 
 class FakePage:
-    def __init__(self, *, token="cf_" + "t" * 40, error=None, token_after=0):
+    def __init__(
+        self, *, token: str | None = "cf_" + "t" * 40, error=None, token_after=0
+    ):
         self.clicks = []
         self._token = token
         self._error = error
@@ -123,8 +128,9 @@ class FakeManager:
         return self._context, "UA-TS"
 
 
-def _config():
-    return SimpleNamespace(
+def _config(**over: Any) -> Config:
+    # Tests exercise the solver without building a full Config.
+    base = dict(
         captcha_retries=1,
         browser_timeout=5,
         poll_budget=2,
@@ -134,6 +140,8 @@ def _config():
         human_mouse_enabled=False,
         human_mouse_jitter_ms=0,
     )
+    base.update(over)
+    return cast(Config, SimpleNamespace(**base))
 
 
 def _services():
@@ -167,7 +175,8 @@ def test_turnstile_solve_returns_token_and_records() -> None:
     async def run() -> None:
         page = FakePage(token="cf_" + "t" * 40)
         context = FakeContext(page)
-        manager = FakeManager(context)
+        # FakeManager duck-types only the new_context seam the solver uses.
+        manager = cast(BrowserManager, FakeManager(context))
         services = _services()
 
         solver = TurnstileSolver(_config(), manager=manager, services=services)
@@ -197,7 +206,8 @@ def test_turnstile_poll_waits_then_returns_token() -> None:
     async def run() -> None:
         page = FakePage(token="cf_" + "z" * 40, token_after=2)
         context = FakeContext(page)
-        manager = FakeManager(context)
+        # FakeManager duck-types only the new_context seam the solver uses.
+        manager = cast(BrowserManager, FakeManager(context))
         solver = TurnstileSolver(_config(), manager=manager, services=None)
 
         result = await solver.solve(
@@ -218,7 +228,8 @@ def test_turnstile_widget_error_surfaced() -> None:
     async def run() -> None:
         page = FakePage(token=None, error="network-error")
         context = FakeContext(page)
-        manager = FakeManager(context)
+        # FakeManager duck-types only the new_context seam the solver uses.
+        manager = cast(BrowserManager, FakeManager(context))
         solver = TurnstileSolver(_config(), manager=manager, services=None)
 
         try:
@@ -241,7 +252,8 @@ def test_turnstile_forwards_render_options_to_injected_page() -> None:
     async def run() -> None:
         page = FakePage(token="cf_" + "t" * 40)
         context = FakeContext(page)
-        manager = FakeManager(context)
+        # FakeManager duck-types only the new_context seam the solver uses.
+        manager = cast(BrowserManager, FakeManager(context))
         solver = TurnstileSolver(_config(), manager=manager, services=None)
 
         await solver.solve(
@@ -260,6 +272,7 @@ def test_turnstile_forwards_render_options_to_injected_page() -> None:
         _url, handler = context.routes[0]
         route = FakeRoute(resource_type="document")
         await handler(route)
+        assert route.fulfilled is not None
         body = route.fulfilled["body"]
         assert '"action": "login"' in body
         assert '"cData": "session-123"' in body
@@ -284,9 +297,9 @@ def test_turnstile_real_page_hooks_render_via_init_script() -> None:
     async def run() -> None:
         page = FakePage(token="cf_" + "t" * 40)
         context = FakeContext(page)
-        manager = FakeManager(context)
-        config = _config()
-        config.turnstile_real_page = True
+        # FakeManager duck-types only the new_context seam the solver uses.
+        manager = cast(BrowserManager, FakeManager(context))
+        config = _config(turnstile_real_page=True)
         solver = TurnstileSolver(config, manager=manager, services=None)
 
         result = await solver.solve(
@@ -316,7 +329,8 @@ def test_turnstile_release_solved_false_on_timeout() -> None:
     async def run() -> None:
         page = FakePage(token=None, error=None)
         context = FakeContext(page)
-        manager = FakeManager(context)
+        # FakeManager duck-types only the new_context seam the solver uses.
+        manager = cast(BrowserManager, FakeManager(context))
         solver = TurnstileSolver(_config(), manager=manager, services=None)
 
         released: list = []

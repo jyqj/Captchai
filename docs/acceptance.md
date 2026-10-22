@@ -93,10 +93,10 @@ curl -s -X POST http://localhost:8000/createTask \
 
 Headless browsers are detected by Google's risk analysis engine. The checkbox click succeeds, but a visual image challenge is presented rather than issuing a token immediately.
 
-**Implemented mitigation:** The solver falls back to the **audio challenge path** — clicking the audio button in the challenge dialog, downloading the MP3, transcribing via the configured model, and submitting the transcript.
+**Implemented mitigation:** The solver falls back to the **audio challenge path** — clicking the audio button in the challenge dialog, downloading the MP3 through the solve's egress, transcribing via the configured speech-to-text model, and submitting the transcript.
 
 !!! note "Audio challenge transcription"
-    The audio challenge requires a language model capable of processing audio or base64-encoded audio data. Accuracy depends on the model endpoint configured via `CAPTCHA_MODEL`.
+    The audio path uses `CLOUD_AUDIO_MODEL` (default `whisper-1`) on the `CLOUD_BASE_URL` endpoint via `audio.transcriptions`. `CLOUD_MODEL` is a chat model and is not used for audio. Accuracy depends on the configured endpoint. Audio URLs are restricted to `https` on Google-owned host suffixes, redirects are refused, and the download is capped at 5 MB.
 
 ### Curl example
 

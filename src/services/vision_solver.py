@@ -16,15 +16,52 @@ visible as browser-solve spend.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-from ..parsing.model_call import ModelCallRequest, ModelCallResult, ModelInvoker
+from ..parsing.model_call import (
+    ModelCallRequest,
+    ModelCallResult,
+    ModelInvoker,
+    is_connection_error,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _is_transient_model_error(exc: BaseException) -> bool:
+    """Classify a model-call / parse failure as retryable.
+
+    Transient: connection/timeout failures, rate limits, 5xx responses and an
+    unparseable model reply (a fresh sample usually fixes a malformed one).
+    Permanent: bad requests, auth/permission errors, unsupported models — a
+    retry would spend tokens on the same guaranteed failure.
+    """
+    if isinstance(exc, ValueError):
+        # ``json.JSONDecodeError`` is a ValueError; so is a non-object reply.
+        return True
+    if is_connection_error(exc):
+        return True
+    for klass in type(exc).__mro__:
+        if klass.__name__ in (
+            "RateLimitError",
+            "APIRateLimitError",
+            "InternalServerError",
+            "ServiceUnavailableError",
+        ):
+            return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and (status == 429 or status >= 500):
+        return True
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int) and (status == 429 or status >= 500):
+        return True
+    return False
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -85,25 +122,44 @@ class VisionSolveBase:
         params: dict[str, Any],
         *,
         challenge_shape: str,
-    ) -> ModelCallResult:
+        parse: Optional[Callable[[ModelCallResult], Any]] = None,
+    ) -> Any:
         """Run the model call with the solvers' retry budget, then meter it.
 
-        Preserves the pre-seam retry count (``captcha_retries``): a transient
-        failure retries the whole invoke (which itself does one connection-error
-        backend fallback). Exactly one :class:`SolveRecord` is written per
-        solve — on the successful call, or once after the final failed attempt.
+        Preserves the pre-seam retry count (``captcha_retries``). ``parse`` (the
+        free-form solvers' JSON parsing/normalisation) runs INSIDE the retried
+        and metered unit, so a malformed model reply is retried instead of
+        surfacing after the retry budget was spent on transport successes.
+
+        Every attempt books its own :class:`SolveRecord`: a successful attempt
+        as ``"ready"``; a failed one as ``"failed"`` with the usage that attempt
+        actually consumed (a reply that parsed badly was still billed by the
+        provider). Metering failures never fail a solve.
+
+        Retry classification: transient failures (connection / timeout / rate
+        limit / 5xx / unparseable reply) back off with deterministic jitter;
+        permanent request failures surface immediately.
         """
         retries = max(1, int(getattr(self._config, "captcha_retries", 3)))
         client_key = params.get("_clientKey")
-        started = time.monotonic()
         last_error: Optional[Exception] = None
         for attempt in range(retries):
+            attempt_started = time.perf_counter()
+            result: Optional[ModelCallResult] = None
             try:
                 result = await self._invoker.invoke(req, client_key=client_key)
-                await self._meter(params, result, "ready", started, challenge_shape)
-                return result
-            except Exception as exc:  # noqa: BLE001 - retry then surface below
+                parsed = parse(result) if parse is not None else result
+                await self._meter(
+                    params, result, "ready", attempt_started, challenge_shape
+                )
+                return parsed
+            except Exception as exc:  # noqa: BLE001 - classified below
                 last_error = exc
+                # Book the attempt even when it failed: the invoke may have
+                # consumed tokens (e.g. the reply was unparseable).
+                await self._meter(
+                    params, result, "failed", attempt_started, challenge_shape
+                )
                 log.warning(
                     "%s attempt %d/%d failed: %s",
                     type(self).__name__,
@@ -111,10 +167,28 @@ class VisionSolveBase:
                     retries,
                     exc,
                 )
-        await self._meter(params, None, "failed", started, challenge_shape)
+                if not _is_transient_model_error(exc):
+                    raise
+                if attempt < retries - 1:
+                    await self._sleep_retry(attempt)
         raise RuntimeError(
             f"{type(self).__name__} failed after {retries} attempts: {last_error}"
         )
+
+    async def _sleep_retry(self, attempt: int) -> None:
+        """Exponential backoff with deterministic jitter between attempts.
+
+        No ``random`` import: the jitter is derived from the attempt index
+        (``attempt * 0.37`` fractional part), which is enough to de-synchronise
+        concurrent retries without making tests flaky. ``retry_backoff_base`` /
+        ``retry_backoff_max`` are honoured (set them to 0 in tests).
+        """
+        base = float(getattr(self._config, "retry_backoff_base", 1.0))
+        cap = float(getattr(self._config, "retry_backoff_max", 8.0))
+        delay = min(cap, base * (2 ** attempt))
+        delay += ((attempt * 0.37) % 1.0) * delay * 0.25
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     async def _meter(
         self,
@@ -136,27 +210,49 @@ class VisionSolveBase:
             return
         from ..consumption.ledger import SolveRecord, estimate_cost
 
-        model = result.model if result is not None else None
+        # Concrete served model id (``ModelClient.model``) — what pricing keys
+        # on. ``backend`` is the routing alias ("local"/"cloud") that actually
+        # served the call; it is kept as the record's routing dimension AND
+        # passed to pricing, where a local backend is authoritative and free
+        # even if the configured local model id has no local marker.
+        actual_model = result.model if result is not None else None
+        backend = getattr(result, "backend", "") if result is not None else ""
+        backend_kind = (backend or "").strip().lower() or None
+        model = backend or actual_model
         in_tok = result.usage.input_tokens if result is not None else 0
         out_tok = result.usage.output_tokens if result is not None else 0
-        wall_ms = int((time.monotonic() - started) * 1000)
+        wall_ms = int((time.perf_counter() - started) * 1000)
         try:
-            await self._ledger.record(
-                SolveRecord(
-                    task_id=str(params.get("_taskId") or ""),
-                    sitekey=str(params.get("websiteKey") or ""),
-                    task_type=str(params.get("type") or "unknown"),
-                    model=model,
-                    challenge_shape=challenge_shape,
-                    vision_calls=1 if result is not None else 0,
-                    input_tokens=in_tok,
-                    output_tokens=out_tok,
-                    wall_ms=wall_ms,
-                    vision_ms=wall_ms,
-                    outcome=outcome,
-                    est_cost_usd=estimate_cost(model or "local", in_tok, out_tok),
-                    client_key=params.get("_clientKey"),
-                )
+            rec = SolveRecord(
+                task_id=str(params.get("_taskId") or ""),
+                sitekey=str(params.get("websiteKey") or ""),
+                task_type=str(params.get("type") or "unknown"),
+                model=model,
+                actual_model=actual_model,
+                challenge_shape=challenge_shape,
+                vision_calls=1 if result is not None else 0,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                wall_ms=wall_ms,
+                vision_ms=wall_ms,
+                outcome=outcome,
+                est_cost_usd=estimate_cost(
+                    model or "local",
+                    in_tok,
+                    out_tok,
+                    actual_model=actual_model,
+                    backend=backend_kind,
+                ),
+                client_key=params.get("_clientKey"),
             )
+            try:
+                await self._ledger.record(
+                    rec, actual_model=actual_model, backend=backend_kind
+                )
+            except TypeError:
+                # Duck-typed ledgers that predate the Wave-A kwargs: the
+                # concrete id still rides on the record (`actual_model`), which
+                # the ledger's `_apply_actual_model` reads.
+                await self._ledger.record(rec)
         except Exception as exc:  # noqa: BLE001 - metering never fails a solve
             log.debug("vision ledger record failed: %s", exc)

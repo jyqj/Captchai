@@ -10,8 +10,10 @@ CaptchAI uses two model backends:
 
 | Backend | Role | Env vars | Default |
 |---------|------|----------|---------|
-| **Local model** | Image recognition & classification (high-throughput, self-hosted) | `LOCAL_BASE_URL`, `LOCAL_API_KEY`, `LOCAL_MODEL` | `http://localhost:30000/v1`, `EMPTY`, `Qwen/Qwen3.5-2B` |
-| **Cloud model** | Audio transcription & complex reasoning (powerful remote API) | `CLOUD_BASE_URL`, `CLOUD_API_KEY`, `CLOUD_MODEL` | External endpoint, your key, `gpt-5.4` |
+| **Local model** | Image recognition & classification (high-throughput, self-hosted) | `LOCAL_BASE_URL`, `LOCAL_API_KEY`, `LOCAL_MODEL`, `LOCAL_MAX_CONCURRENCY` | `http://localhost:30000/v1`, `EMPTY`, `Qwen/Qwen3.5-2B`, `0` (unlimited) |
+| **Cloud model** | Audio transcription & hard-grid escalation (powerful remote API) | `CLOUD_BASE_URL`, `CLOUD_API_KEY`, `CLOUD_MODEL`, `CLOUD_AUDIO_MODEL`, `CLOUD_MAX_CONCURRENCY` | External endpoint, your key, `gpt-5.4`, `whisper-1`, `4` |
+
+`MODEL_CONNECTION_FALLBACK=true` (default) retries a connection-failed call once on the other backend: local → cloud only when `VISION_CLOUD_ENABLED=true` and the budget allows it; cloud → local always.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -96,10 +98,11 @@ export LOCAL_BASE_URL="http://localhost:30000/v1"
 export LOCAL_API_KEY="EMPTY"
 export LOCAL_MODEL="Qwen/Qwen3.5-2B"
 
-# Cloud model (remote API for audio transcription etc.)
+# Cloud model (remote API for audio transcription / hard-grid escalation)
 export CLOUD_BASE_URL="https://your-api-endpoint/v1"
 export CLOUD_API_KEY="sk-your-key"
 export CLOUD_MODEL="gpt-5.4"
+export CLOUD_AUDIO_MODEL="whisper-1"
 
 # Other config
 export CLIENT_KEY="your-client-key"
@@ -123,10 +126,21 @@ curl http://localhost:8000/api/v1/health
   "status": "ok",
   "supported_task_types": ["RecaptchaV3TaskProxyless", "..."],
   "browser_headless": true,
+  "browser_runtime": "chromium",
+  "browser_runtime_requested": "chromium",
+  "browser_runtime_effective": "chromium",
+  "browser_runtime_degraded": false,
+  "browser_driver": "playwright",
+  "browser_ready": true,
+  "degraded": false,
+  "degraded_subsystems": [],
+  "model_backends": {"local": {"state": "closed", "healthy": true}, "cloud": {"...": "..."}},
   "cloud_model": "gpt-5.4",
   "local_model": "Qwen/Qwen3.5-2B"
 }
 ```
+
+For orchestrators, `GET /ready` returns HTTP 200/503 with per-check readiness (browser + Redis when configured).
 
 ## Alternative: vLLM
 
@@ -144,7 +158,7 @@ No changes to the CaptchAI configuration are needed — both SGLang and vLLM exp
 
 ## Backward compatibility
 
-The legacy environment variables (`CAPTCHA_BASE_URL`, `CAPTCHA_API_KEY`, `CAPTCHA_MODEL`, `CAPTCHA_MULTIMODAL_MODEL`) are still supported as fallbacks. If you set `CAPTCHA_BASE_URL` without setting `CLOUD_BASE_URL`, the old value will be used. The new `LOCAL_*` and `CLOUD_*` variables take precedence when set.
+The legacy environment variables (`CAPTCHA_BASE_URL`, `CAPTCHA_API_KEY`, `CAPTCHA_MODEL`, `CAPTCHA_MULTIMODAL_MODEL`) are still supported as fallbacks for the split backends. `CLOUD_BASE_URL` falls back to `CAPTCHA_BASE_URL`; `LOCAL_BASE_URL` uses `CAPTCHA_BASE_URL` only when `LOCAL_BASE_URL` is unset. `CLOUD_MODEL`/`LOCAL_MODEL` fall back to `CAPTCHA_MODEL`/`CAPTCHA_MULTIMODAL_MODEL`, and both API keys fall back to `CAPTCHA_API_KEY`. The `LOCAL_*` and `CLOUD_*` variables take precedence when set. `CLOUD_AUDIO_MODEL` has no legacy alias.
 
 ## Recommended models
 

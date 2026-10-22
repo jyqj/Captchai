@@ -2,10 +2,6 @@
 
 <div class="hero hero--light" markdown>
 
-<div class="hero__visual">
-  <img src="../assets/captchai-hero.png" alt="CaptchAI — 自托管验证码求解服务">
-</div>
-
 <div class="hero__copy" markdown>
 
 ## ⚡ 面向自托管场景的 YesCaptcha 风格验证码服务
@@ -16,7 +12,7 @@ CaptchAI 将 **FastAPI**、**Playwright** 与 **OpenAI-compatible 多模态模�
 
 [快速开始](getting-started.md){ .md-button .md-button--primary }
 [API 参考](api-reference.md){ .md-button }
-[GitHub](https://github.com/captchai-org/captchai){ .md-button }
+[GitHub](https://github.com/jyqj/Captchai){ .md-button }
 
 </div>
 

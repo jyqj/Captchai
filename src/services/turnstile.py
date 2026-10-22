@@ -33,9 +33,30 @@ import logging
 from typing import Any, Optional
 
 from .browser_solver import SolveStage
+from .captcha_errors import (
+    CaptchaError,
+    NonRetryableWidgetError,
+    RetryableWidgetError,
+)
 from .injected_widget import InjectedWidgetSolver
 
 log = logging.getLogger(__name__)
+
+#: Cloudflare's documented ``error-callback`` codes -> (description, retryable).
+#: The four 110x00 codes are request-level faults (the widget was rendered with
+#: an invalid sitekey/action/cData/chlPageData) — retrying the identical render
+#: can never succeed, so they must fail fast. The 1xx000 / 3xx010 / 6xx010
+#: codes are transient challenge failures worth another attempt.
+_TURNSTILE_ERROR_CODES: dict[str, tuple[str, bool]] = {
+    "110000": ("invalid sitekey", False),
+    "110100": ("invalid action", False),
+    "110200": ("invalid cData", False),
+    "110300": ("invalid chlPageData", False),
+    "120000": ("challenge error", True),
+    "130000": ("unknown error", True),
+    "300010": ("challenge timed out", True),
+    "600010": ("challenge failed", True),
+}
 
 # Token extractor. Reads the shared-DOM ``#omc-result`` FIRST so it works under
 # Camoufox (whose isolated-world evaluate can't see the page's main-world
@@ -76,10 +97,24 @@ class TurnstileSolver(InjectedWidgetSolver):
         "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
     )
     WIDGET_CONTAINER_ID = "omc-turnstile"
-    # Turnstile's error-callback historically took no argument and set a bare
-    # ``true``; kept identical so behaviour is unchanged.
-    WIDGET_ERROR_CALLBACK_VALUE = "true"
+    # Turnstile's error-callback receives the provider error CODE as its first
+    # argument (e.g. "110000"); capturing the real value lets the solver
+    # classify invalid-sitekey/malformed failures instead of hardcoding a bare
+    # ``true`` that carries no information.
+    WIDGET_ERROR_CALLBACK_VALUE = "String(e)"
     WIDGET_TOKEN_EXTRACTOR_JS = _EXTRACT_TURNSTILE_TOKEN_JS
+
+    def _classify_error(self, raw: object) -> CaptchaError:
+        """Map Turnstile's numeric error codes to the shared taxonomy."""
+        code = str(raw if raw is not None else "").strip()
+        entry = _TURNSTILE_ERROR_CODES.get(code)
+        if entry is not None:
+            description, retryable = entry
+            message = f"Turnstile widget error {code} ({description})"
+            if retryable:
+                return RetryableWidgetError(message)
+            return NonRetryableWidgetError(message)
+        return super()._classify_error(raw)
 
     # Selector for the Turnstile widget iframe on the injected page.
     _WIDGET_IFRAME = 'iframe[src*="challenges.cloudflare.com"]'
@@ -141,7 +176,10 @@ class TurnstileSolver(InjectedWidgetSolver):
     ) -> Optional[str]:
         """Warm the pointer, click the widget checkbox, then poll for a token."""
         params["_phase"] = SolveStage.INTERACTION.value
-        await self._human_mouse(page)
+        # A mobile fingerprint has no hovering cursor: trace touch scroll/dwell
+        # and tap, not mouse motion (a mouse on a phone context is a tell).
+        touch = bool(params.get("_is_mobile"))
+        await self._human_mouse(page, touch=touch)
 
         try:
             frame = page.frame_locator(self._WIDGET_IFRAME)
@@ -152,6 +190,7 @@ class TurnstileSolver(InjectedWidgetSolver):
                 frame,
                 self._CHECKBOX_SELECTOR,
                 timeout_ms=5_000,
+                touch=touch,
             )
         except Exception as exc:
             log.info("Turnstile checkbox click skipped (managed widget?): %s", exc)

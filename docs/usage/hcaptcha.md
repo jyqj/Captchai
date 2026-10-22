@@ -22,7 +22,7 @@ hCaptcha presents a CAPTCHA challenge via an iframe widget. The solver renders t
 | `isInvisible` | bool | Render the widget as invisible. The solver waits for the widget to load, seeds a **continuous** human motion timeline (multi-segment wander/scroll for `HCAPTCHA_INVISIBLE_MOTION_SECONDS`, so passive scoring sees a real `motionData` buffer instead of one short burst), then triggers `execute()` — it does **not** click a checkbox (invisible widgets have none). A mobile fingerprint seeds touch-scroll motion instead of a cursor. The passive verdict gets a longer budget (`HCAPTCHA_INVISIBLE_PASSIVE_BUDGET`); if it still escalates to a visual challenge, it's dispatched and solved. |
 | `rqdata` | string | hCaptcha Enterprise `rqdata` nonce. Forwarded to `hcaptcha.render`; required by enterprise widgets that set it. |
 | `enterprisePayload` | object | Enterprise render config (`rqdata`, `sentry`, `endpoint`, `reportapi`, `assethost`, `imghost`, …). Its keys are **spread flat** onto `hcaptcha.render`, matching the JS API. If you send `rqdata` here (the YesCaptcha convention) it reaches the widget — no separate top-level `rqdata` needed. |
-| `realPage` | bool | Override the page strategy for this task. `false` (enterprise default) serves a synthetic page at the target hostname (token-relay). `true` navigates the real target and hooks `hcaptcha.render` (runs the site's own anti-bot JS). Defaults to `HCAPTCHA_REAL_PAGE`. |
+| `realPage` | bool | Override the page strategy for this task. `false` serves a synthetic page at the target hostname (token-relay). `true` navigates the real target and hooks `hcaptcha.render` (runs the site's own anti-bot JS). Defaults to `HCAPTCHA_REAL_PAGE` (false), including for enterprise tasks. |
 | `userAgent` | string | Force a UA so the token matches your downstream submission. Echoed back in `solution.userAgent`. |
 | `egress` | string | `auto` (default) / `task` / `pool` / `proxyless`. For enterprise/Stripe use `task` with your own residential proxy (see Stripe note). |
 | `proxyType` / `proxyAddress` / `proxyPort` / `proxyLogin` / `proxyPassword` | | Solve through a proxy. Recommended for reputation-bound / IP-bound flows. |
@@ -35,7 +35,7 @@ Stripe's payment/checkout flows present hCaptcha Enterprise (Radar). Enterprise 
 1. Pass the exact `websiteURL` (correct **hostname** — the widget binds the token to `document.location.hostname`) and the correct `websiteKey`.
 2. Capture a **fresh** `rqdata` per challenge from Stripe's own page (it's single-use and session-bound) and pass it (top-level or inside `enterprisePayload`). A stale/missing `rqdata` mints a token Radar rejects even if the grid is answered correctly.
 3. **Match the egress IP.** Enterprise scores IP consistency, so the token must be minted through the **same IP** you submit the card-binding request from. Use `egress=task` with your **own residential/mobile proxy** and reuse that proxy for the Stripe call. Reuse `solution.userAgent` and (`solution.timezoneId` / `acceptLanguage`) too.
-    - If you rely on the server-side pool (`egress=pool`), the minted IP is a server proxy you can't reach — set `POOL_EGRESS_EXPOSE_CREDENTIALS=true` to receive a reusable credentialed `egressServer`, otherwise the token's IP won't match your submit and Radar is likely to reject it.
+    - If you rely on the server-side pool (`egress=pool`), the pool must be seeded from `PROXY_POOL` (see [Enterprise egress policy](#enterprise-egress-policy-proxy_pool--residential)). The minted IP is a server proxy you can't reach — set `POOL_EGRESS_EXPOSE_CREDENTIALS=true` to receive a reusable credentialed `egressServer`, otherwise the token's IP won't match your submit and Radar is likely to reject it.
 4. Enterprise defaults to the **injected page** (token-relay) rather than navigating the real Stripe URL, which usually can't be reproduced from a clean context. Set `realPage: true` per task only if a specific site's own JS must run.
 5. **Run a hardened runtime.** Enterprise detectors flag stock Chromium's automation + software-WebGL signals (its spoofed GPU string contradicts the real SwiftShader renderer). Set `BROWSER_RUNTIME=camoufox`; set `ENTERPRISE_REQUIRE_HARDENED_RUNTIME=true` to *refuse* (not just warn about) an enterprise solve on stock Chromium. Even on stock Chromium the stealth layer now keeps the whole WebGL capability surface (params + extension list), `window.screen`, `navigator.connection`, the AudioContext fingerprint and canvas (`toDataURL`/`toBlob`) coherent, and forces WebRTC through the proxy (`--force-webrtc-ip-handling-policy=disable_non_proxied_udp`) so the pre-proxy IP can't leak.
 6. **Persist the device (optional).** Set `HCAPTCHA_DEVICE_PERSISTENCE=true` so the hCaptcha device-trust cookie (`hmt`) captured on one solve is re-seeded into the next fresh context on the **same egress**, presenting a *returning* device instead of a zero-history one — pairs with `ENTERPRISE_FRESH_CONTEXT` (fresh-context isolation **and** a stable per-IP device). In-memory only; a restart starts cold.
@@ -44,6 +44,35 @@ Stripe's payment/checkout flows present hCaptcha Enterprise (Radar). Enterprise 
 
 !!! warning "Enterprise tokens can't be server-verified"
     In the token-relay model the service holds no siteverify secret for the target sitekey, so it **cannot confirm** an enterprise token will be accepted. Enterprise solves return a `solution.warnings` array reminding you the token is IP-bound and unverifiable — capture a **fresh** `rqdata` per solve and submit from the same egress. Confirm real acceptance via `/reportCorrect` (or your own downstream check).
+
+## Enterprise egress policy (PROXY_POOL + residential)
+
+Enterprise mode is detected from `rqdata` / `enterprisePayload`. Egress is enforced before the solve:
+
+| Request | Result |
+|---------|--------|
+| `egress` unset / `auto` + task proxy | Treated as `egress=task` |
+| `egress` unset / `auto` + no task proxy | Forced to `egress=pool` |
+| `egress=proxyless` | Refused (`ERROR_CAPTCHA_UNSOLVABLE`) — enterprise can't use the server IP |
+| `egress=task` + no proxy | Refused |
+| `egress=pool` | Allowed; checks out a residential/mobile pool proxy |
+
+**`PROXY_POOL` is required for the default enterprise path.** The server-side pool is seeded only from the `PROXY_POOL` environment variable — one proxy per line or comma-separated, using the same single-string syntax as task proxies:
+
+```bash
+export PROXY_POOL="http://user:pass@1.2.3.4:8080|kind=residential|country=DE
+http://user:pass@5.6.7.8:9090|kind=mobile|country=US"
+```
+
+- `kind` defaults to `datacenter`. Annotate `|kind=residential` or `|kind=mobile`; with `ENTERPRISE_REQUIRE_RESIDENTIAL=true` (the default) the pool checkout filters to those two kinds and fails with a specific "requires a residential ... pool proxy" error when none is available. Mobile is accepted as residential-equivalent.
+- Without any `PROXY_POOL` entries (or with only datacenter entries under the default policy), an enterprise solve with no task proxy fails — it is **not** silently attempted proxyless.
+- With `REDIS_URL`, pool inventory, health, cooldown, and per-sitekey stats are shared across workers; otherwise the pool is per process. Set `ENTERPRISE_REQUIRE_RESIDENTIAL=false` only for tests/dev to accept any pool proxy.
+- For `egress=task`, the caller's proxy is normally the caller's responsibility: it is allowed with a warning and its kind is not checked. Set `ENTERPRISE_REQUIRE_RESIDENTIAL_ON_TASK=true` to refuse a task proxy whose `proxy` string is not annotated `|kind=residential` / `|kind=mobile` (an unannotated proxy is treated as datacenter).
+- `egress=pool` mints the token through a server-side exit IP the caller normally cannot reuse. Set `POOL_EGRESS_EXPOSE_CREDENTIALS=true` only when clients are trusted and need a reusable credentialed `egressServer` for the downstream submit.
+
+### URL safety
+
+The hCaptcha page path validates `websiteURL` before navigation when `SSRF_PROTECT=true` (default): http(s) only, host must resolve, and every resolved address must be public. A DNS resolution failure is fail-open (logged, navigation proceeds); a host that resolves to a loopback/private/link-local/reserved/multicast/unspecified address is rejected as a non-retryable solve error. Set `SSRF_PROTECT=false` only in a controlled test environment.
 
 ## Test targets
 

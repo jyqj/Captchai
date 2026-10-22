@@ -1,11 +1,15 @@
 """Tests for the Redis-backed proxy pool (``RedisProxyPool``).
 
-Mirrors the existing Redis ledger test pattern in ``test_consumption.py``:
-each test calls ``pytest.importorskip("redis.asyncio")`` so the suite skips
-cleanly when the ``redis`` package isn't installed, and flushes the test key
-prefix before/after so runs don't see stale data. A real Redis server is
-required — when one isn't reachable the tests skip too (best-effort ping)
-rather than failing the suite.
+The suite uses a real Redis server when one is reachable at
+``localhost:6379``. Otherwise it runs against an in-process ``fakeredis``
+server shared by every async/sync client (``from_url`` is routed through a
+fixture), so the tests actually execute instead of skipping. They skip cleanly
+only when neither a server nor ``fakeredis`` is available.
+
+``fakeredis`` without the ``lupa`` extra rejects ``EVAL`` — precisely the
+scripting-less client the pool's pure-Python fallback exists for. Tests that
+need real server-side Lua skip when ``lupa`` is absent; fallback tests force a
+``ResponseError`` from a wrapper client instead.
 """
 
 from __future__ import annotations
@@ -14,6 +18,9 @@ import asyncio
 import sys
 import time
 from pathlib import Path
+from typing import cast
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -22,33 +29,121 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.assets.proxy_pool import ProxyAsset, build_proxy_pool  # noqa: E402
 
 
-_REDIS_URL = "redis://localhost:6379/0"
+_REAL_REDIS_URL = "redis://localhost:6379/0"
+_FAKE_REDIS_URL = "fakeredis://captchai-tests"
+_ACTIVE_URL = _REAL_REDIS_URL
+_REAL_AVAILABLE: "bool | None" = None
+_FAKE_SERVER = None
+
+
+def _real_server_available() -> bool:
+    """Ping ``localhost:6379`` once and cache the answer.
+
+    ``INFO`` is checked too: a minimal in-process mock listening on 6379
+    answers PING but is not a real Redis (and its EVAL is a stub), so it must
+    not take the tests off the fakeredis path.
+    """
+    global _REAL_AVAILABLE
+    if _REAL_AVAILABLE is None:
+        try:
+            import redis as sync_redis
+
+            client = sync_redis.from_url(
+                _REAL_REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=0.5,
+                socket_timeout=0.5,
+            )
+            client.ping()
+            info = client.info("server")
+            client.close()
+            _REAL_AVAILABLE = bool(info.get("redis_version"))
+        except Exception:
+            _REAL_AVAILABLE = False
+    return _REAL_AVAILABLE
+
+
+def _ensure_fake_server():
+    global _FAKE_SERVER
+    if _FAKE_SERVER is None:
+        import fakeredis
+
+        _FAKE_SERVER = fakeredis.FakeServer()
+    return _FAKE_SERVER
 
 
 def _redis_helper():
-    """Return (aioredis, url) or skip the test if redis isn't available."""
-    pytest = __import__("pytest")
+    """Return (aioredis, url): real server when reachable, else fakeredis."""
+    global _ACTIVE_URL
     aioredis = pytest.importorskip("redis.asyncio")
-    # Skip if no real Redis server is reachable — these tests need one.
-    import redis as sync_redis
+    if _real_server_available():
+        _ACTIVE_URL = _REAL_REDIS_URL
+        return aioredis, _REAL_REDIS_URL
+    pytest.importorskip("fakeredis")
+    pytest.importorskip("fakeredis.aioredis")
+    _ensure_fake_server()
+    _ACTIVE_URL = _FAKE_REDIS_URL
+    return aioredis, _FAKE_REDIS_URL
 
+
+@pytest.fixture(autouse=True)
+def _redis_backend(monkeypatch):
+    """Route ``from_url('fakeredis://...')`` at one in-process fake server."""
+    if _real_server_available():
+        yield
+        return
     try:
-        client = sync_redis.from_url(_REDIS_URL, decode_responses=True)
-        client.ping()
-        client.close()
-    except Exception:
-        pytest.skip("no reachable Redis server at localhost:6379", allow_module_level=True)
-    return aioredis, _REDIS_URL
+        import fakeredis
+        import fakeredis.aioredis as fakeredis_async
+        import redis as sync_redis
+        import redis.asyncio as async_redis
+    except ImportError:
+        yield
+        return
+    server = _ensure_fake_server()
+    # Fresh state per test so a failed test cannot leak into the next one.
+    fakeredis.FakeRedis(server=server, decode_responses=True).flushall()
+    orig_sync = sync_redis.from_url
+    orig_async = async_redis.from_url
+
+    def sync_from_url(url, **kwargs):
+        if str(url).startswith("fakeredis://"):
+            kwargs.setdefault("decode_responses", True)
+            return fakeredis.FakeRedis(server=server, **kwargs)
+        return orig_sync(url, **kwargs)
+
+    def async_from_url(url, **kwargs):
+        if str(url).startswith("fakeredis://"):
+            kwargs.setdefault("decode_responses", True)
+            return fakeredis_async.FakeRedis(server=server, **kwargs)
+        return orig_async(url, **kwargs)
+
+    monkeypatch.setattr(sync_redis, "from_url", sync_from_url)
+    monkeypatch.setattr(async_redis, "from_url", async_from_url)
+    yield
 
 
 def _flush_prefix(prefix: str) -> None:
     """Synchronously flush test keys so tests don't see stale data."""
     import redis as sync_redis
 
-    r = sync_redis.from_url(_REDIS_URL, decode_responses=True)
+    r = sync_redis.from_url(_ACTIVE_URL, decode_responses=True)
     for key in r.scan_iter(f"{prefix}*"):
         r.delete(key)
     r.close()
+
+
+def _sync_client():
+    """Sync client for the active backend (used by storage-shape assertions)."""
+    import redis as sync_redis
+
+    return sync_redis.from_url(_ACTIVE_URL, decode_responses=True)
+
+
+def _require_lua_if_fake() -> None:
+    """Skip Lua-path tests when fakeredis lacks its optional Lua engine."""
+    if not _real_server_available():
+        pytest.importorskip("lupa")
 
 
 # --------------------------------------------------------------------------- #
@@ -555,5 +650,291 @@ def test_build_proxy_pool_selects_redis_when_configured() -> None:
         pool = build_proxy_pool(cfg_redis)
         assert isinstance(pool, RedisProxyPool)
         await pool.close()
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# Lua checkout / EVAL fallback / new storage layout
+# --------------------------------------------------------------------------- #
+
+
+def _response_error(message: str) -> Exception:
+    from redis.exceptions import ResponseError
+
+    return ResponseError(message)
+
+
+class _NoEvalPipeline:
+    """Pipeline wrapper whose ``eval`` behaves like a scripting-less Redis."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def eval(self, *args, **kwargs):
+        raise _response_error("unknown command 'eval'")
+
+
+class _NoEvalRedis:
+    """Async client wrapper that rejects EVAL, like fakeredis without lupa."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def pipeline(self, *args, **kwargs):
+        return _NoEvalPipeline(self._inner.pipeline(*args, **kwargs))
+
+    async def eval(self, *args, **kwargs):
+        raise _response_error("unknown command 'eval'")
+
+
+def test_lua_checkout_reserves_distinct_proxies_under_concurrency() -> None:
+    """EVAL checkout is atomic: concurrent callers reserve different proxies."""
+    _aioredis, url = _redis_helper()  # noqa: F841
+    _require_lua_if_fake()
+    prefix = "test:proxy:lua:reserve:"
+
+    async def run() -> None:
+        from src.assets.proxy_pool import RedisProxyPool
+
+        _flush_prefix(prefix)
+        pool = RedisProxyPool(url, key_prefix=prefix)
+        try:
+            for index in range(4):
+                pool.add(
+                    ProxyAsset(id=f"p{index}", server=f"http://p{index}:1")
+                )
+            chosen = await asyncio.gather(*(pool.checkout() for _ in range(4)))
+            assert all(proxy is not None for proxy in chosen)
+            chosen_proxies = cast("list[ProxyAsset]", chosen)
+            assert {proxy.id for proxy in chosen_proxies} == {"p0", "p1", "p2", "p3"}
+            # The script path was actually used (no EVAL rejection logged).
+            assert pool._eval_supported is True
+            # Reservation is persisted in the per-proxy hash.
+            row = _sync_client().hgetall(pool._proxy_prefix + "p0")
+            assert row["id"] == "p0"
+            assert float(row["last_used_at"]) > 0
+        finally:
+            await pool.close()
+            _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_eval_rejection_falls_back_to_python_checkout_and_report() -> None:
+    """A client that rejects EVAL keeps working through the Python fallback."""
+    _aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:proxy:fallback:"
+
+    async def run() -> None:
+        from src.assets.proxy_pool import RedisProxyPool
+
+        _flush_prefix(prefix)
+        pool = RedisProxyPool(
+            url, cooldown_seconds=60, max_consecutive_fails=3, key_prefix=prefix
+        )
+        try:
+            pool.add(ProxyAsset(id="good", server="http://good:1"))
+            pool.add(ProxyAsset(id="other", server="http://other:1"))
+            # Sitekey ranking still works through the fallback path.
+            await pool.report_sitekey("good", "sk", success=True)
+            await pool.report_sitekey("other", "sk", success=False)
+
+            # Test wrapper mimics Redis' async surface but isn't a Redis subclass.
+            pool._redis = _NoEvalRedis(pool._redis)  # type: ignore[reportAttributeAccessIssue]
+            chosen = await pool.checkout(sitekey="sk")
+            assert chosen is not None
+            assert chosen.id == "good"
+            assert pool._eval_supported is False
+
+            # report/report_bytes take the locked branch and stay correct.
+            await pool.report("good", success=False, bytes_used=25)
+            await pool.report("good", success=False, bytes_used=25)
+            row = next(r for r in pool.snapshot() if r["id"] == "good")
+            assert row["fail_count"] == 2
+            assert row["consecutive_fails"] == 2
+            assert row["bytes_used"] == 50
+            # The checkout before this reserved a fresh proxy (0 successes),
+            # which transitions it to "probing"; two failures stay below the
+            # three-failure cooldown threshold.
+            assert row["state"] == "probing"
+
+            await pool.report("good", success=False)
+            row = next(r for r in pool.snapshot() if r["id"] == "good")
+            assert row["state"] == "cooldown"
+            assert row["cooldown_remaining"] > 0
+
+            # report_bytes also works without scripting.
+            await pool.report_bytes("other", 10)
+            row = next(r for r in pool.snapshot() if r["id"] == "other")
+            assert row["bytes_used"] == 10
+        finally:
+            await pool.close()
+            _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_report_bytes_burns_proxy_at_cap() -> None:
+    """Byte accounting increments one field and burns at the configured cap."""
+    _aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:proxy:bytes:"
+
+    async def run() -> None:
+        from src.assets.proxy_pool import RedisProxyPool
+
+        _flush_prefix(prefix)
+        pool = RedisProxyPool(
+            url, max_bytes_per_proxy=100, key_prefix=prefix
+        )
+        try:
+            pool.add(ProxyAsset(id="p", server="http://p:1"))
+            await pool.report_bytes("p", 60)
+            row = pool.snapshot()[0]
+            assert row["bytes_used"] == 60
+            assert row["state"] == "healthy"
+
+            await pool.report_bytes("p", 50)
+            row = pool.snapshot()[0]
+            assert row["bytes_used"] == 110
+            assert row["state"] == "burned"
+
+            assert await pool.checkout() is None
+        finally:
+            await pool.close()
+            _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_storage_uses_per_proxy_hash_and_ttl_sitekey_keys() -> None:
+    """Storage is per-field hashes + TTL'd per-sitekey keys, not JSON blobs."""
+    _aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:proxy:shape:"
+
+    async def run() -> None:
+        from src.assets.proxy_pool import RedisProxyPool
+
+        _flush_prefix(prefix)
+        pool = RedisProxyPool(url, key_prefix=prefix)
+        try:
+            pool.add(
+                ProxyAsset(
+                    id="p",
+                    server="http://p:1",
+                    username="user",
+                    password="pass",
+                )
+            )
+            await pool.report_sitekey("p", "sk-a", success=True)
+            await pool.report_sitekey_real("p", "sk-a", success=False)
+
+            client = _sync_client()
+            assert client.sismember(pool._ids_key, "p")
+            fields = client.hgetall(pool._proxy_prefix + "p")
+            assert fields["server"] == "http://p:1"
+            assert fields["username"] == "user"
+            assert fields["success_count"] == "0"
+
+            # The legacy JSON-blob hash is no longer written.
+            assert client.hget(pool._proxies_key, "p") is None
+
+            token_key = pool._sitekey_prefix + "p:sk-a"
+            real_key = pool._real_sitekey_prefix + "p:sk-a"
+            assert client.hget(token_key, "ok") == "1"
+            assert client.hget(real_key, "fail") == "1"
+            assert client.ttl(token_key) > 0
+            assert client.ttl(real_key) > 0
+            assert client.ttl(pool._sitekey_zset_prefix + "p") > 0
+            assert client.ttl(pool._real_sitekey_zset_prefix + "p") > 0
+        finally:
+            await pool.close()
+            _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_sitekey_cardinality_is_bounded_by_top_n() -> None:
+    """Only the ``max_sitekeys_per_proxy`` most active sitekeys survive."""
+    _aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:proxy:sitekeycap:"
+
+    async def run() -> None:
+        from src.assets.proxy_pool import RedisProxyPool
+
+        _flush_prefix(prefix)
+        pool = RedisProxyPool(
+            url, key_prefix=prefix, max_sitekeys_per_proxy=3
+        )
+        try:
+            pool.add(ProxyAsset(id="p", server="http://p:1"))
+            # Activity scores: sk-0=1, sk-1=2, sk-2=3, sk-3=4.
+            for index in range(4):
+                for _ in range(index + 1):
+                    await pool.report_sitekey(
+                        "p", f"sk-{index}", success=True
+                    )
+
+            sitekeys = pool.snapshot()[0]["sitekeys"]
+            assert set(sitekeys) == {"sk-1", "sk-2", "sk-3"}
+            client = _sync_client()
+            assert client.exists(pool._sitekey_prefix + "p:sk-0") == 0
+            for sitekey in ("sk-1", "sk-2", "sk-3"):
+                key = pool._sitekey_prefix + f"p:{sitekey}"
+                assert client.ttl(key) > 0
+        finally:
+            await pool.close()
+            _flush_prefix(prefix)
+
+    asyncio.run(run())
+
+
+def test_add_migrates_legacy_json_blob_health() -> None:
+    """The first add() after an upgrade keeps health from the JSON blob."""
+    _aioredis, url = _redis_helper()  # noqa: F841
+    prefix = "test:proxy:legacy:"
+
+    async def run() -> None:
+        from src.assets.proxy_pool import RedisProxyPool
+
+        _flush_prefix(prefix)
+        pool = RedisProxyPool(url, key_prefix=prefix)
+        try:
+            client = _sync_client()
+            legacy = ProxyAsset(
+                id="p",
+                server="http://p:1",
+                success_count=7,
+                fail_count=2,
+                consecutive_fails=2,
+                state="cooldown",
+                cooldown_until=time.time() + 30,
+                sitekey_stats={"sk": [3, 1]},
+            )
+            client.hset(pool._proxies_key, "p", pool._serialize(legacy))
+
+            pool.add(ProxyAsset(id="p", server="http://p:1"))
+
+            fields = client.hgetall(pool._proxy_prefix + "p")
+            assert fields["success_count"] == "7"
+            assert fields["fail_count"] == "2"
+            assert fields["consecutive_fails"] == "2"
+            assert fields["state"] == "cooldown"
+            # The migrated entry is a real hash key now.
+            assert client.type(pool._proxy_prefix + "p") == "hash"
+            assert client.sismember(pool._ids_key, "p")
+            # Legacy per-sitekey stats are re-seeded into their own key.
+            assert pool.snapshot()[0]["sitekeys"] == {
+                "sk": {"success": 3, "fail": 1}
+            }
+        finally:
+            await pool.close()
+            _flush_prefix(prefix)
 
     asyncio.run(run())

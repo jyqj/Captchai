@@ -1,0 +1,17 @@
+# Development / CI-only tooling. Runtime dependencies stay in requirements.txt
+# (which also carries pytest and the mkdocs stack for the existing docs CI).
+-r requirements.txt
+
+# Static type checker used by .github/workflows/ci.yml and `npx pyright`.
+# Pinned to a floor rather than an exact version so CI can pick up parser
+# fixes without a requirements churn; bump deliberately when needed.
+pyright>=1.1.390
+
+# Redis client for the Redis-backed suites (task store, cost ledger, proxy
+# pool). The ubuntu CI job runs a redis:7 service and installs this file; the
+# windows job deliberately installs requirements.txt only (no service
+# containers on Windows runners) so those tests skip via importorskip rather
+# than fail against an unreachable localhost:6379. Floor matches the
+# `redis.asyncio` API the store was written against.
+redis>=4.2
+fakeredis>=2.40  # in-process Redis for backend tests without a server

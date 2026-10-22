@@ -52,11 +52,32 @@ class VisionAdapter:
             shape=shape,
         )
         started = time.monotonic()
-        result = await self._router.classify(vision_req, client_key=self._client_key)
-        self.total_vision_ms += int((time.monotonic() - started) * 1000)
+        try:
+            result = await self._router.classify(
+                vision_req, client_key=self._client_key
+            )
+        except Exception as exc:
+            # Meter even a failed call: the router may have burned model calls
+            # before raising (e.g. a VisionParseError after every self-
+            # consistency sample failed to parse). The ledger records per
+            # solve, so unattributed usage would silently under-report spend.
+            self._meter(
+                getattr(exc, "usage", None),
+                getattr(exc, "model", None),
+                getattr(exc, "votes", 1),
+            )
+            raise
+        else:
+            self._meter(result.usage, result.model, result.votes)
+            return result
+        finally:
+            self.total_vision_ms += int((time.monotonic() - started) * 1000)
 
-        self.total_vision_calls += max(1, result.votes)
-        self.total_input_tokens += result.usage.input_tokens
-        self.total_output_tokens += result.usage.output_tokens
-        self.last_model = result.model
-        return result
+    def _meter(self, usage: Any, model: Optional[str], votes: Any) -> None:
+        """Accumulate call/token totals for one classify (success or failure)."""
+        self.total_vision_calls += max(1, int(votes or 1))
+        if usage is not None:
+            self.total_input_tokens += usage.input_tokens
+            self.total_output_tokens += usage.output_tokens
+        if model:
+            self.last_model = model

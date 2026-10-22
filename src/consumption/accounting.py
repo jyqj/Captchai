@@ -4,9 +4,32 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import Any, Deque, Dict, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Deque, Dict, Optional, Protocol, Tuple, cast, runtime_checkable
 
 _Key = Tuple[str, Any, Any]
+
+# Hard ceiling on the number of Redis bucket keys tracked per prefix. Once
+# exceeded, the lowest-count buckets are evicted so a stream of unique
+# (sitekey, proxy_kind, model) combinations can't grow Redis without bound.
+_MAX_BUCKETS = 1000
+
+# Redis glob metacharacters. User-controlled sitekeys are embedded in a SCAN
+# ``MATCH`` pattern, so they must be backslash-escaped — otherwise a sitekey
+# containing ``*`` / ``?`` / ``[...]`` would match other sitekeys' buckets.
+_GLOB_SPECIAL = frozenset("\\[]*?^-")
+
+
+def _glob_escape(value: str) -> str:
+    """Escape Redis glob metacharacters in a literal key segment.
+
+    Redis's ``MATCH`` uses shell-style globs (``*``, ``?``, ``[...]``, with
+    ``^`` / ``-`` special inside a bracket expression). Backslash makes the
+    next character literal, so escaping every metacharacter lets a
+    user-controlled sitekey be matched exactly.
+    """
+    return "".join(
+        "\\" + ch if ch in _GLOB_SPECIAL else ch for ch in (value or "")
+    )
 
 
 class SuccessAccounting:
@@ -202,10 +225,17 @@ class RedisSuccessAccounting:
     real-outcome side (``{prefix}:real:{sitekey}:*``). ``SCAN`` is
     cursor-based and non-blocking, so it's safe on a busy Redis; the caveat
     is that it can yield a bucket more than once across cursors when keys
-    are mutated mid-scan, so the helper de-duplicates. A
-    ``{prefix}:sitekeys`` set of seen sitekeys would be a faster index but
-    adds a second write to maintain on every ``record`` call; v1 keeps it
-    simple.
+    are mutated mid-scan, so the helper de-duplicates. The sitekey is
+    user-controlled and is glob-escaped before being embedded in the pattern,
+    so a sitekey containing ``*`` / ``?`` / ``[...]`` matches only its own
+    buckets.
+
+    The number of bucket keys is capped: a ``{prefix}:buckets`` ZSET scores
+    each bucket key by lifetime writes, and the lowest-count keys beyond
+    ``max_buckets`` (default 1000) are evicted on write. This keeps
+    arbitrarily many distinct sitekeys / models from growing Redis without
+    bound. The cap is approximate under concurrent writers (each writer may
+    trim a slightly different set) — good enough for routing statistics.
 
     Optimistic 1.0 is returned for any empty bucket — matches the in-memory
     backend so selection code doesn't penalise fresh sitekeys.
@@ -220,6 +250,7 @@ class RedisSuccessAccounting:
         window: int = 100,
         *,
         key_prefix: str = "captcha:accounting",
+        max_buckets: int = _MAX_BUCKETS,
     ) -> None:
         try:
             import redis.asyncio as aioredis  # noqa: WPS433
@@ -230,6 +261,10 @@ class RedisSuccessAccounting:
             ) from exc
         self._window = window
         self._prefix = key_prefix
+        self._max_buckets = max_buckets
+        # Bucket-key index: member = bucket key, score = lifetime write count.
+        # Used to evict the lowest-count buckets once the cap is exceeded.
+        self._index_key = f"{key_prefix}:buckets"
         self._redis = aioredis.from_url(url, decode_responses=True)
 
     async def _push(
@@ -245,6 +280,31 @@ class RedisSuccessAccounting:
         pipe = self._redis.pipeline()
         pipe.lpush(key, value)
         pipe.ltrim(key, 0, self._window - 1)
+        pipe.zincrby(self._index_key, 1, key)
+        pipe.zcard(self._index_key)
+        results = await pipe.execute()
+        total = int(results[-1] or 0)
+        if total > self._max_buckets:
+            await self._evict_lowest(total - self._max_buckets, protect=key)
+
+    async def _evict_lowest(self, overflow: int, *, protect: str) -> None:
+        """Evict the lowest-count buckets beyond the cap.
+
+        ``protect`` (the bucket just written) is never evicted. Fetches one
+        extra candidate so there are still ``overflow`` victims when the
+        freshly-created bucket is itself among the lowest-count keys.
+        """
+        candidates = await self._redis.zrange(self._index_key, 0, overflow)
+        # ``decode_responses=True``: ZRANGE members are always ``str`` at
+        # runtime; redis-py types the reply as the full bytes/str union.
+        stale = cast(
+            "list[str]", [k for k in candidates if k != protect][:overflow]
+        )
+        if not stale:
+            return
+        pipe = self._redis.pipeline()
+        pipe.zrem(self._index_key, *stale)
+        pipe.delete(*stale)
         await pipe.execute()
 
     async def record(
@@ -314,7 +374,9 @@ class RedisSuccessAccounting:
         yield the same key more than once when keys are mutated mid-scan.
         """
         bucket = "real" if real else "opt"
-        pattern = f"{self._prefix}:{bucket}:{sitekey}:*"
+        # ``sitekey`` is caller-controlled: escape Redis glob metacharacters so
+        # it matches its own buckets literally instead of acting as a pattern.
+        pattern = f"{self._prefix}:{bucket}:{_glob_escape(sitekey)}:*"
         seen: set[str] = set()
         cursor = 0
         while True:

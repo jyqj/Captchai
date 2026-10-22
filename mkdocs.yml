@@ -1,14 +1,14 @@
 site_name: CaptchAI
 site_description: Self-hostable YesCaptcha-compatible captcha solver built with FastAPI, Playwright, and OpenAI-compatible multimodal models.
-site_url: https://captchai-org.github.io/captchai/
-repo_url: https://github.com/captchai-org/captchai
-repo_name: captchai-org/captchai
+site_url: https://jyqj.github.io/Captchai/
+repo_url: https://github.com/jyqj/Captchai
+repo_name: jyqj/Captchai
 edit_uri: edit/main/docs/
 
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/captchai-org/captchai
+      link: https://github.com/jyqj/Captchai
 
 extra_css:
   - stylesheets/extra.css

@@ -6,6 +6,7 @@ import importlib
 import os
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -396,6 +397,7 @@ def test_get_task_result_returns_user_agent_in_solution() -> None:
             },
         ).json()
         task_id = created["taskId"]
+        result: dict[str, Any] = {}
         for _ in range(20):
             result = client.post(
                 "/getTaskResult",

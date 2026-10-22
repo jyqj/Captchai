@@ -21,6 +21,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -56,8 +57,12 @@ def _fake_factory():
     return factory
 
 
-def _build_app(*, client_key: str | None = None):
+def _build_app(*, client_key: str | None = None) -> Any:
     """Reload config + routes with fresh env vars and return a FastAPI app.
+
+    Returns ``Any`` because the project-local ``fastapi`` stub omits
+    ``FastAPI.__call__``; at runtime the object is a valid ASGI app for
+    ``httpx.ASGITransport``.
 
     Reloading ``config`` is necessary because ``Config`` is a frozen dataclass
     built from env vars at import time — the only way to change
@@ -104,7 +109,7 @@ def _make_services():
 
 
 def _make_record(task_id: str, **overrides) -> SolveRecord:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         task_id=task_id,
         sitekey="sk-1",
         task_type="RecaptchaV2TaskProxyless",

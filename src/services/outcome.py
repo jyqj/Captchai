@@ -20,10 +20,31 @@ fail a live solve.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Optional, Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
+
+
+def _accepts_stage(report: Any) -> bool:
+    """True when a proxy pool's ``report`` takes the ``stage`` keyword.
+
+    Wave A added ``stage`` (default ``"transport"``) to both pool backends.
+    Duck-typed fakes / alternative pools that predate it must keep working, so
+    the keyword is only sent when the signature can take it (or takes
+    ``**kwargs``).
+    """
+    try:
+        parameters = inspect.signature(report).parameters
+    except (TypeError, ValueError):  # builtin / opaque callable
+        return False
+    if "stage" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 @runtime_checkable
@@ -58,10 +79,12 @@ async def record_real_outcome(
 ) -> None:
     """Fan a real outcome out to every learner that should update from it.
 
-    * **proxy health** — a pool proxy whose tokens are rejected downstream
-      accrues a consecutive-fail streak and cools down, even though it
-      "obtained" a token; a success reinforces it. Pool proxies only
-      (``identity.proxy_id`` set); caller task proxies are the caller's concern.
+    * **proxy health** — an accepted token reinforces the pool proxy that
+      produced it. A rejection is filed with ``stage="outcome"``: it is a
+      downstream/solve signal, *not* a transport failure, so it is logged
+      without pushing a working proxy toward cooldown. Pool proxies only
+      (``identity.proxy_id`` set); caller task proxies are the caller's
+      concern.
     * **per-sitekey real bucket** — the ``report_sitekey_real`` ranking signal,
       kept separate from the solver's token-obtained bucket so checkout ranking
       can prefer ground truth when present.
@@ -75,10 +98,18 @@ async def record_real_outcome(
 
     proxy_pool = getattr(services, "proxy_pool", None)
     if proxy_id and proxy_pool is not None:
-        try:
-            await proxy_pool.report(proxy_id, success=success)
-        except Exception:  # noqa: BLE001 - feedback must never 500 / fail a solve
-            log.debug("proxy_pool.report (real outcome) failed", exc_info=True)
+        # A real downstream verdict is an *outcome* signal, not a transport
+        # failure: a rejected token must not cool a proxy down as if its
+        # connection had failed (the pool ignores non-transport failures).
+        report = getattr(proxy_pool, "report", None)
+        if report is not None:
+            kwargs: dict[str, Any] = {"success": success}
+            if _accepts_stage(report):
+                kwargs["stage"] = "outcome"
+            try:
+                await report(proxy_id, **kwargs)
+            except Exception:  # noqa: BLE001 - feedback must never 500 / fail a solve
+                log.debug("proxy_pool.report (real outcome) failed", exc_info=True)
         if sitekey:
             try:
                 await proxy_pool.report_sitekey_real(

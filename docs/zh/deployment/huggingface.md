@@ -35,19 +35,25 @@
 
 在 Space 设置中添加以下 secrets：
 
-- `CLIENT_KEY`
-- `CAPTCHA_API_KEY`
+- `CLIENT_KEY` — 公开 Space **必需**。未设置时服务会拒绝启动（默认拒绝），除非 `ALLOW_ANONYMOUS=true`。
+- `CLOUD_API_KEY` — 使用云端模型时需要。
 
 按需添加或覆盖变量：
 
-- `CAPTCHA_BASE_URL`
-- `CAPTCHA_MODEL`
-- `CAPTCHA_MULTIMODAL_MODEL`
+- `CLOUD_BASE_URL`
+- `CLOUD_MODEL=gpt-5.4`
+- `CLOUD_AUDIO_MODEL=whisper-1`
+- `LOCAL_BASE_URL` / `LOCAL_MODEL`（若有可访问的本地视觉模型）
+- `ADMIN_KEY`（保护 `/admin/*`）
+- `RATE_LIMIT_RPM=60`
+- `SSRF_PROTECT=true`
 - `BROWSER_HEADLESS=true`
 - `BROWSER_TIMEOUT=30`
 - `SERVER_PORT=7860`
 
 Hugging Face Spaces 通常对外暴露 `7860` 端口，因此建议设置 `SERVER_PORT=7860`。
+
+旧版 `CAPTCHA_*` 变量仍作为 `CLOUD_*` / `LOCAL_*` 的回退被接受，但建议使用拆分后的名称。
 
 ## 4. 确认启动命令
 
@@ -78,11 +84,19 @@ python main.py
 curl https://<your-space-subdomain>.hf.space/
 ```
 
-### 健康检查
+### 存活检查
 
 ```bash
 curl https://<your-space-subdomain>.hf.space/api/v1/health
 ```
+
+### 就绪检查
+
+```bash
+curl -i https://<your-space-subdomain>.hf.space/ready
+```
+
+HTTP 200 表示就绪；HTTP 503 表示所需子系统（注册了浏览器任务类型时的浏览器，或配置了 `REDIS_URL` 时的 Redis）不可用。
 
 ### 创建 detector 任务
 

@@ -20,10 +20,32 @@ returns ``None`` and solving behaves exactly as before.
 
 from __future__ import annotations
 
+import hmac
 import logging
 from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
+
+
+def constant_time_equals(candidate: str | None, expected: str | None) -> bool:
+    """Compare two token / secret strings without leaking a match prefix.
+
+    Uses :func:`hmac.compare_digest` (constant-time for equal-length inputs)
+    rather than ``==`` so a timing side channel can't reveal how many leading
+    characters of a secret were correct. Used for any caller-supplied token /
+    secret compared against a configured one; the siteverify path itself
+    forwards the secret to the provider and compares no secrets locally.
+
+    ``None`` is only equal to ``None``; everything else is compared as UTF-8
+    bytes. Kept here (rather than in the route layer) so every consumer of the
+    token-trust module uses the same primitive.
+    """
+    if candidate is None or expected is None:
+        return candidate is expected
+    return hmac.compare_digest(
+        candidate.encode("utf-8"), expected.encode("utf-8")
+    )
+
 
 # Well-known provider siteverify endpoints, keyed by the normalized provider
 # string the solvers pass (``hcaptcha`` / ``turnstile`` / ``recaptcha``).

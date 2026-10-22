@@ -26,19 +26,189 @@ attributes plus one render-body hook. Turnstile now inherits the same
 from __future__ import annotations
 
 import asyncio
+import html
+import ipaddress
 import json
 import logging
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import Route
 
 from .browser import set_context_resource_blocking
 from .browser_solver import BaseBrowserSolver, SolveStage
-from .captcha_errors import classify_widget_error
+from .captcha_errors import (
+    CaptchaError,
+    NonRetryableWidgetError,
+    classify_widget_error,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _js_literal(value: Any) -> str:
+    """Serialise ``value`` for embedding inside an inline ``<script>``.
+
+    ``json.dumps`` gives correct JS literals for every JSON type, but a string
+    containing ``</script>`` would terminate the script element early and
+    ``U+2028`` / ``U+2029`` are line terminators in JS. Escaping the three
+    closes the inline-injection hole for caller-supplied render options.
+    """
+    return (
+        json.dumps(value)
+        .replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+#: SSRF-relevant IPv4 ranges the stdlib predicates do not flag on every
+#: Python version: "this network" (0.0.0.0/8), CGNAT shared space
+#: (100.64.0.0/10), IETF protocol assignments (192.0.0.0/24) and the
+#: benchmarking range (198.18.0.0/15).
+_BLOCKED_NETWORKS: tuple[Any, ...] = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "0.0.0.0/8",
+        "100.64.0.0/10",
+        "192.0.0.0/24",
+        "198.18.0.0/15",
+    )
+)
+
+
+def _address_is_blocked(
+    ip: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+) -> bool:
+    """True when ``ip`` must never be reached from a caller-supplied URL.
+
+    Covers the SSRF-relevant categories: loopback, RFC1918 / ULA private,
+    link-local (incl. cloud metadata ``169.254.169.254``), reserved,
+    multicast and the unspecified address, plus the extra explicit ranges in
+    :data:`_BLOCKED_NETWORKS` (CGNAT ``100.64.0.0/10`` in particular is not
+    ``is_private`` on every supported Python). An IPv4-mapped IPv6 address is
+    checked as its embedded IPv4 address too (``::ffff:127.0.0.1`` is not
+    flagged by ``IPv6Address.is_loopback``).
+    """
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv4Address) and any(
+        ip in network for network in _BLOCKED_NETWORKS
+    ):
+        return True
+    return bool(
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+async def _validate_public_http_url(
+    url: str, *, field: str = "websiteURL", strict: bool = False
+) -> str:
+    """Reject a caller-supplied navigation URL that could reach an internal host.
+
+    Mirrors the reCAPTCHA solvers' SSRF pre-flight, with one deliberate policy
+    difference: a DNS *resolution failure* (``socket.gaierror``) is fail-OPEN —
+    it is logged and the solve proceeds. An offline/blocked resolver is an
+    environment fault, not evidence of an internal target, and failing closed
+    there would break every solve (including offline tests) for a hostname the
+    navigation itself would immediately report as unreachable. ``strict``
+    (driven by ``config.ssrf_strict``) turns that fail-open into a hard
+    ``ValueError`` for operators who prefer fail-closed DNS. Once the host
+    *does* resolve, the check is fail-CLOSED: ANY resolved address in a
+    loopback / private / link-local / reserved / multicast / unspecified range
+    rejects the URL before a proxy or browser context is checked out.
+
+    Before resolution, a host that parses as an IP literal is checked
+    directly. ``ipaddress`` rejects the legacy IPv4 spellings Chromium
+    canonicalises (decimal ``2130706433``, octal ``0177.0.0.1``, hex
+    ``0x7f000001``), so ``socket.inet_aton`` is used as a second parser —
+    otherwise a literal loopback spelling would slip past the address check
+    and be resolved/canonicalised to an internal address by the browser.
+
+    Raises ``ValueError`` with a caller-readable message; the caller converts
+    it to :class:`NonRetryableWidgetError` so the retry loop fails fast and the
+    task manager reports ``ERROR_CAPTCHA_UNSOLVABLE`` instead of a 500.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError(f"{field} must be a non-empty http(s) URL")
+    target = url.strip()
+    try:
+        parts = urlsplit(target)
+    except ValueError as exc:
+        raise ValueError(f"{field} is not a valid URL: {exc}") from exc
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(
+            f"{field} must use http or https (got {parts.scheme or 'no scheme'!r})"
+        )
+    host = parts.hostname
+    if not host:
+        raise ValueError(f"{field} has no host: {target!r}")
+    try:
+        port = parts.port or (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError(f"{field} has an invalid port: {exc}") from exc
+
+    # Chromium canonicalises legacy IPv4 spellings that ``ipaddress`` rejects,
+    # so normalise with ``socket.inet_aton`` (which accepts decimal / octal /
+    # hex forms) BEFORE resolution: a literal that parses is checked directly
+    # and a blocked one is refused even if the resolver never sees it.
+    try:
+        packed = socket.inet_aton(host.split("%", 1)[0])
+    except OSError:
+        packed = None
+    if packed is not None:
+        try:
+            literal = ipaddress.ip_address(packed)
+        except ValueError:  # pragma: no cover - inet_aton always yields 4 bytes
+            literal = None
+        if literal is not None and _address_is_blocked(literal):
+            raise ValueError(
+                f"{field} host {host!r} is a blocked address {literal} "
+                "(loopback/private/link-local/reserved/multicast)"
+            )
+
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as exc:
+        if strict:
+            raise ValueError(
+                f"{field} host {host!r} could not be resolved: {exc}"
+            ) from exc
+        # Fail-open on a resolver error (offline env / transient DNS failure):
+        # warn loudly but let navigation surface the real network outcome.
+        log.warning(
+            "%s SSRF preflight could not resolve host %r (%s); proceeding "
+            "without the address check",
+            field,
+            host,
+            exc,
+        )
+        return target
+    for info in infos or ():
+        address = info[4][0]
+        try:
+            ip = ipaddress.ip_address(str(address).split("%", 1)[0])
+        except ValueError:
+            raise ValueError(
+                f"{field} host {host!r} resolved to an invalid address {address!r}"
+            )
+        if _address_is_blocked(ip):
+            raise ValueError(
+                f"{field} host {host!r} resolves to a blocked address {ip} "
+                "(loopback/private/link-local/reserved/multicast)"
+            )
+    return target
 
 
 @dataclass(frozen=True)
@@ -57,6 +227,11 @@ class PageStrategy:
       init script on the real page.
     * ``timeout_message`` — the error raised when no token is obtained.
 
+    ``key`` participates in the per-task signature that guards warm-session
+    reuse, and ``cleanup_context`` reverses whatever ``prepare_context``
+    installed on the (possibly pooled) context so one solve cannot leak a stale
+    document route into the next.
+
     Everything else (the acquire → prepare → goto → provider interaction →
     release choreography, plus phase timing and stage tracking) is shared by
     :meth:`InjectedWidgetSolver._run_page_solve`, so hCaptcha and Turnstile
@@ -67,6 +242,8 @@ class PageStrategy:
     block_resources: bool
     timeout_message: str
     prepare_context: Callable[[Any], Awaitable[None]]
+    key: str = "page"
+    cleanup_context: Optional[Callable[[Any], Awaitable[None]]] = None
 
 
 class InjectedWidgetSolver(BaseBrowserSolver):
@@ -170,6 +347,15 @@ class InjectedWidgetSolver(BaseBrowserSolver):
             "    }\n"
         ) % {"r": cls.OMC_RESULT_ID}
 
+    def _classify_error(self, raw: object) -> CaptchaError:
+        """Map a provider ``error-callback`` payload to the shared taxonomy.
+
+        Providers with structured error codes override this (e.g. Turnstile's
+        numeric codes); the default keeps the substring classifier so behaviour
+        for free-text errors is unchanged.
+        """
+        return classify_widget_error(raw, provider=self.PROVIDER)
+
     # ── injected page ──────────────────────────────────────────
 
     def _widget_api_js(self, options: dict[str, Any]) -> str:
@@ -201,8 +387,12 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         production widget configured with them accepts the resulting token.
         """
         render_opts = {"sitekey": website_key, **options}
-        opts_json = json.dumps(render_opts)
-        api_js = self._widget_api_js(options)
+        # ``opts`` is caller-derived: serialise it as a JSON literal (escaped
+        # for inline <script>) rather than interpolating raw values into JS.
+        opts_json = _js_literal(render_opts)
+        # ``api_js`` may come from a caller-supplied assethost: escape it for
+        # the HTML attribute so it cannot break out of the src="" context.
+        api_js = html.escape(self._widget_api_js(options), quote=True)
         bridge = self._omc_bridge_js()
         # The token/status is written onto ``#omc-result`` (and the legacy
         # ``window.__omc*`` globals) so a Camoufox isolated-world evaluate can
@@ -214,9 +404,9 @@ class InjectedWidgetSolver(BaseBrowserSolver):
 <script src="{api_js}" async defer></script>
 </head>
 <body>
-<div id="{self.WIDGET_CONTAINER_ID}"></div>
-<div id="{self.OMC_RESULT_ID}" data-status="" style="display:none"></div>
-<div id="{self.OMC_EXEC_ID}" data-exec="0" style="display:none"></div>
+<div id="{html.escape(self.WIDGET_CONTAINER_ID, quote=True)}"></div>
+<div id="{html.escape(self.OMC_RESULT_ID, quote=True)}" data-status="" style="display:none"></div>
+<div id="{html.escape(self.OMC_EXEC_ID, quote=True)}" data-exec="0" style="display:none"></div>
 <script>
     window.__omcToken = null;
     {bridge}
@@ -280,7 +470,7 @@ class InjectedWidgetSolver(BaseBrowserSolver):
                 log.info("Got %s token (len=%d)", self.PROVIDER, len(token))
                 return token
             if err:
-                raise classify_widget_error(err, provider=self.PROVIDER)
+                raise self._classify_error(err)
             remaining_ms = int(
                 (deadline - asyncio.get_event_loop().time()) * 1000
             )
@@ -317,7 +507,10 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         ``window.__omc*`` globals the injected page uses. Shared by every
         widget provider (parameterised by :attr:`WIDGET_GLOBAL`).
         """
-        opts_json = json.dumps(options)
+        # Render options are caller-derived; embed them as an escaped JSON
+        # literal so a value like ``</script><script>…`` cannot break out of
+        # the init script.
+        opts_json = _js_literal(options)
         g = self.WIDGET_GLOBAL
         bridge = self._omc_bridge_js()
         return f"""
@@ -341,7 +534,7 @@ class InjectedWidgetSolver(BaseBrowserSolver):
                 const origErr = opts['error-callback'];
                 opts['error-callback'] = function(e) {{
                     window.__omcError = String(e);
-                    __omcSet('error', e);
+                    __omcSet('error', String(e));
                     if (origErr) origErr(e);
                 }};
                 const wid = origRender(container, opts);
@@ -387,26 +580,62 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         page to make look human).
         """
         html = self._build_injected_page(website_key, render_options)
+        handler = self._document_route_handler(html)
         defer_execute = (
             self.DEFER_INVISIBLE_EXECUTE
             and render_options.get("size") == "invisible"
         )
 
         async def prepare(context: Any) -> None:
-            # Re-assert blocking ON in case a reused warm session had it turned
-            # off by a prior real-page solve, then fulfil the document.
-            set_context_resource_blocking(context, True)
+            # Remember the shared context's current interception state. A warm
+            # session may have been prepared by a real-page solve with blocking
+            # OFF; cleanup must put that state back for whichever solve gets
+            # the context next.
+            try:
+                context._omc_prior_block_resources = getattr(
+                    context, "_omc_block_resources", None
+                )
+            except Exception:  # noqa: BLE001 - fake contexts may reject attrs
+                pass
             # Flag the deferral BEFORE the page's inline render script runs
             # (init scripts execute before any page script) so the render hook
             # sees it and skips the automatic invisible execute().
             if defer_execute:
                 await context.add_init_script(self._DEFER_EXECUTE_JS)
-            await context.route(website_url, self._document_route_handler(html))
+            await context.route(website_url, handler)
+            # Re-assert blocking ON — LAST, after the per-solve route is
+            # installed, so a partial prepare can never flip the shared
+            # context's state without cleanup running.
+            set_context_resource_blocking(context, True)
+
+        async def cleanup(context: Any) -> None:
+            # Restore the blocking state prepare found. Leaving interception
+            # ON would make every later real-page solve on this pooled context
+            # abort its CSS/fonts/images — a strong bot tell.
+            prior = getattr(context, "_omc_prior_block_resources", None)
+            if prior is not None:
+                set_context_resource_blocking(context, prior)
+            try:
+                context._omc_prior_block_resources = None
+            except Exception:  # noqa: BLE001 - bookkeeping only
+                pass
+            # A warm pooled context outlives the solve: an un-routed per-solve
+            # document handler would keep serving THIS task's HTML (and
+            # sitekey) to the next solve that navigates the same URL.
+            unroute = getattr(context, "unroute", None)
+            if unroute is None:
+                return
+            try:
+                await unroute(website_url, handler)
+            except Exception as exc:  # noqa: BLE001 - cleanup never fails a solve
+                log.debug("document route cleanup failed: %s", exc)
 
         return PageStrategy(
             block_resources=True,
             timeout_message=f"{self.PROVIDER} token not obtained within budget",
             prepare_context=prepare,
+            key="injected",
+            cleanup_context=cleanup,
         )
 
     def _real_page_strategy(self, render_options: dict[str, Any]) -> PageStrategy:
@@ -429,10 +658,16 @@ class InjectedWidgetSolver(BaseBrowserSolver):
                 self._build_real_page_init_script(render_options)
             )
 
+        # Playwright exposes no ``remove_init_script``; the per-task signature
+        # check in ``_run_page_solve`` is what keeps a pooled context from
+        # applying stale render options (a differing URL/options forces a
+        # fresh-context acquire). Same-signature reuse is harmless (identical
+        # options are merged), so no cleanup callback is needed here.
         return PageStrategy(
             block_resources=False,
             timeout_message=f"{self.PROVIDER} token not obtained (real page mode)",
             prepare_context=prepare,
+            key="real_page",
         )
 
     # ── shared solve template ──────────────────────────────────
@@ -492,36 +727,107 @@ class InjectedWidgetSolver(BaseBrowserSolver):
         provider supplies :meth:`_interact`. Phase timings and :class:`SolveStage`
         tracking are recorded here so both providers (and both strategies) get
         them uniformly.
+
+        Warm pooled contexts are treated as reusable only for the SAME task:
+        ``prepare_context`` installs per-solve routes/init scripts on the
+        context, which outlive the solve. A context whose recorded
+        URL/options/render signature differs from this task is handed back
+        untouched and a fresh context is acquired instead, so a later solve can
+        never inherit another sitekey's injected page or render options.
         """
+        # SSRF guard at the navigation point, shared by every injected/real-page
+        # provider (hCaptcha + Turnstile). Runs BEFORE a proxy or browser
+        # context is checked out. A rejected URL is a non-retryable request
+        # fault: retrying the same malformed/internal target would only burn
+        # the retry budget and egrees, so it raises the classified error the
+        # task manager maps to ERROR_CAPTCHA_UNSOLVABLE (never a 500).
+        # ``ssrf_protect=False`` disables the pre-flight entirely.
+        if getattr(self._config, "ssrf_protect", True):
+            try:
+                website_url = await _validate_public_http_url(
+                    website_url,
+                    field="websiteURL",
+                    # Opt-in fail-closed DNS (default keeps the offline-test
+                    # fail-open policy documented on the helper).
+                    strict=bool(getattr(self._config, "ssrf_strict", False)),
+                )
+            except ValueError as exc:
+                raise NonRetryableWidgetError(str(exc)) from exc
+
+        signature = self._render_signature(strategy, website_url, render_options)
         solve_context = await self._acquire_context(params)
+        stored = getattr(solve_context.context, "_omc_render_signature", None)
+        if (
+            solve_context.session is not None
+            and stored is not None
+            and stored != signature
+        ):
+            log.info(
+                "%s warm session %s was prepared for a different task "
+                "(url/options mismatch); requesting a fresh context",
+                self.PROVIDER,
+                solve_context.session_id,
+            )
+            await self._return_warm_session(solve_context)
+            # Drop the discarded session/proxy identity before re-acquiring so
+            # nothing from the rejected context is reported against this solve.
+            for key in (
+                "_proxy_override",
+                "_egress_server",
+                "_pool_proxy_id",
+                "_pool_geo",
+                "_proxy_seed",
+                "_pool_proxy_mobile",
+                "_sessionId",
+            ):
+                params.pop(key, None)
+            prior_force = params.get("_force_fresh_context")
+            params["_force_fresh_context"] = True
+            try:
+                solve_context = await self._acquire_context(params)
+            finally:
+                if prior_force is None:
+                    params.pop("_force_fresh_context", None)
+                else:
+                    params["_force_fresh_context"] = prior_force
+
         self._stash_fingerprint_geo(solve_context, params)
         context = solve_context.context
         user_agent = solve_context.user_agent
 
         solved = False
+        # ``solve_context`` is duck-typed, so ``new_page()`` returns ``Any``;
+        # keep the sentinel ``None`` before the page exists.
+        page: Any = None
+        prepared = False
         # Initialised before the try so the finally's challenge-phase timing is
         # always defined even if context setup / goto raises early.
-        _challenge_started = time.monotonic()
+        _challenge_started = time.perf_counter()
         try:
             params["_phase"] = SolveStage.ACQUIRE.value
             self._guard(solve_context, params)
             await strategy.prepare_context(context)
+            prepared = True
+            setattr(context, "_omc_render_signature", signature)
             # Re-seed a persisted provider device-trust cookie (hCaptcha ``hmt``)
             # into this (possibly fresh) context so the widget sees a returning
             # device rather than a zero-history one. No-op unless the provider
             # overrides it and the operator opted in.
             await self._restore_device(context, params)
+            # ``new_page`` is inside the try: a failure after page creation must
+            # still run the finally that closes the page and releases the warm
+            # session slot.
             page = await context.new_page()
             params["_phase"] = SolveStage.PAGE_LOAD.value
             timeout_ms = self._config.browser_timeout * 1000
-            _page_started = time.monotonic()
+            _page_started = time.perf_counter()
             await page.goto(
                 website_url, wait_until="domcontentloaded", timeout=timeout_ms
             )
             params["_phase_page_load_ms"] = int(
-                (time.monotonic() - _page_started) * 1000
+                (time.perf_counter() - _page_started) * 1000
             )
-            _challenge_started = time.monotonic()
+            _challenge_started = time.perf_counter()
 
             token = await self._interact(
                 page, website_url, website_key, render_options, params, client_key
@@ -533,10 +839,79 @@ class InjectedWidgetSolver(BaseBrowserSolver):
             raise RuntimeError(strategy.timeout_message)
         finally:
             params["_phase_challenge_ms"] = int(
-                (time.monotonic() - _challenge_started) * 1000
+                (time.perf_counter() - _challenge_started) * 1000
             )
-            # Capture the provider device-trust cookie BEFORE the context is
-            # released/closed so the next solve on this egress can present a
-            # returning device. Guarded + no-op unless opted in.
-            await self._persist_device(context, params, solved)
-            await self._release_context(solve_context, solved, params)
+            try:
+                # Capture the provider device-trust cookie BEFORE the context is
+                # released/closed so the next solve on this egress can present a
+                # returning device. Guarded + no-op unless opted in.
+                try:
+                    await self._persist_device(context, params, solved)
+                finally:
+                    # Close the per-solve page on BOTH paths — a warm session's
+                    # context outlives the solve, so an unclosed page would
+                    # accumulate (and its listeners/route stay live) until the
+                    # session retires.
+                    if page is not None:
+                        closer = getattr(page, "close", None)
+                        if closer is not None:
+                            try:
+                                await closer()
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:  # noqa: BLE001
+                                log.debug("page close failed: %s", exc)
+            finally:
+                try:
+                    # Undo this solve's context-level route (warm session) so it
+                    # cannot fulfil the next task's document with stale HTML.
+                    if prepared and strategy.cleanup_context is not None:
+                        await strategy.cleanup_context(context)
+                finally:
+                    await self._release_context(solve_context, solved, params)
+
+    def _render_signature(
+        self, strategy: PageStrategy, website_url: str, render_options: dict[str, Any]
+    ) -> str:
+        """Identity of the per-solve page preparation (provider + URL + options).
+
+        The provider is part of the key: a warm context prepared by a
+        different widget solver already carries that provider's init script,
+        so a same-URL/same-options signature without the provider would let
+        the other provider reuse it (cross-provider init-script
+        contamination).
+        """
+        try:
+            options_key = json.dumps(
+                render_options, sort_keys=True, default=str
+            )
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            options_key = repr(render_options)
+        return f"{self.PROVIDER}|{strategy.key}|{website_url}|{options_key}"
+
+    async def _return_warm_session(self, solve_context: Any) -> None:
+        """Hand a warm session back untouched when its preparation mismatches.
+
+        Best-effort: a pool failure must not abort the solve (the fresh-context
+        path can still run); ``released`` is set so the discarded context can
+        never be released twice.
+        """
+        session = solve_context.session
+        session_pool = (
+            getattr(self._services, "session_pool", None)
+            if self._services is not None
+            else None
+        )
+        if session is None or session_pool is None:
+            return
+        solve_context.released = True
+        try:
+            await session_pool.release(session, success=True, burned=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - bookkeeping only
+            log.warning(
+                "warm session release on mismatch failed for %s: %s",
+                solve_context.session_id,
+                exc,
+            )

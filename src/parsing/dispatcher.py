@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 
+from ..services.captcha_errors import CaptchaError
+
 log = logging.getLogger(__name__)
 
 
@@ -41,6 +43,94 @@ class ChallengeShape(str, Enum):
     CANVAS_SLIDE = "canvas_slide"
     RECAPTCHA_DYNAMIC = "recaptcha_dynamic"
     UNKNOWN = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Shape selector vocabulary — the single source of truth
+# ---------------------------------------------------------------------------
+#
+# The classifier decides *which shape* a frame is from cheap ``count()`` probes,
+# and the dispatched solver then has to find (screenshot / click) the elements
+# for that shape. Keeping those two selector sets in separate literal lists let
+# them drift: the classifier could recognize a shape the solver had no selector
+# for, wasting the whole attempt. Both sides now read the registry below, so a
+# selector added for detection is visible to the solver and vice versa.
+#
+# ``detect`` groups hold the classifier's probe selectors; the named element
+# groups (``tile`` / ``handle`` / ``background`` / ``puzzle`` / ``image``) are
+# what the shape's solver operates on. Dynamic grids are a grid subtype — the
+# classifier only reaches the dynamic markers after a grid signal matched — so
+# their vocabulary also inherits the grid's (see ``_PARENT_SHAPE``).
+SHAPE_SELECTORS: Dict[ChallengeShape, Dict[str, "tuple[str, ...]"]] = {
+    ChallengeShape.GRID_SELECT: {
+        "detect": (".task-grid", ".task-image", "table.rc-imageselect-table"),
+        "tile": (".task-image",),
+    },
+    ChallengeShape.RECAPTCHA_DYNAMIC: {
+        "detect": (".rc-imageselect-dynamic-selected", "[data-dynamic]", ".dynamic"),
+        "tile": (".rc-imageselect-tile", ".task-image"),
+    },
+    ChallengeShape.CANVAS_SLIDE: {
+        "detect": (
+            ".slider",
+            ".slide-handle",
+            ".geetest_slider_button",
+            "canvas.slideBg",
+            "[class*='slider']",
+        ),
+        "handle": (".slide-handle", ".slider", ".geetest_slider_button"),
+        "background": (
+            "canvas.slideBg",
+            ".geetest_canvas_bg",
+            ".slider-bg",
+            ".puzzle-image",
+            ".captcha-image",
+        ),
+    },
+    ChallengeShape.DRAG_DROP: {
+        "detect": (
+            ".drag-handle",
+            ".draggable",
+            "[draggable='true']",
+            ".piece",
+            # The drag area itself is what the solver screenshots; probing it
+            # for detection keeps "classified as drag" and "solver can find the
+            # puzzle" the same question.
+            ".drag-area",
+        ),
+        "puzzle": (
+            ".puzzle-image",
+            ".captcha-image",
+            ".drag-area",
+            "canvas",
+            ".task-image",
+        ),
+    },
+    ChallengeShape.AREA_BBOX: {
+        "detect": (".bbox-overlay", ".area-select", ".single-image"),
+        "image": (".single-image", ".task-image", "canvas"),
+    },
+}
+
+# Shapes whose detection vocabulary builds on another shape's (grid subtype).
+_PARENT_SHAPE: Dict[ChallengeShape, ChallengeShape] = {
+    ChallengeShape.RECAPTCHA_DYNAMIC: ChallengeShape.GRID_SELECT,
+}
+
+
+def shape_selectors(shape: ChallengeShape, group: str) -> "tuple[str, ...]":
+    """Return one selector group from :data:`SHAPE_SELECTORS`."""
+    try:
+        return SHAPE_SELECTORS[shape][group]
+    except KeyError as exc:  # pragma: no cover - programming error
+        raise KeyError(
+            f"no selector group {group!r} for shape {shape.value}"
+        ) from exc
+
+
+def selector_csv(shape: ChallengeShape, group: str) -> str:
+    """Comma-joined selector group, ready for a Playwright locator string."""
+    return ", ".join(shape_selectors(shape, group))
 
 
 @dataclass
@@ -125,31 +215,18 @@ class ChallengeClassifier:
     ``UNKNOWN`` rather than raising.
     """
 
-    # Selectors grouped by the signal they imply.
-    GRID_SELECTORS = (".task-grid", ".task-image", "table.rc-imageselect-table")
+    # Selectors grouped by the signal they imply. Every set comes from
+    # ``SHAPE_SELECTORS`` (the same registry the shape solvers read), so
+    # detection vocabulary and solver selectors can't drift apart.
+    GRID_SELECTORS = shape_selectors(ChallengeShape.GRID_SELECT, "detect")
     # The per-tile selector inside a grid. Counting it separates a real
     # multi-tile grid from a single-image "click the object" (area-select)
     # challenge, which hCaptcha also renders with ``.task-image``.
-    TILE_SELECTOR = ".task-image"
-    DYNAMIC_MARKERS = (
-        ".rc-imageselect-dynamic-selected",
-        "[data-dynamic]",
-        ".dynamic",
-    )
-    SLIDER_SELECTORS = (
-        ".slider",
-        ".slide-handle",
-        ".geetest_slider_button",
-        "canvas.slideBg",
-        "[class*='slider']",
-    )
-    DRAG_SELECTORS = (
-        ".drag-handle",
-        ".draggable",
-        "[draggable='true']",
-        ".piece",
-    )
-    BBOX_SELECTORS = (".bbox-overlay", ".area-select", ".single-image")
+    TILE_SELECTOR = selector_csv(ChallengeShape.GRID_SELECT, "tile")
+    DYNAMIC_MARKERS = shape_selectors(ChallengeShape.RECAPTCHA_DYNAMIC, "detect")
+    SLIDER_SELECTORS = shape_selectors(ChallengeShape.CANVAS_SLIDE, "detect")
+    DRAG_SELECTORS = shape_selectors(ChallengeShape.DRAG_DROP, "detect")
+    BBOX_SELECTORS = shape_selectors(ChallengeShape.AREA_BBOX, "detect")
     # Prompt containers — present on every rendered hCaptcha challenge (grid,
     # area-select, etc.) regardless of interaction shape.
     PROMPT_SELECTORS = (".prompt-text", ".challenge-prompt")
@@ -361,6 +438,12 @@ class ChallengeDispatcher:
 
         try:
             token = await solver.run(frame, ctx)
+        except CaptchaError:
+            # Classified errors (rate limit, non-retryable widget error, vision
+            # parse failure) carry the reaction the solve loop must take —
+            # fail fast or retry with backoff. Swallowing them here collapsed
+            # every kind into an indistinguishable "no token".
+            raise
         except Exception as exc:  # noqa: BLE001 - solver failures shouldn't crash dispatch
             log.warning("Solver for %s raised: %s", shape.value, exc)
             return None
@@ -368,3 +451,88 @@ class ChallengeDispatcher:
         if token:
             log.info("Solver for %s produced a token (len=%d)", shape.value, len(token))
         return token
+
+
+def assert_selector_vocabulary_matches() -> None:
+    """Assert the classifier and every shape solver share one vocabulary.
+
+    Module-level consistency hook (also callable from tests): a future edit that
+    adds a selector to the classifier or to a solver without registering it in
+    :data:`SHAPE_SELECTORS` — the drift that lets a challenge be classified as a
+    shape whose solver can't find it — fails loudly here instead of silently
+    wasting solve attempts. Raises ``AssertionError`` on any mismatch.
+    """
+    # Imported lazily: the shape modules import this module for the shared
+    # request/context types, so a module-level import would be circular.
+    from .shapes.area_bbox import AreaBBoxSolver
+    from .shapes.drag_drop import DragDropSolver
+    from .shapes.dynamic_grid import DynamicGridSolver
+    from .shapes.grid_select import GridSelectSolver
+    from .shapes.slide import CanvasSlideSolver
+
+    solver_checks = (
+        (ChallengeShape.GRID_SELECT, GridSelectSolver, "TILE_SELECTOR", "tile"),
+        (
+            ChallengeShape.RECAPTCHA_DYNAMIC,
+            DynamicGridSolver,
+            "TILE_SELECTOR",
+            "tile",
+        ),
+        (ChallengeShape.CANVAS_SLIDE, CanvasSlideSolver, "HANDLE_SELECTOR", "handle"),
+        (
+            ChallengeShape.CANVAS_SLIDE,
+            CanvasSlideSolver,
+            "BG_SELECTOR",
+            "background",
+        ),
+        (ChallengeShape.DRAG_DROP, DragDropSolver, "PUZZLE_SELECTOR", "puzzle"),
+        (ChallengeShape.AREA_BBOX, AreaBBoxSolver, "IMAGE_SELECTOR", "image"),
+    )
+    for shape, solver_cls, attr, group in solver_checks:
+        assert solver_cls.SHAPE is shape, (
+            f"{solver_cls.__name__}.SHAPE is {solver_cls.SHAPE}, expected {shape}"
+        )
+        actual = tuple(
+            part.strip() for part in str(getattr(solver_cls, attr)).split(",")
+        )
+        expected = shape_selectors(shape, group)
+        assert actual == expected, (
+            f"{solver_cls.__name__}.{attr} is {actual!r}, but "
+            f"SHAPE_SELECTORS[{shape.value}][{group!r}] is {expected!r}"
+        )
+
+    # The classifier's own constants must be the registry values verbatim.
+    assert ChallengeClassifier.GRID_SELECTORS == shape_selectors(
+        ChallengeShape.GRID_SELECT, "detect"
+    ), "ChallengeClassifier.GRID_SELECTORS drifted from SHAPE_SELECTORS"
+    assert ChallengeClassifier.DYNAMIC_MARKERS == shape_selectors(
+        ChallengeShape.RECAPTCHA_DYNAMIC, "detect"
+    ), "ChallengeClassifier.DYNAMIC_MARKERS drifted from SHAPE_SELECTORS"
+    assert ChallengeClassifier.SLIDER_SELECTORS == shape_selectors(
+        ChallengeShape.CANVAS_SLIDE, "detect"
+    ), "ChallengeClassifier.SLIDER_SELECTORS drifted from SHAPE_SELECTORS"
+    assert ChallengeClassifier.DRAG_SELECTORS == shape_selectors(
+        ChallengeShape.DRAG_DROP, "detect"
+    ), "ChallengeClassifier.DRAG_SELECTORS drifted from SHAPE_SELECTORS"
+    assert ChallengeClassifier.BBOX_SELECTORS == shape_selectors(
+        ChallengeShape.AREA_BBOX, "detect"
+    ), "ChallengeClassifier.BBOX_SELECTORS drifted from SHAPE_SELECTORS"
+
+    # Every shape must expose some selector its classifier can detect AND some
+    # element its solver can operate on, and the two sets must overlap (for
+    # dynamic grids the grid vocabulary counts — it is a grid subtype).
+    for shape, groups in SHAPE_SELECTORS.items():
+        detect = set(groups.get("detect", ()))
+        assert detect, f"{shape.value}: empty detection vocabulary"
+        parent = _PARENT_SHAPE.get(shape)
+        if parent is not None:
+            detect |= set(shape_selectors(parent, "detect"))
+        elements = set()
+        for name, selectors in groups.items():
+            if name != "detect":
+                elements.update(selectors)
+        assert elements, f"{shape.value}: no solver element selectors"
+        assert elements & detect, (
+            f"{shape.value}: classifier detects {sorted(detect)} but the solver "
+            f"only operates on {sorted(elements)} — vocabularies are disjoint"
+        )

@@ -16,7 +16,9 @@ the things that matter for real-world captcha solving:
 * **Runtime selection** — ``BROWSER_RUNTIME`` chooses stock ``chromium`` (default)
   or a hardened patched runtime (``rebrowser`` / ``camoufox``) for the toughest
   targets, falling back to stock Chromium when the patched runtime isn't
-  installed.
+  installed. ``rebrowser`` launches through ``rebrowser_playwright``'s patched
+  driver; the manager records the *actually* started runtime + driver on
+  ``effective_runtime`` / ``driver`` so a silent stock launch is observable.
 
 ``context_factory`` implements the signature the warm :class:`SessionPool`
 expects (``async (fingerprint, proxy) -> (context, user_agent)``), so the pool
@@ -25,7 +27,11 @@ can create sessions without importing Playwright itself.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
+import sys
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 from urllib.parse import urlparse
@@ -65,12 +71,19 @@ DEFAULT_USER_AGENT = (
 # Leaving the GPU enabled lets a GPU-equipped host (or headful runtime) present
 # real hardware WebGL consistent with the spoofed GPU; on a GPU-less headless
 # host Chromium still falls back to ANGLE/SwiftShader (no worse than before).
+#
+# NOTE: ``--no-sandbox`` and the site-isolation-disable flags are deliberately
+# NOT part of the default set. ``--no-sandbox`` removes Chromium's renderer
+# sandbox (a security downgrade and an automation tell), so it is added only
+# when the operator opts in via ``BROWSER_DISABLE_SANDBOX=true`` or, in auto
+# mode (``None``), when running as root on POSIX — the container case where
+# the setuid sandbox cannot start (never on Windows). Disabling site isolation
+# is likewise opt-in via ``BROWSER_DISABLE_SITE_ISOLATION=true``: a browser
+# with ``IsolateOrigins,site-per-process`` off behaves (and is detectable)
+# differently across origins. See ``BrowserManager._launch_args``.
 _LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
-    "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--disable-site-isolation-trials",
     # WebRTC egress leak guard: a captcha token is IP-bound, but WebRTC can
     # surface the host's real (pre-proxy) local/public IP via ICE candidates,
     # contradicting the proxy egress and handing enterprise risk models a
@@ -79,11 +92,85 @@ _LAUNCH_ARGS = [
     # candidate leaks. Camoufox handles this via CAMOUFOX_BLOCK_WEBRTC instead.
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 ]
+_DISABLE_SITE_ISOLATION_ARGS = [
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-site-isolation-trials",
+]
+
+# Chrome version token (``Chrome/149.0.7827.55`` → ``149.0.7827.55``). Used to
+# keep a caller-forced UA coherent with the spoofed client hints.
+_CHROME_UA_RE = re.compile(r"Chrome/(\d+(?:\.\d+)*)")
 
 
 def _parse_csv(value: str) -> set[str]:
     """Split a comma-separated config string into a lowercased set of tokens."""
     return {token.strip().lower() for token in (value or "").split(",") if token.strip()}
+
+
+def _chrome_ua_version(user_agent: str) -> Optional[Tuple[str, str]]:
+    """Return ``(major, full_version)`` from a Chrome UA, or ``None``.
+
+    ``full_version`` is the version token exactly as it appears in the UA
+    (``"149.0.0.0"`` for the reduced form, ``"149.0.7827.55"`` for a full
+    one), so the spoofed ``uaFullVersion`` never contradicts the UA string.
+    """
+    match = _CHROME_UA_RE.search(user_agent or "")
+    if match is None:
+        return None
+    version = match.group(1)
+    return version.split(".", 1)[0], version
+
+
+def _ua_client_hint_align_js(user_agent: str) -> Optional[str]:
+    """JS init script aligning ``navigator.userAgentData`` with ``user_agent``.
+
+    ``build_stealth_js`` derives the low-entropy brands from the fingerprint's
+    UA major, but pins ``fullVersionList`` / ``uaFullVersion`` to the bundled
+    engine's full version. When a caller forces an older/newer Chrome UA (so
+    the token binds to the UA they will submit with), a low-entropy brand of
+    ``131`` next to ``uaFullVersion`` ``149.x`` is a contradiction detectors
+    flag. Registered AFTER the stealth script (init scripts run in order), so
+    it only rewrites the two high-entropy values, preserving the GREASE brand.
+    Returns ``None`` when the UA has no parseable Chrome version.
+    """
+    parsed = _chrome_ua_version(user_agent)
+    if parsed is None:
+        return None
+    major, full_version = parsed
+    return f"""
+(() => {{
+  try {{
+    const uaData = navigator.userAgentData;
+    if (!uaData || typeof uaData.getHighEntropyValues !== 'function') return;
+    const major = {json.dumps(major)};
+    const fullVersion = {json.dumps(full_version)};
+    const align = (brands, version) => (brands || []).map((b) => (
+      (b && (b.brand === 'Google Chrome' || b.brand === 'Chromium'))
+        ? {{ brand: b.brand, version: version }}
+        : b
+    ));
+    const orig = uaData.getHighEntropyValues.bind(uaData);
+    Object.defineProperty(uaData, 'getHighEntropyValues', {{
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: (hints) => orig(hints).then((values) => Object.assign({{}}, values, {{
+        brands: align(values.brands || uaData.brands, major),
+        fullVersionList: align(values.fullVersionList, fullVersion),
+        uaFullVersion: fullVersion,
+      }})),
+    }});
+    try {{
+      Object.defineProperty(uaData, 'brands', {{
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: align(uaData.brands, major),
+      }});
+    }} catch (e) {{}}
+  }} catch (e) {{}}
+}})();
+"""
 
 
 @dataclass
@@ -233,6 +320,28 @@ class BrowserManager:
         self._requested_runtime = getattr(config, "browser_runtime", "chromium")
         self._runtime = self._requested_runtime
         self._runtime_strict = bool(getattr(config, "browser_runtime_strict", False))
+        # What ACTUALLY launched (runtime + Playwright driver package), as
+        # opposed to what was requested. ``not-started`` until ``start()``
+        # succeeds; a rebrowser request that degrades records
+        # ``chromium(rebrowser-unavailable)`` so health/telemetry can tell it
+        # apart from a deliberate stock launch.
+        self.effective_runtime: str = "not-started"
+        self.driver: str = "not-started"
+        self._driver = "not-started"
+        self._effective_runtime_override: Optional[str] = None
+        # Supervisor state: flipped by the browser's ``disconnected`` event so
+        # ``is_ready()`` reports a dead process even if the Playwright
+        # connection check is unavailable. A future supervisor loop can watch
+        # this flag to relaunch.
+        self._disconnected = False
+        # Launch-arg gating. ``browser_disable_sandbox`` is tri-state
+        # (None = auto: root on POSIX only); site-isolation disabling is
+        # strictly opt-in. Read defensively so test configs built from a bare
+        # ``SimpleNamespace`` keep the safe defaults.
+        self._disable_sandbox = getattr(config, "browser_disable_sandbox", None)
+        self._disable_site_isolation = bool(
+            getattr(config, "browser_disable_site_isolation", False)
+        )
         # Camoufox is a Firefox fork that owns its fingerprint at the engine
         # level, so its contexts are built WITHOUT our Chromium stealth JS /
         # Chrome client hints / forced UA (those would contradict a Firefox
@@ -275,11 +384,177 @@ class BrowserManager:
         """The runtime the operator requested via ``BROWSER_RUNTIME``."""
         return self._requested_runtime
 
+    def is_ready(self) -> bool:
+        """True when the shared browser process is connected and alive.
+
+        Combines the supervisor's ``disconnected`` flag (which catches crashes
+        even when the Playwright connection check is unavailable) with a
+        guarded ``browser.is_connected()`` call. Never raises: fake browsers
+        and partially initialised Playwright objects return False.
+        """
+        if self._browser is None or self._disconnected:
+            return False
+        try:
+            is_connected = getattr(self._browser, "is_connected", None)
+            if not callable(is_connected):
+                return False
+            return bool(is_connected())
+        except Exception:  # noqa: BLE001 - readiness probe is best-effort
+            return False
+
+    def _sandbox_disabled(self) -> bool:
+        """Whether Chromium should be launched with ``--no-sandbox``.
+
+        Explicit ``BROWSER_DISABLE_SANDBOX`` wins. Auto (``None``) disables
+        the sandbox only when running as root on POSIX, where Chromium's
+        setuid sandbox cannot start — the container case. Never on Windows.
+        """
+        if self._disable_sandbox is True:
+            return True
+        if self._disable_sandbox is False:
+            return False
+        if sys.platform == "win32":
+            return False
+        try:
+            return os.geteuid() == 0
+        except (AttributeError, OSError):
+            return False
+
+    def _launch_args(self) -> list[str]:
+        """Resolve Chromium launch args, applying the config-gated flags.
+
+        The baseline (``_LAUNCH_ARGS``) is always applied; ``--no-sandbox``
+        and the site-isolation-disable flags are opt-in (see the notes on
+        ``_LAUNCH_ARGS``) so the default launch is sandboxed and presents the
+        standard cross-origin isolation behaviour a real Chrome does.
+        """
+        args = list(_LAUNCH_ARGS)
+        if self._sandbox_disabled():
+            args.append("--no-sandbox")
+        if self._disable_site_isolation:
+            args.extend(_DISABLE_SITE_ISOLATION_ARGS)
+        return args
+
+    def _prepare_runtime(self) -> None:
+        """Resolve the requested runtime against what is actually installed.
+
+        Strict mode makes an unavailable hardened runtime fatal; lenient mode
+        degrades to stock Chromium and records the divergence (loudly logged
+        by ``start``). Also invoked from ``_launch`` so direct callers get the
+        same guard.
+        """
+        if self._runtime not in {"camoufox", "rebrowser"}:
+            return
+        if self._hardened_runtime_available(self._runtime):
+            return
+        msg = (
+            f"BROWSER_RUNTIME={self._runtime!r} was requested but the runtime "
+            f"is not installed in this environment"
+        )
+        if self._runtime_strict:
+            raise RuntimeError(
+                msg + " (BROWSER_RUNTIME_STRICT=true). Install it or change "
+                "BROWSER_RUNTIME."
+            )
+        log.warning("%s; degrading to stock Chromium", msg)
+        if self._runtime == "rebrowser":
+            # Distinguish "asked for rebrowser, ran stock Playwright" from a
+            # deliberate chromium launch in health/telemetry.
+            self._effective_runtime_override = "chromium(rebrowser-unavailable)"
+            self._driver = "playwright"
+        self._runtime = "chromium"
+
+    async def _start_playwright(self) -> Playwright:
+        """Start the Playwright driver matching the resolved runtime.
+
+        ``rebrowser`` must start ``rebrowser_playwright``'s patched driver —
+        the stock ``playwright`` package would silently launch an unpatched
+        browser (the audit's runtime-truth bug). If that import fails even
+        though ``find_spec`` saw the package, strict mode raises (the operator
+        asked for a runtime that cannot start); lenient mode degrades to stock
+        and records ``chromium(rebrowser-unavailable)``.
+        """
+        if self._runtime == "rebrowser":
+            try:
+                from rebrowser_playwright.async_api import (  # type: ignore[reportMissingImports]
+                    async_playwright as rebrowser_async_playwright,
+                )
+            except Exception as exc:  # noqa: BLE001 - broken/partial install
+                # ``_prepare_runtime`` only proved the package is *findable*;
+                # a broken/partial install can still fail the real import.
+                # Strict mode must be honoured here too — otherwise the
+                # BROWSER_RUNTIME_STRICT contract is bypassed by the very
+                # failure it exists to catch.
+                if self._runtime_strict:
+                    raise RuntimeError(
+                        "BROWSER_RUNTIME=rebrowser was requested but the "
+                        "rebrowser_playwright driver could not be imported "
+                        f"({exc}) and BROWSER_RUNTIME_STRICT=true forbids the "
+                        "stock-Playwright fallback. Reinstall "
+                        "rebrowser-playwright or change BROWSER_RUNTIME."
+                    ) from exc
+                log.warning(
+                    "BROWSER_RUNTIME=rebrowser but the rebrowser_playwright "
+                    "driver could not be imported (%s); falling back to stock "
+                    "Playwright. Effective runtime recorded as "
+                    "'chromium(rebrowser-unavailable)' — enterprise/anti-bot "
+                    "targets may flag this browser.",
+                    exc,
+                )
+                self._runtime = "chromium"
+                self._driver = "playwright"
+                self._effective_runtime_override = "chromium(rebrowser-unavailable)"
+                return await async_playwright().start()
+            self._driver = "rebrowser-playwright"
+            return await rebrowser_async_playwright().start()
+        self._driver = "playwright"
+        return await async_playwright().start()
+
+    def _set_effective_runtime(self) -> None:
+        """Record what actually launched (runtime + driver package)."""
+        if self._effective_runtime_override is not None:
+            self.effective_runtime = self._effective_runtime_override
+        elif self._runtime == "camoufox":
+            self.effective_runtime = "camoufox"
+        elif self._runtime == "rebrowser":
+            self.effective_runtime = "rebrowser"
+        else:
+            self.effective_runtime = "chromium"
+        self.driver = self._driver
+
+    def _attach_supervisor(self, browser: Browser) -> None:
+        """Wire the disconnect supervisor onto the launched browser.
+
+        Phase 0 only records state and logs; a later supervisor can watch
+        ``self._disconnected`` (and add a relaunch loop) without changing the
+        hook points.
+        """
+        try:
+            browser.on("disconnected", self._on_browser_disconnected)
+        except Exception as exc:  # noqa: BLE001 - fake/partial browsers
+            log.warning("Could not attach browser disconnect supervisor: %s", exc)
+
+    def _on_browser_disconnected(self, *_args: Any) -> None:
+        """Mark the manager not-ready when the browser process dies."""
+        self._disconnected = True
+        log.warning(
+            "Shared browser process disconnected (effective_runtime=%s); "
+            "manager is no longer ready. No auto-relaunch is configured in "
+            "this phase.",
+            self.effective_runtime,
+        )
+
     async def start(self) -> None:
         if self._browser is not None:
             return
-        self._playwright = await async_playwright().start()
+        # Resolve availability BEFORE starting a driver: strict mode must fail
+        # before any stock Playwright process is spawned, and rebrowser needs
+        # its own patched driver started below.
+        self._prepare_runtime()
+        self._playwright = await self._start_playwright()
         self._browser = await self._launch()
+        self._disconnected = False
+        self._attach_supervisor(self._browser)
         if self._runtime == "camoufox":
             await self._cache_camoufox_user_agent()
         else:
@@ -297,8 +572,11 @@ class BrowserManager:
                 self._runtime,
             )
         log.info(
-            "Shared browser started (runtime=%s, requested=%s, headless=%s)",
+            "Shared browser started (runtime=%s, effective_runtime=%s, "
+            "driver=%s, requested=%s, headless=%s)",
             self._runtime,
+            self.effective_runtime,
+            self.driver,
             self._requested_runtime,
             self._config.browser_headless,
         )
@@ -321,40 +599,39 @@ class BrowserManager:
         )
         if module is None:
             return True
-        return importlib.util.find_spec(module) is not None
+        # Already-imported packages are available by definition; this also
+        # keeps test-injected fake modules (which often have no ``__spec__``)
+        # usable without find_spec raising ValueError.
+        if module in sys.modules:
+            return True
+        try:
+            return importlib.util.find_spec(module) is not None
+        except (ImportError, AttributeError, ValueError):
+            # A partially installed package must not crash startup; treat it
+            # as unavailable and let the import in ``_start_playwright``
+            # decide (it degrades with the rebrowser-unavailable marker).
+            return False
 
     async def _launch(self) -> Browser:
         assert self._playwright is not None
-        launcher = self._playwright.chromium
-
         # Guard hardened runtimes before we attempt a launch so an operator who
         # asked for camoufox/rebrowser but never installed it gets a clear
         # signal instead of a silent degrade. In strict mode this is fatal; in
         # lenient mode we degrade to stock Chromium (and start() warns loudly).
-        if self._runtime in {"camoufox", "rebrowser"} and not self._hardened_runtime_available(
-            self._runtime
-        ):
-            msg = (
-                f"BROWSER_RUNTIME={self._runtime!r} was requested but the runtime "
-                f"is not installed in this environment"
-            )
-            if self._runtime_strict:
-                raise RuntimeError(
-                    msg + " (BROWSER_RUNTIME_STRICT=true). Install it or change "
-                    "BROWSER_RUNTIME."
-                )
-            log.warning("%s; degrading to stock Chromium", msg)
-            self._runtime = "chromium"
+        self._prepare_runtime()
+        launcher = self._playwright.chromium
 
         try:
             if self._runtime == "camoufox":
-                return await self._launch_camoufox()
-            # rebrowser-playwright exposes the same API surface via the standard
-            # `chromium` object once its patched driver is installed.
-            return await launcher.launch(
-                headless=self._config.browser_headless,
-                args=_LAUNCH_ARGS,
-            )
+                browser = await self._launch_camoufox()
+            else:
+                # rebrowser-playwright exposes the same API surface via the
+                # standard `chromium` object once its patched driver is started
+                # (see ``_start_playwright``).
+                browser = await launcher.launch(
+                    headless=self._config.browser_headless,
+                    args=self._launch_args(),
+                )
         except Exception as exc:  # pragma: no cover - depends on host runtimes
             if self._runtime_strict:
                 raise RuntimeError(
@@ -367,11 +644,51 @@ class BrowserManager:
                 self._runtime,
                 exc,
             )
-            self._runtime = "chromium"
-            return await launcher.launch(
-                headless=self._config.browser_headless,
-                args=_LAUNCH_ARGS,
-            )
+            if self._runtime == "rebrowser":
+                # ``launcher`` belongs to the rebrowser driver that just
+                # failed; retrying through it would replay the same failure.
+                # Start the stock Playwright driver and launch there.
+                browser = await self._relaunch_on_stock_playwright()
+            else:
+                self._runtime = "chromium"
+                browser = await launcher.launch(
+                    headless=self._config.browser_headless,
+                    args=self._launch_args(),
+                )
+        # Record the actual runtime + driver only after the launch succeeded.
+        self._set_effective_runtime()
+        return browser
+
+    async def _relaunch_on_stock_playwright(self) -> Browser:
+        """Relaunch Chromium through the stock Playwright driver.
+
+        Called when the ``rebrowser`` (patched) driver started but failed to
+        launch a browser. Retrying through the same Playwright instance would
+        just replay the patched driver's failure, so the patched driver is
+        stopped and a fresh stock ``playwright`` driver is started. The
+        divergence is recorded as ``chromium(rebrowser-launch-failed)`` on
+        ``effective_runtime`` so health/telemetry cannot mistake this for a
+        deliberate stock launch.
+        """
+        log.warning(
+            "rebrowser driver launch failed; restarting the browser on stock "
+            "Playwright. Effective runtime will be recorded as "
+            "'chromium(rebrowser-launch-failed)' — enterprise/anti-bot "
+            "targets may flag this browser."
+        )
+        try:
+            if self._playwright is not None:
+                await self._playwright.stop()
+        except Exception:  # noqa: BLE001 - a broken driver may not stop cleanly
+            log.debug("stopping the failed rebrowser driver raised", exc_info=True)
+        self._playwright = await async_playwright().start()
+        self._runtime = "chromium"
+        self._driver = "playwright"
+        self._effective_runtime_override = "chromium(rebrowser-launch-failed)"
+        return await self._playwright.chromium.launch(
+            headless=self._config.browser_headless,
+            args=self._launch_args(),
+        )
 
     async def _launch_camoufox(self) -> Browser:
         """Launch the patched Camoufox (Firefox) build via the real driver.
@@ -384,8 +701,10 @@ class BrowserManager:
         The proxy is applied per-context (Firefox supports context proxies) so
         each solve still egresses through its own pool/task proxy.
         """
-        from camoufox import AsyncNewBrowser  # noqa: WPS433 - optional runtime dep
-        from camoufox.utils import launch_options as camoufox_launch_options
+        # Optional runtime dependency: absent from a stock install, imported
+        # only when BROWSER_RUNTIME=camoufox selected it.
+        from camoufox import AsyncNewBrowser  # type: ignore[reportMissingImports]  # noqa: WPS433
+        from camoufox.utils import launch_options as camoufox_launch_options  # type: ignore[reportMissingImports]
 
         opts = camoufox_launch_options(
             headless=self._config.browser_headless,
@@ -468,6 +787,13 @@ class BrowserManager:
         if self._playwright:
             await self._playwright.stop()
             self._playwright = None
+        # A stopped manager has no launched runtime; reset so is_ready() and
+        # health can't report a stale browser.
+        self._disconnected = False
+        self.effective_runtime = "not-started"
+        self.driver = "not-started"
+        self._driver = "not-started"
+        self._effective_runtime_override = None
         log.info("Shared browser stopped")
 
     async def new_context(self, params: dict[str, Any]) -> Tuple[BrowserContext, str]:
@@ -477,11 +803,26 @@ class BrowserManager:
         back to the caller for token/UA binding.
         """
         opts = resolve_context_options(self._config, params)
-        # Honour a caller-forced UA by projecting it onto the fingerprint.
+        # Honour a caller-forced UA by projecting it onto the fingerprint, but
+        # only when it is reconcilable with the Chromium client hints. A UA
+        # with no parseable Chrome major would leave ``navigator.userAgentData``
+        # / ``Sec-CH-UA`` claiming one browser while the UA claims another — a
+        # detection contradiction — so drop the override (and log) instead.
         fingerprint = opts.fingerprint
-        if opts.user_agent != fingerprint.user_agent:
+        forced_ua = params.get("userAgent")
+        if forced_ua and self._runtime != "camoufox":
+            if _chrome_ua_version(forced_ua) is None:
+                log.warning(
+                    "Caller-supplied userAgent %r has no parseable Chrome "
+                    "major version; dropping the UA override and using the "
+                    "coherent fingerprint UA %r.",
+                    forced_ua,
+                    fingerprint.user_agent,
+                )
+                forced_ua = None
+        if forced_ua and forced_ua != fingerprint.user_agent:
             fingerprint = FingerprintProfile(
-                user_agent=opts.user_agent,
+                user_agent=forced_ua,
                 platform=fingerprint.platform,
                 languages=fingerprint.languages,
                 hardware_concurrency=fingerprint.hardware_concurrency,
@@ -498,16 +839,29 @@ class BrowserManager:
         # Under camoufox the engine owns the UA; only a *caller-forced* UA
         # (params["userAgent"]) overrides it. Otherwise echo camoufox's real
         # Firefox UA so the caller submits with a matching one.
-        forced_ua = params.get("userAgent")
-        context = await self._build_context(fingerprint, opts.proxy, forced_ua=forced_ua)
-        return context, self._effective_user_agent(opts.user_agent, forced_ua)
+        context = await self._build_context(
+            fingerprint,
+            opts.proxy,
+            forced_ua=forced_ua,
+            # These contexts navigate REAL target pages (recaptcha v2/v3 and
+            # every fresh-context solve): aborting CSS/fonts/images on a real
+            # page is a bot tell, so default to passthrough. The synthetic
+            # widget solvers re-enable blocking in their own prepare step.
+            block_resources=False,
+        )
+        return context, self._effective_user_agent(fingerprint.user_agent, forced_ua)
 
     async def context_factory(
         self, fingerprint: FingerprintProfile, proxy: Optional[ProxyAsset]
     ) -> Tuple[BrowserContext, str]:
         """SessionPool-compatible factory: build a warm context from a fingerprint."""
         proxy_dict = proxy.playwright_proxy() if proxy is not None else None
-        context = await self._build_context(fingerprint, proxy_dict)
+        # Warm sessions back real-page solves too (recaptcha v2/v3 use the
+        # pool path); widget solvers that inject a synthetic page explicitly
+        # re-enable blocking before their navigation.
+        context = await self._build_context(
+            fingerprint, proxy_dict, block_resources=False
+        )
         return context, self._effective_user_agent(fingerprint.user_agent, None)
 
     def _effective_user_agent(
@@ -529,6 +883,7 @@ class BrowserManager:
         proxy: Optional[dict],
         *,
         forced_ua: Optional[str] = None,
+        block_resources: Optional[bool] = None,
     ) -> BrowserContext:
         assert self._browser is not None, "BrowserManager not started"
         if self._runtime == "camoufox":
@@ -539,18 +894,30 @@ class BrowserManager:
             # Chromium stealth JS only — camoufox spoofs at the engine level, so
             # injecting Chromium-shaped patches there would create contradictions.
             await context.add_init_script(build_stealth_js(fingerprint))
+            if forced_ua:
+                # Keep navigator.userAgentData's high-entropy fullVersionList /
+                # uaFullVersion aligned with the caller-forced UA's Chrome
+                # major (the stealth script pins them to the bundled engine
+                # version). Registered after the stealth script so it patches
+                # the object that script installed.
+                align_js = _ua_client_hint_align_js(forced_ua)
+                if align_js:
+                    await context.add_init_script(align_js)
         # Per-context response byte counter. Accumulated from Content-Length
         # headers (chunked transfers undercount, but the bulk of captcha-solving
         # traffic — images, scripts, stylesheets — carries Content-Length).
         # Read by BaseBrowserSolver._release_context to report proxy bandwidth
         # and populate SolveRecord.proxy_bytes.
         context._omc_bytes_used = 0  # type: ignore[attr-defined]
-        # Per-context resource-blocking switch (default on). A solver can flip
-        # it off per solve via ``set_context_resource_blocking`` — enterprise
-        # real-page solves do, so the real target page loads its CSS/fonts/
-        # images like a human browser instead of producing a bot-shaped
-        # "scripts only" network waterfall.
-        context._omc_block_resources = True  # type: ignore[attr-defined]
+        # Per-context resource-blocking switch. ``None`` keeps the historical
+        # direct-call default (on) for backward compatibility; the production
+        # entry points (``new_context`` / ``context_factory``) pass False
+        # because their callers navigate real target pages, where aborting
+        # CSS/fonts/images is a bot tell. Synthetic widget solvers re-enable
+        # blocking in their prepare step via ``set_context_resource_blocking``.
+        context._omc_block_resources = (  # type: ignore[reportAttributeAccessIssue]
+            True if block_resources is None else bool(block_resources)
+        )
         context.on("response", _count_response_bytes)
         # WP4: per-context resource interception. Registered BEFORE the solver
         # fulfill routes (hcaptcha/turnstile register ``context.route(website_url,

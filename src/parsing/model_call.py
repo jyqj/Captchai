@@ -14,7 +14,15 @@ invisibly. :class:`ModelInvoker` is the one place a model call is actually made:
 it owns tier→backend routing, the budget gate, connection-error backend
 fallback (local↔cloud) and the model-pool concurrency bound. Callers hand it a
 system prompt, a user prompt and image data URLs and get back the raw content,
-token usage and the backend that actually served the call.
+token usage, the backend that actually served the call and the concrete model id
+that backend was configured to serve.
+
+It also exposes the per-backend fan-out reservation
+(:meth:`ModelInvoker.backend_semaphore`) used by the grid plane's
+self-consistency voting: ``vision_vote_samples`` concurrent samples per solve,
+across every concurrent solve, would otherwise multiply into a burst that no
+single client-level limit necessarily covers (duck-typed / test clients have
+no ``max_concurrency`` at all).
 
 The module is intentionally decoupled from the consumption layer: ``budget`` is
 an opaque, optional, duck-typed object (every use is guarded with
@@ -24,6 +32,7 @@ or, under voting, several — the record is per-solve, not per-call).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from dataclasses import dataclass, field
@@ -32,6 +41,28 @@ from typing import Any, Optional
 from ..assets.model_pool import ModelPool, ModelUsage
 
 log = logging.getLogger(__name__)
+
+# Concrete model ids that resolved to a backend by search (i.e. the id was not
+# a pool key) and were already reported. Process-wide so an ambiguous id — the
+# same model served by BOTH backends — is logged exactly once instead of once
+# per model call.
+_AMBIGUOUS_MODEL_LOGGED: set[str] = set()
+
+
+# Default per-backend fan-out reservations used when neither the resolved
+# client nor the config declares a limit. Cloud matches CLOUD_MAX_CONCURRENCY's
+# default (the paid, rate-limited backend is the one worth protecting); local
+# mirrors VISION_CONCURRENCY. 0 / unset never means "unbounded" for voting.
+_DEFAULT_FANOUT_LIMITS = {"local": 8, "cloud": 4}
+
+
+def _positive_int(value: Any) -> int:
+    """Coerce a config / client limit to a positive int (0 when unusable)."""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
 
 
 # Exception class names that indicate a *connection / availability* failure
@@ -100,7 +131,13 @@ class ModelCallRequest:
 class ModelCallResult:
     content: str
     usage: ModelUsage
+    #: Concrete served model id (``ModelClient.model``, e.g. the configured
+    #: ``cloud_model``) — what pricing should key on. Falls back to the backend
+    #: alias only when the client exposes no model id (duck-typed test fakes).
     model: str
+    #: Backend alias that served the call (``"local"`` / ``"cloud"``), kept for
+    #: callers that need the routing dimension rather than the served id.
+    backend: str = ""
 
 
 class ModelInvoker:
@@ -118,6 +155,11 @@ class ModelInvoker:
         self._pool = model_pool
         self._config = config
         self._budget = budget
+        # backend key -> (event loop it was created on, semaphore). Cached with
+        # the loop because an invoker is process-lived while callers (tests,
+        # ``asyncio.run`` loops) may drive it from a fresh loop each time, and
+        # an ``asyncio.Semaphore`` is bound to the loop of its first use.
+        self._backend_sems: dict[str, "tuple[Any, asyncio.Semaphore]"] = {}
 
     # -- routing ----------------------------------------------------------
 
@@ -184,6 +226,116 @@ class ModelInvoker:
 
     # -- model call -------------------------------------------------------
 
+    def _resolve_client(self, model_name: str) -> Any:
+        """Resolve a backend alias *or* a concrete served model id to its client.
+
+        Routing happens in aliases (``"local"`` / ``"cloud"``), but callers such
+        as the grid plane's voting loop receive the concrete served id back from
+        :meth:`call_with_fallback` and pass it straight to :meth:`call_backend`.
+        Accepting both keeps that path working without making callers peel the
+        alias back out of the result.
+        """
+        try:
+            return self._pool.get(model_name)
+        except (KeyError, TypeError, ValueError) as first_error:
+            matches: list[tuple[str, Any]] = []
+            for alias in ("local", "cloud"):
+                try:
+                    client = self._pool.get(alias)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if getattr(client, "model", None) == model_name:
+                    matches.append((alias, client))
+            if matches:
+                if len(matches) > 1 and model_name not in _AMBIGUOUS_MODEL_LOGGED:
+                    # Both backends are configured to serve the same concrete
+                    # id; resolution deterministically prefers "local". Make
+                    # that choice observable (once per process / model id)
+                    # instead of silently returning the first backend.
+                    _AMBIGUOUS_MODEL_LOGGED.add(model_name)
+                    log.info(
+                        "concrete model id %r is served by both backends (%s); "
+                        "resolving to %r",
+                        model_name,
+                        ", ".join(alias for alias, _ in matches),
+                        matches[0][0],
+                    )
+                return matches[0][1]
+            raise first_error
+
+    @staticmethod
+    def _served_identity(client: Any, fallback_name: str) -> "tuple[str, str]":
+        """Return ``(backend_alias, concrete_model_id)`` for a served client."""
+        backend = str(getattr(client, "name", None) or fallback_name)
+        model = str(getattr(client, "model", None) or backend)
+        return backend, model
+
+    # -- per-backend fan-out reservation ----------------------------------
+
+    def _try_resolve_client(self, model_name: str) -> Any:
+        """Resolve ``model_name`` to its client, or ``None`` when unknown."""
+        try:
+            return self._resolve_client(model_name)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _backend_alias(client: Any, fallback_name: str) -> str:
+        """Normalise a client (or model id) to a fan-out namespace.
+
+        Known aliases keep their name; an unresolvable concrete model id is
+        treated as the paid backend so it inherits the tighter default.
+        """
+        name = str(getattr(client, "name", None) or fallback_name)
+        return name if name in _DEFAULT_FANOUT_LIMITS else "cloud"
+
+    def backend_limit(self, model_name: str) -> int:
+        """Concurrent-call budget for the backend that serves ``model_name``.
+
+        Resolution order: the resolved client's own ``max_concurrency`` (the
+        model-pool bound), then the matching config field
+        (``cloud_max_concurrency`` / ``local_max_concurrency``), then the
+        conservative default in :data:`_DEFAULT_FANOUT_LIMITS`. Always finite:
+        an unbounded voting fan-out is what trips provider rate limits.
+        """
+        client = self._try_resolve_client(model_name)
+        if client is not None:
+            limit = _positive_int(getattr(client, "max_concurrency", 0))
+            if limit:
+                return limit
+        backend = self._backend_alias(client, model_name)
+        field = (
+            "cloud_max_concurrency"
+            if backend == "cloud"
+            else "local_max_concurrency"
+        )
+        limit = _positive_int(getattr(self._config, field, 0))
+        if limit:
+            return limit
+        return _DEFAULT_FANOUT_LIMITS[backend]
+
+    def backend_semaphore(self, model_name: str) -> "asyncio.Semaphore | None":
+        """The per-backend fan-out reservation semaphore (``None`` if sync).
+
+        Lazily created and cached per (backend, event loop). Voting callers
+        hold it once per sample, so the aggregate fan-out of every concurrent
+        solve stays within the backend's budget even when the underlying client
+        is duck-typed and declares no ``max_concurrency`` of its own.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        limit = self.backend_limit(model_name)
+        if limit <= 0:  # pragma: no cover - backend_limit is always positive
+            return None
+        key = self._backend_alias(self._try_resolve_client(model_name), model_name)
+        cached = self._backend_sems.get(key)
+        if cached is None or cached[0] is not loop:
+            cached = (loop, asyncio.Semaphore(limit))
+            self._backend_sems[key] = cached
+        return cached[1]
+
     async def call_backend(
         self,
         model_name: str,
@@ -194,10 +346,12 @@ class ModelInvoker:
     ) -> "tuple[str, ModelUsage]":
         """Call one specific backend (no routing / budget). Returns (content, usage).
 
-        Used directly by the grid plane's voting loop, which has already routed
-        and budget-gated once and wants repeated samples on the same backend.
+        ``model_name`` may be the backend alias (``"local"`` / ``"cloud"``) or a
+        concrete served model id — the grid plane's voting loop has already
+        routed and budget-gated once and wants repeated samples on the same
+        backend, which it identifies by the served id it got back.
         """
-        client = self._pool.get(model_name)
+        client = self._resolve_client(model_name)
         timeout = float(getattr(self._config, "captcha_timeout", 30))
         return await client.chat(
             messages=messages,
@@ -223,13 +377,39 @@ class ModelInvoker:
         the call retries once on the other backend: ``local → cloud`` (gated by
         ``vision_cloud_enabled`` + budget, since cloud is paid) or
         ``cloud → local`` (always, local is free). Returns
-        ``(served_model_name, content, usage)``.
+        ``(served_model_id, content, usage)`` where ``served_model_id`` is the
+        concrete ``ModelClient.model`` that served the call (the backend alias is
+        returned separately by :meth:`invoke` as ``ModelCallResult.backend``).
         """
+        _, served, content, usage = await self._call_with_fallback(
+            model_name,
+            messages,
+            client_key=client_key,
+            est_cost=est_cost,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return served, content, usage
+
+    async def _call_with_fallback(
+        self,
+        model_name: str,
+        messages: list,
+        *,
+        client_key: "str | None",
+        est_cost: float,
+        temperature: float = 0.0,
+        max_tokens: int = 512,
+    ) -> "tuple[str, str, str, ModelUsage]":
+        """Inner call returning ``(backend_alias, served_model, content, usage)``."""
         try:
             content, usage = await self.call_backend(
                 model_name, messages, temperature=temperature, max_tokens=max_tokens
             )
-            return model_name, content, usage
+            backend, served = self._served_identity(
+                self._resolve_client(model_name), model_name
+            )
+            return backend, served, content, usage
         except Exception as exc:  # noqa: BLE001
             fallback_enabled = bool(
                 getattr(self._config, "model_connection_fallback", True)
@@ -249,7 +429,10 @@ class ModelInvoker:
             content, usage = await self.call_backend(
                 alt, messages, temperature=temperature, max_tokens=max_tokens
             )
-            return alt, content, usage
+            backend, served = self._served_identity(
+                self._resolve_client(alt), alt
+            )
+            return backend, served, content, usage
 
     async def _fallback_backend(
         self, model_name: str, est_cost: float, client_key: "str | None"
@@ -273,14 +456,15 @@ class ModelInvoker:
 
         Everything a single-call caller (the free-form vision plane) needs:
         the returned :class:`ModelCallResult` carries the raw content, the token
-        usage and the backend that actually served the call (post-fallback).
+        usage, the concrete model that actually served the call (post-fallback)
+        and, separately, the backend alias that served it.
         """
         model_name = self.route(req.tier)
         model_name = await self.guard_budget(model_name, req.est_cost, client_key)
         messages = self.build_messages(
             req.system_prompt, req.user_text, req.image_urls, req.detail
         )
-        served, content, usage = await self.call_with_fallback(
+        backend, served, content, usage = await self._call_with_fallback(
             model_name,
             messages,
             client_key=client_key,
@@ -288,4 +472,6 @@ class ModelInvoker:
             temperature=req.temperature,
             max_tokens=req.max_tokens,
         )
-        return ModelCallResult(content=content, usage=usage, model=served)
+        return ModelCallResult(
+            content=content, usage=usage, model=served, backend=backend
+        )

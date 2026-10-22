@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, List, Optional, Tuple
 
-from ..dispatcher import ChallengeContext, ChallengeShape
+from ..dispatcher import ChallengeContext, ChallengeShape, selector_csv
 from .base import BaseShapeSolver, ClassifyRequest
 from .human_cursor import human_drag
 
@@ -19,8 +19,9 @@ log = logging.getLogger(__name__)
 class CanvasSlideSolver(BaseShapeSolver):
     SHAPE = ChallengeShape.CANVAS_SLIDE
 
-    HANDLE_SELECTOR = ".slide-handle, .slider, .geetest_slider_button"
-    BG_SELECTOR = "canvas.slideBg, .geetest_canvas_bg, .slider-bg, .puzzle-image, .captcha-image"
+    # Same registry the classifier uses (single source of truth).
+    HANDLE_SELECTOR = selector_csv(ChallengeShape.CANVAS_SLIDE, "handle")
+    BG_SELECTOR = selector_csv(ChallengeShape.CANVAS_SLIDE, "background")
     STEPS = 30
 
     async def run(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:

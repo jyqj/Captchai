@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from ..dispatcher import ChallengeContext, ChallengeShape
+from ..dispatcher import ChallengeContext, ChallengeShape, selector_csv
 from .base import BaseShapeSolver, ClassifyRequest
 
 log = logging.getLogger(__name__)
@@ -27,6 +27,8 @@ log = logging.getLogger(__name__)
 
 class GridSelectSolver(BaseShapeSolver):
     SHAPE = ChallengeShape.GRID_SELECT
+    # Same registry the classifier detects grids with (single source of truth).
+    TILE_SELECTOR = selector_csv(ChallengeShape.GRID_SELECT, "tile")
     REFRESH_SELECTOR = ".refresh, .button-refresh, [aria-label='Get a new challenge']"
     CONFIDENCE_FLOOR = 0.4
 

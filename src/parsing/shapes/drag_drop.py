@@ -9,9 +9,9 @@ paired ``result.indices``) or from ``ctx.extra``.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple, TypeGuard
 
-from ..dispatcher import ChallengeContext, ChallengeShape
+from ..dispatcher import ChallengeContext, ChallengeShape, selector_csv
 from .base import BaseShapeSolver, ClassifyRequest
 from .human_cursor import human_drag
 
@@ -21,7 +21,8 @@ log = logging.getLogger(__name__)
 class DragDropSolver(BaseShapeSolver):
     SHAPE = ChallengeShape.DRAG_DROP
 
-    PUZZLE_SELECTOR = ".puzzle-image, .captcha-image, .drag-area, canvas, .task-image"
+    # Same registry the classifier uses (single source of truth).
+    PUZZLE_SELECTOR = selector_csv(ChallengeShape.DRAG_DROP, "puzzle")
     STEPS = 25
 
     async def run(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:
@@ -92,7 +93,8 @@ class DragDropSolver(BaseShapeSolver):
         return None
 
     @staticmethod
-    def _is_point(value: Any) -> bool:
+    def _is_point(value: Any) -> TypeGuard[Sequence[Any]]:
+        """Narrow an untyped vision/extra value to a 2-item coordinate pair."""
         return isinstance(value, (list, tuple)) and len(value) >= 2
 
     def _path(

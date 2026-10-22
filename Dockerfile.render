@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+# Install browsers into a shared location. Playwright's default is
+# /root/.cache/ms-playwright, which the non-root runtime user cannot read.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 WORKDIR /app
 
 COPY requirements.txt .
@@ -7,6 +11,21 @@ RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 RUN playwright install --with-deps chromium
 
 COPY . .
+
+# Run as an unprivileged user instead of root.
+#
+# Sandbox note: BROWSER_DISABLE_SANDBOX is tri-state. Unset (the default) is
+# auto: src/services/browser.py appends --no-sandbox only when the process
+# runs as root on POSIX (never on Windows). This image runs as non-root
+# (appuser, uid 10001), so Chromium's sandbox stays ENABLED in-container and
+# the launch args do NOT contain --no-sandbox. If the deployment platform
+# (e.g. Render) cannot provide the user-namespace support the sandbox needs,
+# force it off with BROWSER_DISABLE_SANDBOX=true; BROWSER_DISABLE_SANDBOX=false
+# pins it on.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app /ms-playwright
+
+USER appuser
 
 EXPOSE 8000
 

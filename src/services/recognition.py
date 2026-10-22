@@ -134,5 +134,13 @@ class CaptchaRecognizer(VisionSolveBase):
             raise ValueError("Missing 'body' field (base64 image)")
         image_bytes = base64.b64decode(body)
         req = await self._build_request(image_bytes)
-        result = await self._invoke(req, params, challenge_shape="image_to_text")
-        return {"text": json.dumps(parse_json_object(result.content))}
+        # Parsing runs INSIDE the retried + metered unit (the seam's ``parse``
+        # callback): a malformed reply is retried, and the usage that reply was
+        # billed for is recorded even when parsing raises.
+        parsed = await self._invoke(
+            req,
+            params,
+            challenge_shape="image_to_text",
+            parse=lambda result: parse_json_object(result.content),
+        )
+        return {"text": json.dumps(parsed)}

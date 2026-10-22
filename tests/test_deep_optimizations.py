@@ -12,11 +12,13 @@ import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     _ = sys.path.insert(0, str(PROJECT_ROOT))
+
+from playwright.async_api import Browser, Playwright  # noqa: E402
 
 from src.assets.fingerprint import (  # noqa: E402
     client_hint_headers,
@@ -24,7 +26,10 @@ from src.assets.fingerprint import (  # noqa: E402
     generate_fingerprint,
     sec_ch_ua,
 )
-from src.parsing.dispatcher import ChallengeContext  # noqa: E402
+from src.assets.model_pool import ModelPool  # noqa: E402
+from src.core.config import Config  # noqa: E402
+from src.orchestration.store import TaskStore  # noqa: E402
+from src.parsing.dispatcher import ChallengeContext, VisionClient  # noqa: E402
 from src.parsing.shapes.grid_select import GridSelectSolver  # noqa: E402
 from src.parsing.shapes.human_cursor import ease_path, human_click, point_in_box  # noqa: E402
 from src.services.browser import BrowserManager  # noqa: E402
@@ -160,7 +165,7 @@ class _FakeVision:
 def test_grid_select_uses_human_path_when_page_present() -> None:
     async def run() -> None:
         frame = _FakeFrame(counts={".task-image": 4}, texts={".prompt-text": "x"})
-        vision = _FakeVision(indices=[1, 2])
+        vision = cast(VisionClient, _FakeVision(indices=[1, 2]))  # duck-typed fake
         seq = iter([None, None, "TOKEN"])
 
         async def poll():
@@ -182,7 +187,7 @@ def test_grid_select_uses_human_path_when_page_present() -> None:
 def test_grid_select_falls_back_to_locator_click_without_page() -> None:
     async def run() -> None:
         frame = _FakeFrame(counts={".task-image": 4}, texts={".prompt-text": "x"})
-        vision = _FakeVision(indices=[0, 3])
+        vision = cast(VisionClient, _FakeVision(indices=[0, 3]))  # duck-typed fake
         seq = iter([None, None, "TOKEN"])
 
         async def poll():
@@ -225,7 +230,11 @@ def test_checkbox_click_uses_human_path_when_enabled() -> None:
 
         page = _RecordingPage()
         config = SimpleNamespace(human_mouse_enabled=True, human_mouse_jitter_ms=0)
-        solver = BaseBrowserSolver(config, manager=SimpleNamespace(), services=None)
+        solver = BaseBrowserSolver(
+            cast(Config, config),  # duck-typed config namespace
+            manager=cast(BrowserManager, SimpleNamespace()),  # fake manager, unused
+            services=None,
+        )
         await solver._human_click_in_frame(page, _Frame(), "#checkbox")
         # Real pointer travel + a real press, exactly like the tile clicks.
         assert len(page.mouse.moves) > 5
@@ -258,7 +267,11 @@ def test_checkbox_click_falls_back_to_locator_click_when_disabled() -> None:
 
         page = _RecordingPage()
         config = SimpleNamespace(human_mouse_enabled=False, human_mouse_jitter_ms=0)
-        solver = BaseBrowserSolver(config, manager=SimpleNamespace(), services=None)
+        solver = BaseBrowserSolver(
+            cast(Config, config),  # duck-typed config namespace
+            manager=cast(BrowserManager, SimpleNamespace()),  # fake manager, unused
+            services=None,
+        )
         await solver._human_click_in_frame(page, _Frame(), "#checkbox")
         assert clicked["n"] == 1
         assert page.mouse.downs == 0
@@ -325,15 +338,20 @@ def test_egress_from_params_surfaces_kind_and_server() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _runtime_config(runtime: str, strict: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        browser_headless=True,
-        browser_runtime=runtime,
-        browser_runtime_strict=strict,
-        resource_block_enabled=False,
-        resource_block_types="",
-        resource_allow_hosts="",
-        resource_block_hosts="",
+def _runtime_config(runtime: str, strict: bool) -> Config:
+    # BrowserManager reads every field defensively via getattr; this namespace
+    # is a duck-typed config, cast at the seam to the declared Config type.
+    return cast(
+        Config,
+        SimpleNamespace(
+            browser_headless=True,
+            browser_runtime=runtime,
+            browser_runtime_strict=strict,
+            resource_block_enabled=False,
+            resource_block_types="",
+            resource_allow_hosts="",
+            resource_block_hosts="",
+        ),
     )
 
 
@@ -342,7 +360,7 @@ def test_strict_runtime_raises_when_hardened_runtime_unavailable() -> None:
         mgr = BrowserManager(_runtime_config("camoufox", strict=True))
         # Force "not installed" so the test is independent of the environment.
         mgr._hardened_runtime_available = lambda rt: False  # type: ignore[assignment]
-        mgr._playwright = SimpleNamespace(chromium=SimpleNamespace())
+        mgr._playwright = cast(Playwright, SimpleNamespace(chromium=SimpleNamespace()))
         try:
             await mgr._launch()
             raise AssertionError("strict mode should raise on unavailable runtime")
@@ -364,7 +382,7 @@ def test_lenient_runtime_degrades_to_chromium() -> None:
 
         mgr = BrowserManager(_runtime_config("camoufox", strict=False))
         mgr._hardened_runtime_available = lambda rt: False  # type: ignore[assignment]
-        mgr._playwright = SimpleNamespace(chromium=_Launcher())
+        mgr._playwright = cast(Playwright, SimpleNamespace(chromium=_Launcher()))
         await mgr._launch()
         # Degraded to stock chromium and recorded the divergence.
         assert launched["chromium"] is True
@@ -397,7 +415,16 @@ def _burn_services(max_consecutive_fails: int = 3):
     return services, proxy, SolveRecord
 
 
-def test_report_incorrect_burns_proxy_health() -> None:
+def test_report_incorrect_does_not_burn_proxy_health() -> None:
+    """Wave A: a downstream rejection is an OUTCOME signal, not transport.
+
+    ``record_real_outcome`` files a real rejection with ``stage="outcome"``.
+    The proxy pool keeps that in ``real_sitekey_stats`` (ground truth for
+    checkout ranking) but deliberately does NOT count it as a transport
+    failure, so a working proxy is not pushed toward cooldown by a rejected
+    token. This used to bump ``fail_count`` / ``consecutive_fails``; that
+    behaviour was the transport/outcome conflation Wave A removed.
+    """
     async def run() -> None:
         from src.api import routes as routes_mod
         from src.core.services import set_services
@@ -422,9 +449,12 @@ def test_report_incorrect_burns_proxy_health() -> None:
                 ReportTaskRequest(clientKey=ck, taskId="t-burn"), correct=False
             )
             assert resp.errorId == 0
-            # Downstream reject now hits proxy *health*, not just ranking.
-            assert proxy.fail_count == 1
-            assert proxy.consecutive_fails == 1
+            # Ground truth IS recorded (0 successes / 1 failure)...
+            assert proxy.real_sitekey_stats["sk"] == [0, 1]
+            # ...but it is not a transport failure, so health is untouched.
+            assert proxy.fail_count == 0
+            assert proxy.consecutive_fails == 0
+            assert proxy.state == "healthy"
         finally:
             set_services(None)
 
@@ -524,7 +554,7 @@ def test_vision_stitches_grid_into_single_image() -> None:
     from src.parsing.vision import VisionRequest, VisionRouter
 
     pool = _RecPool()
-    router = VisionRouter(pool, _vision_config(vision_stitch_grid=True))
+    router = VisionRouter(cast(ModelPool, pool), _vision_config(vision_stitch_grid=True))
     req = VisionRequest(
         prompt="select all buses",
         images=[_png((i * 30 % 255, 80, 120)) for i in range(4)],
@@ -541,7 +571,7 @@ def test_vision_stitch_disabled_sends_per_tile() -> None:
     from src.parsing.vision import VisionRequest, VisionRouter
 
     pool = _RecPool()
-    router = VisionRouter(pool, _vision_config(vision_stitch_grid=False))
+    router = VisionRouter(cast(ModelPool, pool), _vision_config(vision_stitch_grid=False))
     req = VisionRequest(
         prompt="select all buses",
         images=[_png((i * 30 % 255, 80, 120)) for i in range(4)],
@@ -556,7 +586,7 @@ def test_vision_does_not_stitch_coordinate_shapes() -> None:
     from src.parsing.vision import VisionRequest, VisionRouter
 
     pool = _RecPool()
-    router = VisionRouter(pool, _vision_config(vision_stitch_grid=True))
+    router = VisionRouter(cast(ModelPool, pool), _vision_config(vision_stitch_grid=True))
     # area_bbox normally sends one image; even with 2 it must NOT be stitched
     # (stitching would corrupt the pixel-coordinate answer).
     req = VisionRequest(
@@ -808,7 +838,7 @@ def test_acreate_task_returns_cross_worker_owner_without_spawning() -> None:
                 queue_max_size=10,
                 solve_timeout=5,
             ),
-            store=store,
+            store=cast(TaskStore, store),  # duck-typed store fake
         )
         tid = await mgr.acreate_task("T", {}, idempotency_key="dup")
         # Returned the other worker's task id; no local task/spawn/persist.
@@ -881,18 +911,23 @@ class _CamouFakeBrowser:
         return _CamouFakeContext()
 
 
-def _ctx_config(runtime: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        browser_headless=True,
-        browser_runtime=runtime,
-        browser_runtime_strict=False,
-        resource_block_enabled=True,
-        resource_block_types="image,media,font,stylesheet",
-        resource_allow_hosts="hcaptcha.com",
-        resource_block_hosts="",
-        camoufox_humanize=True,
-        camoufox_block_webrtc=True,
-        camoufox_os="",
+def _ctx_config(runtime: str) -> Config:
+    # BrowserManager reads every field defensively via getattr; this namespace
+    # is a duck-typed config, cast at the seam to the declared Config type.
+    return cast(
+        Config,
+        SimpleNamespace(
+            browser_headless=True,
+            browser_runtime=runtime,
+            browser_runtime_strict=False,
+            resource_block_enabled=True,
+            resource_block_types="image,media,font,stylesheet",
+            resource_allow_hosts="hcaptcha.com",
+            resource_block_hosts="",
+            camoufox_humanize=True,
+            camoufox_block_webrtc=True,
+            camoufox_os="",
+        ),
     )
 
 
@@ -918,10 +953,11 @@ def test_camoufox_context_skips_chromium_spoofing() -> None:
     assert "extra_http_headers" not in kw
     assert "user_agent" not in kw
     # Camoufox owns the fingerprint → no Chromium stealth JS injected.
-    assert ctx.init_scripts == []
+    fake_ctx = cast(_CamouFakeContext, ctx)
+    assert fake_ctx.init_scripts == []
     # Byte accounting + resource interception are engine-agnostic and still wired.
-    assert any(event == "response" for event, _ in ctx.listeners)
-    assert any(url == "**/*" for url, _ in ctx.routes)
+    assert any(event == "response" for event, _ in fake_ctx.listeners)
+    assert any(url == "**/*" for url, _ in fake_ctx.routes)
 
 
 def test_camoufox_context_honours_forced_ua() -> None:
@@ -958,7 +994,7 @@ def test_engine_version_match_is_silent_ok() -> None:
 
     async def run() -> None:
         mgr = BrowserManager(_runtime_config("chromium", strict=True))
-        mgr._browser = SimpleNamespace(version=f"{chrome_major()}.0.7827.55")
+        mgr._browser = cast(Browser, SimpleNamespace(version=f"{chrome_major()}.0.7827.55"))
         # Strict mode + matching version → no raise.
         await mgr._validate_engine_version()
 
@@ -969,7 +1005,7 @@ def test_engine_version_mismatch_raises_in_strict_mode() -> None:
     """A drifted engine major fails fast under BROWSER_RUNTIME_STRICT."""
     async def run() -> None:
         mgr = BrowserManager(_runtime_config("chromium", strict=True))
-        mgr._browser = SimpleNamespace(version="131.0.6778.86")  # stale
+        mgr._browser = cast(Browser, SimpleNamespace(version="131.0.6778.86"))  # stale
         try:
             await mgr._validate_engine_version()
             raise AssertionError("expected a version-mismatch RuntimeError")
@@ -984,7 +1020,7 @@ def test_engine_version_mismatch_warns_in_lenient_mode() -> None:
     """A drifted engine major only warns (doesn't raise) when strict is off."""
     async def run() -> None:
         mgr = BrowserManager(_runtime_config("chromium", strict=False))
-        mgr._browser = SimpleNamespace(version="131.0.6778.86")
+        mgr._browser = cast(Browser, SimpleNamespace(version="131.0.6778.86"))
         # Lenient mode → no raise even on mismatch.
         await mgr._validate_engine_version()
 
@@ -1000,7 +1036,7 @@ def test_chromium_context_still_injects_stealth_and_client_hints() -> None:
     kw = mgr._browser.new_context_kwargs[0]  # type: ignore[attr-defined]
     assert "extra_http_headers" in kw  # Chrome client hints present
     assert kw["user_agent"] == fp.user_agent
-    assert ctx.init_scripts  # Chromium stealth JS injected
+    assert cast(_CamouFakeContext, ctx).init_scripts  # Chromium stealth JS injected
 
 
 if __name__ == "__main__":
@@ -1018,7 +1054,7 @@ if __name__ == "__main__":
     test_egress_from_params_surfaces_kind_and_server()
     test_strict_runtime_raises_when_hardened_runtime_unavailable()
     test_lenient_runtime_degrades_to_chromium()
-    test_report_incorrect_burns_proxy_health()
+    test_report_incorrect_does_not_burn_proxy_health()
     test_report_correct_reinforces_proxy_health()
     test_vision_stitches_grid_into_single_image()
     test_vision_stitch_disabled_sends_per_tile()

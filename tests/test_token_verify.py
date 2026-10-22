@@ -12,12 +12,15 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.consumption.ledger import CostLedger  # noqa: E402
+from src.core.config import Config  # noqa: E402
+from src.services.browser import BrowserManager  # noqa: E402
 from src.consumption.token_verify import (  # noqa: E402
     HttpTokenVerifier,
     build_token_verifier,
@@ -181,7 +184,10 @@ def _run_turnstile(verifier, retries=1):
         context = _FakeContext(page)
         services = _services(verifier)
         solver = TurnstileSolver(
-            _config(retries), manager=_FakeManager(context), services=services
+            cast(Config, _config(retries)),
+            # Duck-typed fake standing in for BrowserManager at this seam.
+            manager=cast(BrowserManager, _FakeManager(context)),
+            services=services,
         )
         result = None
         error = None
@@ -204,6 +210,7 @@ def test_verified_token_returns_and_records_real_success() -> None:
     verifier = _FakeVerifier(verdict=True)
     result, error, services = _run_turnstile(verifier)
     assert error is None
+    assert result is not None
     assert result["token"].startswith("cf_")
     # Verifier was consulted with the provider + sitekey.
     assert verifier.calls and verifier.calls[0][1] == "turnstile"
@@ -227,6 +234,7 @@ def test_unknown_verdict_returns_token_without_real_record() -> None:
     verifier = _FakeVerifier(verdict=None)
     result, error, services = _run_turnstile(verifier)
     assert error is None
+    assert result is not None
     assert result["token"].startswith("cf_")
     # Unknown verdict → caller-driven loop preserved, no real outcome recorded.
     assert services.accounting.real == []
@@ -235,6 +243,7 @@ def test_unknown_verdict_returns_token_without_real_record() -> None:
 def test_no_verifier_is_unchanged_behaviour() -> None:
     result, error, services = _run_turnstile(verifier=None)
     assert error is None
+    assert result is not None
     assert result["token"].startswith("cf_")
     assert services.accounting.real == []
 

@@ -27,12 +27,14 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.assets.model_pool import ModelUsage  # noqa: E402
+from src.assets.model_pool import ModelPool, ModelUsage  # noqa: E402
+from src.core.config import Config  # noqa: E402
 from src.parsing.vision import VisionRequest, VisionRouter  # noqa: E402
 from src.services.browser import BrowserManager  # noqa: E402
 
@@ -82,6 +84,11 @@ class FakePool:
 
     def get(self, name):
         return self._clients[name]
+
+
+def _model_pool(local, cloud=None) -> ModelPool:
+    """Tests inject a duck-typed pool; cast it to the seam's declared type."""
+    return cast(ModelPool, FakePool(local, cloud))
 
 
 class FakeBudget:
@@ -144,7 +151,7 @@ def _make_config(**overrides):
 
 
 def _req(**overrides):
-    base = dict(prompt="select all buses", images=[b"\x89PNGfake"], task_tier=1)
+    base: dict[str, Any] = dict(prompt="select all buses", images=[b"\x89PNGfake"], task_tier=1)
     base.update(overrides)
     return VisionRequest(**base)
 
@@ -170,7 +177,7 @@ def test_concurrent_voting_overlaps_samples():
     # tier-2 + cloud_enabled → initial + vote calls all hit the cloud client.
     cloud = ScriptedConcurrencyClient("cloud", contents, delay=0.05)
     local = ScriptedConcurrencyClient("local", contents, delay=0.05)
-    pool = FakePool(local=local, cloud=cloud)
+    pool = _model_pool(local=local, cloud=cloud)
     router = VisionRouter(pool, config)
 
     asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
@@ -197,7 +204,7 @@ def test_serial_voting_does_not_overlap():
     )
     cloud = ScriptedConcurrencyClient("cloud", contents, delay=0.05)
     local = ScriptedConcurrencyClient("local", contents, delay=0.05)
-    pool = FakePool(local=local, cloud=cloud)
+    pool = _model_pool(local=local, cloud=cloud)
     router = VisionRouter(pool, config)
 
     asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
@@ -226,7 +233,7 @@ def test_concurrent_voting_accumulates_all_usage():
     local = ScriptedConcurrencyClient(
         "local", contents, delay=0.01, usage=ModelUsage(input_tokens=10, output_tokens=5)
     )
-    pool = FakePool(local=local, cloud=cloud)
+    pool = _model_pool(local=local, cloud=cloud)
     router = VisionRouter(pool, config)
 
     result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
@@ -261,7 +268,7 @@ def test_inline_escalation_uses_cloud_when_local_low_confidence():
         delay=0.0,
         usage=ModelUsage(input_tokens=20, output_tokens=8),
     )
-    pool = FakePool(local=local, cloud=cloud)
+    pool = _model_pool(local=local, cloud=cloud)
     router = VisionRouter(pool, config)
 
     result = asyncio.run(router.classify(_req(task_tier=1)))
@@ -297,7 +304,7 @@ def test_inline_escalation_budget_denial_returns_local():
         delay=0.0,
         usage=ModelUsage(input_tokens=20, output_tokens=8),
     )
-    pool = FakePool(local=local, cloud=cloud)
+    pool = _model_pool(local=local, cloud=cloud)
     budget = FakeBudget(allowed=False, downgrade_to="local")
     router = VisionRouter(pool, config, budget=budget)
 
@@ -338,7 +345,7 @@ def test_inline_escalation_skipped_when_local_confident():
         delay=0.0,
         usage=ModelUsage(input_tokens=20, output_tokens=8),
     )
-    pool = FakePool(local=local, cloud=cloud)
+    pool = _model_pool(local=local, cloud=cloud)
     router = VisionRouter(pool, config)
 
     result = asyncio.run(router.classify(_req(task_tier=1)))
@@ -370,7 +377,7 @@ def test_inline_escalation_skipped_when_flag_disabled():
         delay=0.0,
         usage=ModelUsage(input_tokens=20, output_tokens=8),
     )
-    pool = FakePool(local=local, cloud=cloud)
+    pool = _model_pool(local=local, cloud=cloud)
     router = VisionRouter(pool, config)
 
     result = asyncio.run(router.classify(_req(task_tier=1)))
@@ -412,7 +419,7 @@ def test_inline_escalation_engages_voting_when_cloud_also_low():
         delay=0.0,
         usage=ModelUsage(input_tokens=10, output_tokens=5),
     )
-    pool = FakePool(local=local, cloud=cloud)
+    pool = _model_pool(local=local, cloud=cloud)
     router = VisionRouter(pool, config)
 
     result = asyncio.run(router.classify(_req(task_tier=1, grid_size=9)))
@@ -445,7 +452,9 @@ def _resource_manager(*, block_hosts=""):
         ),
         resource_block_hosts=block_hosts,
     )
-    return BrowserManager(config)
+    # BrowserManager reads every field defensively via getattr; the namespace
+    # is a duck-typed config, cast at this seam to the declared Config type.
+    return BrowserManager(cast(Config, config))
 
 
 def test_resource_handler_blocks_image_on_generic_host():

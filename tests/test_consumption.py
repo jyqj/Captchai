@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from typing import cast
+
+import pytest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.consumption.accounting import SuccessAccounting
 from src.consumption.budget import BudgetGuard
 from src.consumption.ledger import CostLedger, SolveRecord, estimate_cost
+from src.core.config import Config
+from src.services.browser import BrowserManager
 
 
 def _rec(
@@ -120,14 +125,31 @@ def test_ledger_summary_no_successes() -> None:
 def test_ledger_max_records_ring_behavior() -> None:
     async def run() -> None:
         ledger = CostLedger(max_records=3)
+        # Alternate client keys so the per-client lifetime counter is exercised
+        # across eviction too (t0/t2/t4 belong to "alice").
         for i in range(5):
-            await ledger.record(_rec(f"t{i}", cost=1.0))
+            await ledger.record(
+                _rec(f"t{i}", cost=1.0, client_key="alice" if i % 2 == 0 else None)
+            )
 
+        # The record ring is a bounded WINDOW: only the newest `max_records`
+        # records survive for history / per-record inspection.
         records = await ledger.records()
         assert [r.task_id for r in records] == ["t2", "t3", "t4"]
-        # Evicted records no longer count toward totals.
-        assert await ledger.total_cost_usd() == 3.0
-        assert (await ledger.summary())["count"] == 3
+
+        # Wave A changed the totals to LIFETIME, MONOTONIC counters: they are
+        # deliberately independent of the bounded ring, so evicting a record
+        # never decrements spend. That is what keeps BudgetGuard safe — churning
+        # the ring can't make an already-spent budget look available again.
+        assert await ledger.total_cost_usd() == 5.0
+        assert await ledger.total_cost_usd("alice") == 3.0
+
+        # summary(), by contrast, aggregates over the RETAINED window only
+        # (it snapshots self._records), so it reports 3 records / $3 here even
+        # though lifetime spend is $5.
+        summary = await ledger.summary()
+        assert summary["count"] == 3
+        assert summary["cost_usd"] == 3.0
 
     asyncio.run(run())
 
@@ -314,7 +336,8 @@ def test_record_helper_produces_solve_record() -> None:
             human_mouse_enabled=False,
             human_mouse_jitter_ms=0,
         )
-        solver = BaseBrowserSolver(config, services=services)
+        # Duck-typed config fake; solvers only read attributes off it.
+        solver = BaseBrowserSolver(cast(Config, config), services=services)
 
         params = {
             "type": "RecaptchaV2TaskProxyless",
@@ -380,7 +403,12 @@ def test_recaptcha_v2_records_to_ledger() -> None:
 
                 return FakeCtx(), params.get("userAgent") or "UA"
 
-        solver = RecaptchaV2Solver(config, manager=FakeManager(), services=services)
+        solver = RecaptchaV2Solver(
+            cast(Config, config),
+            # FakeManager/new_context() stands in for BrowserManager here.
+            manager=cast(BrowserManager, FakeManager()),
+            services=services,
+        )
 
         async def _fake_solve_once(website_url, website_key, is_invisible, params):
             return "token-" + "x" * 30, "UA"
@@ -418,7 +446,11 @@ def test_recaptcha_v3_defaults_egress_proxyless() -> None:
         from src.services.recaptcha_v3 import RecaptchaV3Solver
 
         config = SimpleNamespace(captcha_retries=1)
-        solver = RecaptchaV3Solver(config, manager=SimpleNamespace(), services=None)
+        solver = RecaptchaV3Solver(
+            cast(Config, config),
+            manager=cast(BrowserManager, SimpleNamespace()),
+            services=None,
+        )
 
         seen: list[dict] = []
 
@@ -461,7 +493,11 @@ def test_recaptcha_v2_defaults_egress_auto() -> None:
         from src.services.recaptcha_v2 import RecaptchaV2Solver
 
         config = SimpleNamespace(captcha_retries=1)
-        solver = RecaptchaV2Solver(config, manager=SimpleNamespace(), services=None)
+        solver = RecaptchaV2Solver(
+            cast(Config, config),
+            manager=cast(BrowserManager, SimpleNamespace()),
+            services=None,
+        )
 
         async def _fake_solve_once(website_url, website_key, is_invisible, params):
             return "token-" + "x" * 30, "UA"
@@ -484,18 +520,99 @@ def test_recaptcha_v2_defaults_egress_auto() -> None:
 # ---------------------------------------------------------------------------
 
 
+_REAL_REDIS_URL = "redis://localhost:6379/0"
+_FAKE_REDIS_URL = "fakeredis://local/0"
+_REAL_AVAILABLE = None
+_FAKE_SERVER = None
+_ACTIVE_URL = _REAL_REDIS_URL
+
+
+def _real_server_available() -> bool:
+    """Ping localhost:6379 once and cache the answer (INFO-verified)."""
+    global _REAL_AVAILABLE
+    if _REAL_AVAILABLE is None:
+        try:
+            import redis as sync_redis
+
+            client = sync_redis.from_url(
+                _REAL_REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=0.5,
+                socket_timeout=0.5,
+            )
+            client.ping()
+            info = client.info("server")
+            client.close()
+            _REAL_AVAILABLE = bool(info.get("redis_version"))
+        except Exception:
+            _REAL_AVAILABLE = False
+    return _REAL_AVAILABLE
+
+
+def _ensure_fake_server():
+    global _FAKE_SERVER
+    if _FAKE_SERVER is None:
+        import fakeredis
+
+        _FAKE_SERVER = fakeredis.FakeServer()
+    return _FAKE_SERVER
+
+
 def _redis_helper():
-    """Return (aioredis, url) or skip the test if redis isn't available."""
-    pytest = __import__("pytest")
+    """Return (aioredis, url): real server when reachable, else fakeredis."""
+    global _ACTIVE_URL
     aioredis = pytest.importorskip("redis.asyncio")
-    return aioredis, "redis://localhost:6379/0"
+    if _real_server_available():
+        _ACTIVE_URL = _REAL_REDIS_URL
+        return aioredis, _REAL_REDIS_URL
+    pytest.importorskip("fakeredis")
+    pytest.importorskip("fakeredis.aioredis")
+    _ensure_fake_server()
+    _ACTIVE_URL = _FAKE_REDIS_URL
+    return aioredis, _FAKE_REDIS_URL
+
+
+@pytest.fixture(autouse=True)
+def _redis_backend(monkeypatch):
+    """Route ``from_url('fakeredis://...')`` at one in-process fake server."""
+    if _real_server_available():
+        yield
+        return
+    try:
+        import fakeredis
+        import fakeredis.aioredis as fakeredis_async
+        import redis as sync_redis
+        import redis.asyncio as async_redis
+    except ImportError:
+        yield
+        return
+    server = _ensure_fake_server()
+    fakeredis.FakeRedis(server=server, decode_responses=True).flushall()
+    orig_sync = sync_redis.from_url
+    orig_async = async_redis.from_url
+
+    def sync_from_url(url, **kwargs):
+        if str(url).startswith("fakeredis://"):
+            kwargs.setdefault("decode_responses", True)
+            return fakeredis.FakeRedis(server=server, **kwargs)
+        return orig_sync(url, **kwargs)
+
+    def async_from_url(url, **kwargs):
+        if str(url).startswith("fakeredis://"):
+            kwargs.setdefault("decode_responses", True)
+            return fakeredis_async.FakeRedis(server=server, **kwargs)
+        return orig_async(url, **kwargs)
+
+    monkeypatch.setattr(sync_redis, "from_url", sync_from_url)
+    monkeypatch.setattr(async_redis, "from_url", async_from_url)
+    yield
 
 
 def _flush_prefix(prefix: str) -> None:
     """Synchronously flush test keys so tests don't see stale data."""
     import redis as sync_redis
 
-    r = sync_redis.from_url("redis://localhost:6379/0", decode_responses=True)
+    r = sync_redis.from_url(_ACTIVE_URL, decode_responses=True)
     for key in r.scan_iter(f"{prefix}:*"):
         r.delete(key)
     r.close()
@@ -713,7 +830,7 @@ def _accounting_flush_prefix(prefix: str) -> None:
     """Synchronously flush accounting test keys so tests don't see stale data."""
     import redis as sync_redis
 
-    r = sync_redis.from_url("redis://localhost:6379/0", decode_responses=True)
+    r = sync_redis.from_url(_ACTIVE_URL, decode_responses=True)
     for key in r.scan_iter(f"{prefix}*"):
         r.delete(key)
     r.close()

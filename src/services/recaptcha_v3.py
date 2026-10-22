@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .browser_solver import BaseBrowserSolver, has_task_proxy
+from ..models.task import AttemptContext
+from .browser_solver import BaseBrowserSolver, SolveStage, has_task_proxy
 
 log = logging.getLogger(__name__)
 
@@ -71,48 +72,50 @@ class RecaptchaV3Solver(BaseBrowserSolver):
             verify_provider="recaptcha",
         )
 
+    #: Provider label used by the shared real-page template in logs/errors.
+    PROVIDER_LABEL = "reCAPTCHA v3"
+
     async def _solve_once(
         self, website_url: str, website_key: str, page_action: str, params: dict[str, Any]
     ) -> tuple[str, str]:
-        solve_context = await self._acquire_context(params)
-        self._stash_fingerprint_geo(solve_context, params)
-        context = solve_context.context
-        user_agent = solve_context.user_agent
-        page = await context.new_page()
+        """Thin wrapper over the shared real-page template.
 
-        solved = False
+        ``page_action`` / ``website_key`` are retained for API compatibility;
+        the hook re-derives the exact same values from ``params`` (the source
+        ``solve`` read them from).
+        """
+        return await self._solve_real_page_once(params, website_url)
+
+    def _invalid_token_message(self, token: Any) -> str:
+        # Preserve the pre-refactor wording tests assert on.
+        return f"Invalid token received: {token!r}"
+
+    async def _prepare_page(
+        self, page: Any, params: dict[str, Any], attempt: AttemptContext
+    ) -> None:
+        """Warm the behaviour score and wait (briefly) for the SDK."""
+        # A short human-like pre-interaction to warm the behaviour score.
+        # Reduced from two fixed sleeps to a single eased mouse move so
+        # v3 still gets a real-interaction signal without dead time.
+        await self._human_mouse(page)
+        # Wait for reCAPTCHA to become available (may already be on page).
         try:
-            timeout_ms = self._config.browser_timeout * 1000
-            await page.goto(
-                website_url, wait_until="domcontentloaded", timeout=timeout_ms
+            await page.wait_for_function(
+                "(typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') "
+                "|| (typeof grecaptcha !== 'undefined' && typeof grecaptcha?.enterprise?.execute === 'function')",
+                timeout=10_000,
             )
-
-            # A short human-like pre-interaction to warm the behaviour score.
-            # Reduced from two fixed sleeps to a single eased mouse move so
-            # v3 still gets a real-interaction signal without dead time.
-            await self._human_mouse(page)
-
-            # Wait for reCAPTCHA to become available (may already be on page)
-            try:
-                await page.wait_for_function(
-                    "(typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') "
-                    "|| (typeof grecaptcha !== 'undefined' && typeof grecaptcha?.enterprise?.execute === 'function')",
-                    timeout=10_000,
-                )
-            except Exception:
-                log.info(
-                    "grecaptcha not detected on page, will attempt script injection"
-                )
-
-            token = await page.evaluate(_EXECUTE_JS, [website_key, page_action])
-
-            if not isinstance(token, str) or len(token) < 20:
-                raise RuntimeError(f"Invalid token received: {token!r}")
-
+        except Exception:
             log.info(
-                "Got reCAPTCHA token for %s (len=%d)", website_url, len(token)
+                "grecaptcha not detected on page, will attempt script injection"
             )
-            solved = True
-            return token, user_agent
-        finally:
-            await self._release_context(solve_context, solved, params)
+
+    async def _extract_token(
+        self, page: Any, params: dict[str, Any], attempt: AttemptContext
+    ) -> str | None:
+        """Execute the action and return the v3 token."""
+        self._stamp_phase(params, SolveStage.CHALLENGE)
+        action = params.get("pageAction") or params.get("action") or "verify"
+        return await page.evaluate(
+            _EXECUTE_JS, [params["websiteKey"], action]
+        )

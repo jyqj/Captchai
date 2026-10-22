@@ -114,8 +114,77 @@ class ClassificationSolver(VisionSolveBase):
             max_tokens=512,
             est_cost=0.002 * max(1, len(image_urls)),
         )
-        result = await self._invoke(req, params, challenge_shape="classification")
-        return parse_json_object(result.content)
+        # Parsing runs INSIDE the retried + metered unit: a malformed reply is
+        # retried (and metered on every attempt) rather than escaping after the
+        # model call already succeeded.
+        return await self._invoke(
+            req,
+            params,
+            challenge_shape="classification",
+            parse=lambda result: self._normalize_answer(
+                task_type, parse_json_object(result.content)
+            ),
+        )
+
+    @classmethod
+    def _normalize_answer(
+        cls, task_type: str, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Validate a parsed model reply into the documented solution shape.
+
+        The API contract is ``{"answer": bool | list[int]}`` for
+        ``HCaptchaClassification`` and ``{"objects": list[int]}`` for the grid
+        adapters (``ReCaptchaV2Classification`` / ``FunCaptchaClassification`` /
+        ``AwsClassification``). Returning the raw model JSON let arbitrary keys
+        and wrong types reach ``SolutionObject`` (a validation 500) — or leak
+        model chatter into the caller's solution. Anything that cannot be
+        normalised raises ``ValueError``, which surfaces as
+        ``ERROR_CAPTCHA_UNSOLVABLE`` after the retry budget.
+        """
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"model reply must be a JSON object, got {type(data).__name__}"
+            )
+        # ``HCaptchaClassification`` documents BOTH fields ("objects or
+        # answer", including the single-image boolean form); the grid adapters
+        # document ``objects`` only, so an ``answer`` list is mapped onto it.
+        is_hcaptcha = task_type == "HCaptchaClassification"
+        if "objects" in data or (not is_hcaptcha and "answer" in data):
+            objects = data.get("objects", data.get("answer"))
+            if isinstance(objects, int) and not isinstance(objects, bool):
+                objects = [objects]
+            if isinstance(objects, list):
+                return {"objects": cls._normalize_indices(objects)}
+            raise ValueError(
+                f"'objects' must be a list of indices, got {objects!r}"
+            )
+        if "answer" in data:
+            answer = data["answer"]
+            if isinstance(answer, bool):
+                return {"answer": answer}
+            if isinstance(answer, int) and not isinstance(answer, bool):
+                answer = [answer]
+            if isinstance(answer, list):
+                return {"answer": cls._normalize_indices(answer)}
+            raise ValueError(
+                f"'answer' must be a boolean or a list of indices, got {answer!r}"
+            )
+        raise ValueError(
+            f"model reply has neither 'answer' nor 'objects': {sorted(data)[:5]}"
+        )
+
+    @staticmethod
+    def _normalize_indices(values: list[Any]) -> list[int]:
+        """Validate cell indices: non-negative ints only, de-duplicated in order."""
+        indices: list[int] = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"cell index must be an integer, got {value!r}")
+            if value < 0 or value > 4095:
+                raise ValueError(f"cell index out of range: {value!r}")
+            if value not in indices:
+                indices.append(value)
+        return indices
 
     @staticmethod
     def _get_system_prompt(task_type: str) -> str:

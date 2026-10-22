@@ -10,8 +10,10 @@ CaptchAI 使用两种模型后端：
 
 | 后端 | 角色 | 环境变量 | 默认值 |
 |------|------|---------|-------|
-| **本地模型** | 图像识别与分类（高吞吐，自托管） | `LOCAL_BASE_URL`, `LOCAL_API_KEY`, `LOCAL_MODEL` | `http://localhost:30000/v1`, `EMPTY`, `Qwen/Qwen3.5-2B` |
-| **云端模型** | 音频转录与复杂推理（强大远程 API） | `CLOUD_BASE_URL`, `CLOUD_API_KEY`, `CLOUD_MODEL` | 外部端点, 你的密钥, `gpt-5.4` |
+| **本地模型** | 图像识别与分类（高吞吐，自托管） | `LOCAL_BASE_URL`, `LOCAL_API_KEY`, `LOCAL_MODEL`, `LOCAL_MAX_CONCURRENCY` | `http://localhost:30000/v1`, `EMPTY`, `Qwen/Qwen3.5-2B`, `0`（不限） |
+| **云端模型** | 音频转录与困难网格升级（强大远程 API） | `CLOUD_BASE_URL`, `CLOUD_API_KEY`, `CLOUD_MODEL`, `CLOUD_AUDIO_MODEL`, `CLOUD_MAX_CONCURRENCY` | 外部端点, 你的密钥, `gpt-5.4`, `whisper-1`, `4` |
+
+`MODEL_CONNECTION_FALLBACK=true`（默认）会在连接失败时在另一后端重试一次：本地 → 云端仅在 `VISION_CLOUD_ENABLED=true` 且预算允许时；云端 → 本地始终允许。
 
 ## 前置要求
 
@@ -77,10 +79,11 @@ export LOCAL_BASE_URL="http://localhost:30000/v1"
 export LOCAL_API_KEY="EMPTY"
 export LOCAL_MODEL="Qwen/Qwen3.5-2B"
 
-# 云端模型（远程 API，用于音频转录等）
+# 云端模型（远程 API，用于音频转录 / 困难网格升级）
 export CLOUD_BASE_URL="https://your-api-endpoint/v1"
 export CLOUD_API_KEY="sk-your-key"
 export CLOUD_MODEL="gpt-5.4"
+export CLOUD_AUDIO_MODEL="whisper-1"
 
 # 其他配置
 export CLIENT_KEY="your-client-key"
@@ -93,9 +96,11 @@ export BROWSER_HEADLESS=true
 python main.py
 ```
 
+健康/详情端点为 `GET /api/v1/health`，返回两个模型后端、浏览器实际运行时（`browser_runtime`、`browser_runtime_requested`、`browser_runtime_effective`、`browser_runtime_degraded`、`browser_driver`）以及 `degraded_subsystems`。编排器就绪探针使用 `GET /ready`（HTTP 200/503；注册了浏览器任务类型时检查浏览器，配置 `REDIS_URL` 时检查 Redis）。
+
 ## 向后兼容
 
-旧版环境变量（`CAPTCHA_BASE_URL`、`CAPTCHA_API_KEY`、`CAPTCHA_MODEL`、`CAPTCHA_MULTIMODAL_MODEL`）仍然支持。新的 `LOCAL_*` 和 `CLOUD_*` 变量优先生效。
+旧版环境变量（`CAPTCHA_BASE_URL`、`CAPTCHA_API_KEY`、`CAPTCHA_MODEL`、`CAPTCHA_MULTIMODAL_MODEL`）仍作为拆分后后端的回退。`CLOUD_BASE_URL` 回退到 `CAPTCHA_BASE_URL`；`LOCAL_BASE_URL` 仅在未设置时使用 `CAPTCHA_BASE_URL`。`CLOUD_MODEL`/`LOCAL_MODEL` 分别回退到 `CAPTCHA_MODEL`/`CAPTCHA_MULTIMODAL_MODEL`，两个 API key 都回退到 `CAPTCHA_API_KEY`。设置后 `LOCAL_*` 与 `CLOUD_*` 优先生效。`CLOUD_AUDIO_MODEL` 没有旧版别名。
 
 ## 推荐模型
 

@@ -7,6 +7,10 @@
   "extraPaths": [
     "."
   ],
+  "exclude": [
+    ".venv",
+    "site"
+  ],
   "stubPath": "typings",
   "venvPath": ".",
   "venv": ".venv",

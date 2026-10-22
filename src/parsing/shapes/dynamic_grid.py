@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from ..dispatcher import ChallengeContext, ChallengeShape
+from ..dispatcher import ChallengeContext, ChallengeShape, selector_csv
 from .base import BaseShapeSolver, ClassifyRequest
 
 log = logging.getLogger(__name__)
@@ -19,7 +19,8 @@ log = logging.getLogger(__name__)
 class DynamicGridSolver(BaseShapeSolver):
     SHAPE = ChallengeShape.RECAPTCHA_DYNAMIC
 
-    TILE_SELECTOR = ".rc-imageselect-tile, .task-image"
+    # Same registry the classifier uses (single source of truth).
+    TILE_SELECTOR = selector_csv(ChallengeShape.RECAPTCHA_DYNAMIC, "tile")
     REFRESH_SELECTOR = ".rc-button-reload, .reload-button-holder button, [id='recaptcha-reload-button']"
     CONFIDENCE_FLOOR = 0.4
 

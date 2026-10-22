@@ -33,6 +33,8 @@ The solver does **not** load the raw target page (which is often behind a Cloudf
 
 > **Out of scope:** the full-page "Checking your browser…" managed challenge (the `cf_clearance` cookie flow) is a different mechanism from the Turnstile widget and is not solved here.
 
+Before navigation, `websiteURL` is checked when `SSRF_PROTECT=true` (default): http(s) only, the host must resolve, and every resolved address must be public. A DNS resolution failure is fail-open (logged); a host resolving to loopback/private/link-local/reserved/multicast/unspecified is rejected.
+
 ## Solution field
 
 Unlike reCAPTCHA tasks, the result is returned in `solution.token` (not `solution.gRecaptchaResponse`). The `userAgent` used during solving is echoed back — submit the token with this exact UA and (if used) the same proxy IP:

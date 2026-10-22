@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Tuple
 
-from ..dispatcher import ChallengeContext, ChallengeShape
+from ..dispatcher import ChallengeContext, ChallengeShape, selector_csv
 from .base import BaseShapeSolver, ClassifyRequest
 from .human_cursor import human_point_click, human_tap
 
@@ -23,7 +23,8 @@ log = logging.getLogger(__name__)
 class AreaBBoxSolver(BaseShapeSolver):
     SHAPE = ChallengeShape.AREA_BBOX
 
-    IMAGE_SELECTOR = ".single-image, .task-image, canvas"
+    # Same registry the classifier uses (single source of truth).
+    IMAGE_SELECTOR = selector_csv(ChallengeShape.AREA_BBOX, "image")
 
     async def run(self, frame: Any, ctx: ChallengeContext) -> Optional[str]:
         token = await self.poll_token()

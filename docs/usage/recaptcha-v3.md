@@ -45,6 +45,10 @@ A local acceptance run against the public detector target successfully:
 - reached `ready`
 - returned a non-empty token
 
+## URL validation
+
+Before a proxy or browser context is checked out, `websiteURL` must be http(s), the hostname must resolve, and every resolved address must be public (loopback, private, link-local, reserved, multicast, and unspecified are rejected). This pre-flight is always on for reCAPTCHA v3; a rejected URL surfaces as `ERROR_CAPTCHA_UNSOLVABLE`.
+
 ## Operational caveats
 
 - A returned token does not imply guaranteed score targeting.

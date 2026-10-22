@@ -11,6 +11,7 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -107,7 +108,9 @@ def _make_config(**overrides):
 
 
 def _req(**overrides):
-    base = dict(prompt="select all buses", images=[b"\x89PNGfake"], task_tier=1)
+    base: dict[str, Any] = dict(
+        prompt="select all buses", images=[b"\x89PNGfake"], task_tier=1
+    )
     base.update(overrides)
     return VisionRequest(**base)
 
@@ -165,7 +168,9 @@ def test_route_tier1_uses_local():
     )
     router = VisionRouter(pool, config)
     result = asyncio.run(router.classify(_req(task_tier=1)))
-    assert result.model == "local"
+    # Wave A: VisionResult.model carries the CONCRETE served model id (what
+    # pricing / actual_model keys on), not the local/cloud routing alias.
+    assert result.model == "qwen-local"
     assert recorder[0]["model"] == "qwen-local"
 
 
@@ -176,7 +181,8 @@ def test_route_tier2_cloud_enabled_uses_cloud():
     )
     router = VisionRouter(pool, config)
     result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
-    assert result.model == "cloud"
+    # Wave A: concrete served id (configured cloud_model), not the "cloud" alias.
+    assert result.model == "gpt-cloud"
     assert recorder[0]["model"] == "gpt-cloud"
 
 
@@ -187,7 +193,8 @@ def test_route_tier2_cloud_disabled_uses_local():
     )
     router = VisionRouter(pool, config)
     result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
-    assert result.model == "local"
+    # Wave A: concrete served id, not the "local" backend alias.
+    assert result.model == "qwen-local"
     assert recorder[0]["model"] == "qwen-local"
 
 
@@ -300,7 +307,8 @@ def test_budget_denial_downgrades_to_local():
     result = asyncio.run(
         router.classify(_req(task_tier=2, grid_size=9), client_key="acct-1")
     )
-    assert result.model == "local"
+    # Wave A: concrete served id (downgraded to the local model), not "local".
+    assert result.model == "qwen-local"
     assert recorder[0]["model"] == "qwen-local"
     # Budget was consulted for the (would-be) cloud call.
     assert budget.calls
@@ -316,7 +324,8 @@ def test_budget_allowed_keeps_cloud():
     budget = FakeBudget(allowed=True)
     router = VisionRouter(pool, config, budget=budget)
     result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
-    assert result.model == "cloud"
+    # Wave A: concrete served id (configured cloud_model), not the "cloud" alias.
+    assert result.model == "gpt-cloud"
     assert recorder[0]["model"] == "gpt-cloud"
 
 
@@ -436,7 +445,8 @@ def test_local_connection_error_falls_back_to_cloud():
         vision_stitch_grid=False,
         model_connection_fallback=True,
     )
-    router = VisionRouter(_Pool(), config)
+    # _Pool is a duck-typed ModelPool fake (only .get is used).
+    router = VisionRouter(cast(ModelPool, _Pool()), config)
     result = asyncio.run(router.classify(_req(task_tier=1)))
     assert result.model == "cloud"  # fell back to cloud
     assert result.indices == [2, 4]
@@ -467,7 +477,8 @@ def test_cloud_connection_error_falls_back_to_local():
         vision_stitch_grid=False,
         model_connection_fallback=True,
     )
-    router = VisionRouter(_Pool(), config)
+    # _Pool is a duck-typed ModelPool fake (only .get is used).
+    router = VisionRouter(cast(ModelPool, _Pool()), config)
     result = asyncio.run(router.classify(_req(task_tier=2, grid_size=9)))
     assert result.model == "local"
     assert result.indices == [1]
@@ -490,7 +501,8 @@ def test_connection_fallback_disabled_reraises():
         vision_stitch_grid=False,
         model_connection_fallback=False,
     )
-    router = VisionRouter(_Pool(), config)
+    # _Pool is a duck-typed ModelPool fake (only .get is used).
+    router = VisionRouter(cast(ModelPool, _Pool()), config)
     try:
         asyncio.run(router.classify(_req(task_tier=1)))
         raise AssertionError("expected the connection error to propagate")
@@ -521,7 +533,7 @@ def test_non_connection_error_does_not_fall_back():
         vision_stitch_grid=False,
         model_connection_fallback=True,
     )
-    router = VisionRouter(pool, config)
+    router = VisionRouter(cast(ModelPool, pool), config)
     try:
         asyncio.run(router.classify(_req(task_tier=1)))
         raise AssertionError("expected the ValueError to propagate")

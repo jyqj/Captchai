@@ -45,6 +45,10 @@ curl -X POST http://localhost:8000/getTaskResult \
 - 轮询到 `ready`
 - 返回非空 token
 
+## URL 校验
+
+在签出代理或浏览器上下文之前，`websiteURL` 必须为 http(s)、主机可解析，且所有解析地址为公网（回环、私有、链路本地、保留、多播、未指定地址均拒绝）。reCAPTCHA v3 始终执行该预检；被拒绝的 URL 表现为 `ERROR_CAPTCHA_UNSOLVABLE`。
+
 ## 运行注意事项
 
 - 返回 token 不代表可以保证指定 score。

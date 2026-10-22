@@ -10,7 +10,7 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -22,6 +22,7 @@ from src.parsing.dispatcher import (
     ChallengeDispatcher,
     ChallengeShape,
     ClassifierSelectors,
+    ClassifyResult,
 )
 from src.parsing.shapes.area_bbox import AreaBBoxSolver
 from src.parsing.shapes.base import BaseShapeSolver
@@ -103,6 +104,8 @@ class FakeFrame:
         self.shots = shots or {}
         self.clicks: List[Any] = []
         self.screenshots: List[Any] = []
+        # Some slide tests attach a recording mouse to act as the page.
+        self.mouse: Any = None
 
     def locator(self, selector: str) -> FakeLocator:
         return FakeLocator(self, selector)
@@ -116,9 +119,12 @@ class FakeVision:
         self.confidence = confidence
         self.calls: List[Any] = []
 
-    async def classify(self, req: Any):
+    async def classify(self, req: Any) -> ClassifyResult:
         self.calls.append(req)
-        return SimpleNamespace(indices=list(self.indices), confidence=self.confidence)
+        return cast(
+            ClassifyResult,
+            SimpleNamespace(indices=list(self.indices), confidence=self.confidence),
+        )
 
 
 def make_token_poll(sequence: List[Optional[str]]):
@@ -231,8 +237,11 @@ def test_classifier_unknown_when_nothing_matches() -> None:
 def test_classifier_vision_fallback_hint() -> None:
     async def run() -> None:
         class HintVision:
-            async def classify(self, req: Any):
-                return SimpleNamespace(shape="drag_drop", indices=[], confidence=0.5)
+            async def classify(self, req: Any) -> ClassifyResult:
+                return cast(
+                    ClassifyResult,
+                    SimpleNamespace(shape="drag_drop", indices=[], confidence=0.5),
+                )
 
         frame = FakeFrame(counts={})
         clf = ChallengeClassifier(vision=HintVision())
@@ -764,8 +773,13 @@ def test_area_bbox_scales_high_dpr_point_and_adds_offset() -> None:
         )
 
         class PointVision:
-            async def classify(self, req: Any):
-                return SimpleNamespace(point=(450.0, 450.0), indices=[], confidence=0.9)
+            async def classify(self, req: Any) -> ClassifyResult:
+                return cast(
+                    ClassifyResult,
+                    SimpleNamespace(
+                        point=(450.0, 450.0), indices=[], confidence=0.9
+                    ),
+                )
 
         poll, _state = make_token_poll([None, "CLICKED"])
         solver = AreaBBoxSolver(vision=PointVision(), token_poll=poll)
@@ -795,9 +809,12 @@ def test_slide_scales_distance_by_dpr() -> None:
         )
 
         class DistVision:
-            async def classify(self, req: Any):
+            async def classify(self, req: Any) -> ClassifyResult:
                 # 180 screenshot px => 60 CSS px at DPR 3.
-                return SimpleNamespace(distance=180.0, indices=[], confidence=0.9)
+                return cast(
+                    ClassifyResult,
+                    SimpleNamespace(distance=180.0, indices=[], confidence=0.9),
+                )
 
         poll, _state = make_token_poll([None, "SLID"])
         solver = CanvasSlideSolver(vision=DistVision(), token_poll=poll)

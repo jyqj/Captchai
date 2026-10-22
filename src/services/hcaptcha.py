@@ -35,6 +35,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import FrameLocator
 
@@ -52,7 +53,6 @@ from ..parsing.shapes.dynamic_grid import DynamicGridSolver
 from ..parsing.shapes.grid_select import GridSelectSolver
 from ..parsing.shapes.slide import CanvasSlideSolver
 from ..parsing.vision_adapter import VisionAdapter
-from .captcha_errors import classify_widget_error
 from .injected_widget import InjectedWidgetSolver
 from .browser_solver import (
     ProxyKind,
@@ -206,8 +206,28 @@ class HCaptchaSolver(InjectedWidgetSolver):
         # ``<assethost>/1/api.js``). Standard enterprise (e.g. Stripe) sets no
         # assethost, so this falls back to the public SDK unchanged.
         assethost = options.get("assethost")
-        if isinstance(assethost, str) and assethost.startswith("http"):
-            return f"{assethost.rstrip('/')}/1/api.js?render=explicit"
+        if isinstance(assethost, str) and assethost.strip():
+            # ``assethost`` is caller-supplied and ends up in the injected
+            # page's <script src>, so it must be a bare https origin — no
+            # credentials, path, query or fragment (anything else is either an
+            # injection vector or not an origin hCaptcha would serve from).
+            parts = urlsplit(assethost.strip())
+            bare_origin = (
+                parts.scheme == "https"
+                and bool(parts.hostname)
+                and not parts.username
+                and not parts.password
+                and parts.path in ("", "/")
+                and not parts.query
+                and not parts.fragment
+            )
+            if bare_origin:
+                return f"{parts.scheme}://{parts.netloc}/1/api.js?render=explicit"
+            log.warning(
+                "Ignoring invalid hCaptcha assethost %r (must be a bare https "
+                "origin); falling back to the public SDK",
+                assethost,
+            )
         return self.WIDGET_API_JS
 
     # ── public solve ───────────────────────────────────────────
@@ -260,7 +280,7 @@ class HCaptchaSolver(InjectedWidgetSolver):
             if stage == SolveStage.CHALLENGE.value:
                 params["_hcaptcha_vision_tier"] = 2
 
-        started = time.monotonic()
+        started = time.perf_counter()
         solution = await self._solve_with_retries(
             params,
             sitekey=website_key,
@@ -285,7 +305,7 @@ class HCaptchaSolver(InjectedWidgetSolver):
         # warning the caller can act on (capture a fresher rqdata / speed up the
         # egress) rather than silently returning a probably-dead token.
         if profile.variant == "enterprise" and profile.render_options.get("rqdata"):
-            elapsed = time.monotonic() - started
+            elapsed = time.perf_counter() - started
             ttl = float(getattr(self._config, "hcaptcha_rqdata_ttl", 30.0))
             if ttl > 0 and elapsed > ttl:
                 note = (
@@ -836,7 +856,7 @@ class HCaptchaSolver(InjectedWidgetSolver):
             " return el.textContent || 'error'; } return window.__omcError || null; }"
         )
         if err:
-            raise classify_widget_error(err, provider="hCaptcha")
+            raise self._classify_error(err)
 
         challenge_frame: FrameLocator = page.frame_locator(_CHALLENGE_IFRAME)
 
@@ -920,7 +940,7 @@ class HCaptchaSolver(InjectedWidgetSolver):
             if isinstance(token, str) and len(token) > 20:
                 return token
             if err:
-                raise classify_widget_error(err, provider=self.PROVIDER)
+                raise self._classify_error(err)
             try:
                 if await classifier.ready(challenge_frame):
                     return None

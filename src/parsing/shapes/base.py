@@ -18,7 +18,14 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
+from ...services.captcha_errors import (
+    CaptchaError,
+    NonRetryableWidgetError,
+    RetryableWidgetError,
+)
 from ..dispatcher import ChallengeContext, VisionClient
+from ..model_call import is_connection_error
+from ..vision import VisionParseError
 from .human_cursor import human_click, human_tap_box
 
 log = logging.getLogger(__name__)
@@ -68,14 +75,33 @@ class BaseShapeSolver:
     # -- token -------------------------------------------------------------
 
     async def poll_token(self) -> Optional[str]:
-        """Invoke the injected token poll, if any. Guarded."""
+        """Invoke the injected token poll, if any.
+
+        Errors are classified rather than swallowed: an already-classified
+        :class:`CaptchaError` (widget rate-limit / non-retryable error) keeps
+        its kind, and anything else is mapped to a transient (connection-style)
+        or permanent error. Returning ``None`` for all of them — the previous
+        behaviour — made the solve loop retry a rate-limited egress and report
+        an indistinguishable ``ERROR_CAPTCHA_UNSOLVABLE``.
+        """
         if self._token_getter is None:
             return None
         try:
             token = await self._token_getter()
-        except Exception as exc:  # noqa: BLE001
-            log.debug("token_poll raised: %s", exc)
-            return None
+        except CaptchaError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - classify, never swallow
+            message = f"token poll failed: {exc}"
+            # Programming-level faults (bad callback signature, malformed
+            # state) won't fix themselves on retry; everything else — notably
+            # connection/timeout failures and browser-context churn — is
+            # transient and gets the normal retry-with-backoff treatment.
+            permanent = isinstance(
+                exc, (TypeError, ValueError, AttributeError, KeyError)
+            ) and not is_connection_error(exc)
+            if permanent:
+                raise NonRetryableWidgetError(message) from exc
+            raise RetryableWidgetError(message) from exc
         if isinstance(token, str) and token:
             return token
         return None
@@ -100,10 +126,23 @@ class BaseShapeSolver:
         return ""
 
     async def _screenshot_tile(self, frame: Any, selector: str, index: int) -> bytes:
+        """Screenshot one tile; a failure is a failed sample, never ``b""``.
+
+        Returning empty bytes used to feed an image-less (or, mid-grid,
+        index-shifting) model call that could only answer wrong. The classified
+        error lets the solve loop retry the attempt instead.
+        """
         try:
-            return await frame.locator(selector).nth(index).screenshot()
-        except Exception:  # noqa: BLE001
-            return b""
+            shot = await frame.locator(selector).nth(index).screenshot()
+        except Exception as exc:  # noqa: BLE001 - classify the failed sample
+            raise RetryableWidgetError(
+                f"screenshot failed for {selector!r}[{index}]: {exc}"
+            ) from exc
+        if not shot:
+            raise RetryableWidgetError(
+                f"screenshot for {selector!r}[{index}] returned no image data"
+            )
+        return shot
 
     # -- coordinate mapping (screenshot pixels -> element CSS pixels) --------
     #
@@ -308,14 +347,38 @@ class BaseShapeSolver:
             pass
 
     async def classify(self, req: ClassifyRequest) -> Optional[Any]:
-        """Call the injected vision client. Returns the raw result or None."""
+        """Call the injected vision client. Returns the raw result or None.
+
+        A request with no image (or an empty tile payload) is rejected before
+        the model call: an image-less call answers an unrelated prompt, and a
+        dropped tile shifts every index after it. Classified vision errors
+        (``CaptchaError``, e.g. ``VisionParseError``) propagate so the solve
+        loop can react to them.
+        """
         if self._vision is None:
             return None
+        images = list(getattr(req, "images", []) or [])
+        if not images or any(not image for image in images):
+            log.warning(
+                "vision.classify skipped: empty image payload (shape=%r)",
+                getattr(req, "shape", ""),
+            )
+            raise RetryableWidgetError(
+                "refusing an image-less vision call (screenshot failed)"
+            )
         try:
-            return await self._vision.classify(req)
+            result = await self._vision.classify(req)
+        except CaptchaError:
+            raise
         except Exception as exc:  # noqa: BLE001
             log.warning("vision.classify failed: %s", exc)
             return None
+        if getattr(result, "ok", True) is False:
+            # An alternative vision client may signal parse failure with
+            # ``ok=False`` instead of raising; map it to the same classified
+            # failure so it reaches ``ERROR_CAPTCHA_UNSOLVABLE``.
+            raise VisionParseError("vision client reported an explicit failure")
+        return result
 
     @staticmethod
     def valid_indices(indices: Any, count: int) -> List[int]:
